@@ -152,6 +152,35 @@ class AxClient:
         r.raise_for_status()
         return r.json()
 
+    def create_agent(self, name: str, **kwargs) -> dict:
+        """POST /api/v1/agents — create a new agent."""
+        body: dict = {"name": name}
+        for key in ("description", "system_prompt", "model", "space_id",
+                     "enable_cloud_agent", "can_manage_agents"):
+            if key in kwargs and kwargs[key] is not None:
+                body[key] = kwargs[key]
+        r = self._http.post("/api/v1/agents", json=body)
+        r.raise_for_status()
+        return r.json()
+
+    def get_agent(self, identifier: str) -> dict:
+        """GET /api/v1/agents/manage/{identifier} — get by name or UUID."""
+        r = self._http.get(f"/api/v1/agents/manage/{identifier}")
+        r.raise_for_status()
+        return r.json()
+
+    def update_agent(self, identifier: str, **fields) -> dict:
+        """PUT /api/v1/agents/manage/{identifier} — update agent."""
+        r = self._http.put(f"/api/v1/agents/manage/{identifier}", json=fields)
+        r.raise_for_status()
+        return r.json()
+
+    def delete_agent(self, identifier: str) -> dict:
+        """DELETE /api/v1/agents/manage/{identifier} — delete agent."""
+        r = self._http.delete(f"/api/v1/agents/manage/{identifier}")
+        r.raise_for_status()
+        return r.json()
+
     def get_agent_tools(self, space_id: str, agent_id: str) -> dict:
         """GET /{space_id}/roster filtered to one agent — returns enabled_tools."""
         r = self._http.get(

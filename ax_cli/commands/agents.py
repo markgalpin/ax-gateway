@@ -1,4 +1,4 @@
-"""ax agents — agent listing and tools."""
+"""ax agents — agent listing, creation, and management."""
 import typer
 import httpx
 
@@ -25,6 +25,113 @@ def list_agents(as_json: bool = JSON_OPTION):
             agents,
             keys=["id", "name", "status"],
         )
+
+
+@app.command("create")
+def create_agent(
+    name: str = typer.Argument(..., help="Agent name"),
+    description: str = typer.Option(None, "--description", "-d", help="Agent description"),
+    system_prompt: str = typer.Option(None, "--system-prompt", help="System prompt"),
+    model: str = typer.Option(None, "--model", "-m", help="LLM model"),
+    cloud: bool = typer.Option(False, "--cloud", help="Enable cloud agent"),
+    can_manage_agents: bool = typer.Option(False, "--can-manage-agents", help="Allow this agent to manage other agents"),
+    space_id: str = typer.Option(None, "--space-id", help="Target space"),
+    as_json: bool = JSON_OPTION,
+):
+    """Create a new agent."""
+    client = get_client()
+    try:
+        data = client.create_agent(
+            name,
+            description=description,
+            system_prompt=system_prompt,
+            model=model,
+            space_id=space_id,
+            enable_cloud_agent=cloud,
+            can_manage_agents=can_manage_agents,
+        )
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+    if as_json:
+        print_json(data)
+    else:
+        console.print(f"[green]Created agent:[/green] {data['name']} ({data['id']})")
+        print_kv({
+            "origin": data.get("origin"),
+            "status": data.get("status"),
+            "space_id": data.get("space_id"),
+        })
+
+
+@app.command("get")
+def get_agent(
+    identifier: str = typer.Argument(..., help="Agent name or UUID"),
+    as_json: bool = JSON_OPTION,
+):
+    """Get agent details by name or UUID."""
+    client = get_client()
+    try:
+        data = client.get_agent(identifier)
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+    if as_json:
+        print_json(data)
+    else:
+        print_kv(data)
+
+
+@app.command("update")
+def update_agent(
+    identifier: str = typer.Argument(..., help="Agent name or UUID"),
+    description: str = typer.Option(None, "--description", "-d"),
+    system_prompt: str = typer.Option(None, "--system-prompt"),
+    model: str = typer.Option(None, "--model", "-m"),
+    status: str = typer.Option(None, "--status", help="active or inactive"),
+    as_json: bool = JSON_OPTION,
+):
+    """Update an agent."""
+    client = get_client()
+    fields = {}
+    if description is not None:
+        fields["description"] = description
+    if system_prompt is not None:
+        fields["system_prompt"] = system_prompt
+    if model is not None:
+        fields["model"] = model
+    if status is not None:
+        fields["status"] = status
+
+    if not fields:
+        typer.echo("Nothing to update. Use --description, --system-prompt, --model, or --status.", err=True)
+        raise typer.Exit(1)
+
+    try:
+        data = client.update_agent(identifier, **fields)
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+    if as_json:
+        print_json(data)
+    else:
+        console.print(f"[green]Updated agent:[/green] {data['name']}")
+
+
+@app.command("delete")
+def delete_agent(
+    identifier: str = typer.Argument(..., help="Agent name or UUID"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Delete an agent."""
+    if not yes:
+        confirm = typer.confirm(f"Delete agent '{identifier}'?")
+        if not confirm:
+            raise typer.Abort()
+
+    client = get_client()
+    try:
+        data = client.delete_agent(identifier)
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+    console.print(f"[red]Deleted:[/red] {data.get('message', identifier)}")
 
 
 @app.command("status")

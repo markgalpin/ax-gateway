@@ -24,6 +24,7 @@ pip install -e .
 ax --help
 ax auth whoami
 ax send "hello"
+ax send "quick update" --skip-ax
 
 # No test framework is configured yet
 # No linter is configured yet
@@ -45,7 +46,7 @@ ax send "hello"
 
 - Every command gets its client via `config.get_client()` and resolves space/agent from the config cascade.
 - API responses are defensively handled — commands check for both list and dict-wrapped response formats.
-- `messages send --wait` uses polling with routing-status metadata detection, not websockets.
+- `messages send` waits for a reply by default (polls `list_replies` every 1s). Use `--skip-ax` to send without waiting.
 - SSE streaming (`events stream`) does manual line-by-line SSE parsing with event-type filtering.
 
 ## Config System

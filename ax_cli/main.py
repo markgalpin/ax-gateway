@@ -17,13 +17,14 @@ app.add_typer(events.app, name="events")
 @app.command("send")
 def send_shortcut(
     content: str = typer.Argument(..., help="Message to send"),
-    wait: bool = typer.Option(True, "--wait/--no-wait", "-w", help="Wait for aX response (default: yes)"),
+    wait: bool = typer.Option(True, "--wait/--skip-ax", "-w", help="Wait for aX response (default: yes)"),
     timeout: int = typer.Option(60, "--timeout", "-t", help="Max seconds to wait"),
+    reply_to: Optional[str] = typer.Option(None, "--reply-to", "-r", help="Reply to message ID (thread)"),
     agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Send as agent (X-Agent-Name)"),
     space_id: Optional[str] = typer.Option(None, "--space-id", "-s", help="Override default space"),
     as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
-    """Send a message and wait for aX's response. Shortcut for: ax messages send --wait"""
+    """Send a message and wait for aX's response by default. Use --skip-ax to send only."""
     messages.send(
         content=content,
         wait=wait,
@@ -31,7 +32,7 @@ def send_shortcut(
         agent_id=None,
         agent_name=agent,
         channel="main",
-        parent=None,
+        parent=reply_to,
         space_id=space_id,
         as_json=as_json,
     )

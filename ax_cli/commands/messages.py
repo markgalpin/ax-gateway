@@ -11,15 +11,57 @@ from ..output import JSON_OPTION, print_json, print_table, print_kv, handle_erro
 app = typer.Typer(name="messages", help="Message operations", no_args_is_help=True)
 
 
-def _wait_for_reply(client, message_id: str, timeout: int = 60, poll_interval: float = 2.0) -> dict | None:
-    """Poll for a reply to a message. Returns the reply or None on timeout."""
-    deadline = time.time() + timeout
-    seen_ids: set[str] = set()
+def _print_wait_status(remaining: int, last_remaining: int | None) -> int:
+    if remaining != last_remaining:
+        console.print(f"  [dim]waiting for aX... ({remaining}s remaining)[/dim]", end="\r")
+    return remaining
+
+
+def _matching_reply(message_id: str, payload, seen_ids: set[str]) -> tuple[dict | None, bool]:
     routing_announced = False
+
+    for reply in payload:
+        rid = reply.get("id", "")
+        if not rid:
+            continue
+
+        matches_thread = reply.get("parent_id") == message_id or reply.get("conversation_id") == message_id
+        if not matches_thread:
+            continue
+
+        if rid in seen_ids:
+            continue
+        seen_ids.add(rid)
+
+        metadata = reply.get("metadata", {}) or {}
+        routing = metadata.get("routing", {})
+        if routing.get("mode") == "ax_relay":
+            target = routing.get("target_agent_name", "specialist")
+            console.print(" " * 60, end="\r")
+            console.print(f"  [cyan]aX is routing to @{target}...[/cyan]")
+            routing_announced = True
+            continue
+
+        console.print(" " * 60, end="\r")
+        return reply, routing_announced
+
+    return None, routing_announced
+
+
+def _wait_for_reply_polling(
+    client,
+    message_id: str,
+    *,
+    deadline: float,
+    seen_ids: set[str],
+    poll_interval: float = 2.0,
+) -> dict | None:
+    """Poll for a reply as a fallback when SSE is unavailable."""
+    last_remaining = None
 
     while time.time() < deadline:
         remaining = int(deadline - time.time())
-        console.print(f"  [dim]waiting for aX... ({remaining}s remaining)[/dim]", end="\r")
+        last_remaining = _print_wait_status(remaining, last_remaining)
 
         try:
             data = client.list_replies(message_id)
@@ -28,22 +70,9 @@ def _wait_for_reply(client, message_id: str, timeout: int = 60, poll_interval: f
             continue
 
         replies = data if isinstance(data, list) else data.get("messages", data.get("replies", []))
-        for reply in replies:
-            rid = reply.get("id", "")
-            if rid and rid not in seen_ids:
-                seen_ids.add(rid)
-                metadata = reply.get("metadata", {}) or {}
-                routing = metadata.get("routing", {})
-
-                if routing.get("mode") == "ax_relay" and not routing_announced:
-                    target = routing.get("target_agent_name", "specialist")
-                    console.print(" " * 60, end="\r")
-                    console.print(f"  [cyan]aX is routing to @{target}...[/cyan]")
-                    routing_announced = True
-                    continue
-
-                console.print(" " * 60, end="\r")
-                return reply
+        reply, _ = _matching_reply(message_id, replies, seen_ids)
+        if reply:
+            return reply
 
         time.sleep(poll_interval)
 
@@ -51,19 +80,33 @@ def _wait_for_reply(client, message_id: str, timeout: int = 60, poll_interval: f
     return None
 
 
+def _wait_for_reply(client, message_id: str, timeout: int = 60) -> dict | None:
+    """Wait for a reply by polling list_replies."""
+    deadline = time.time() + timeout
+    seen_ids: set[str] = {message_id}
+
+    return _wait_for_reply_polling(
+        client,
+        message_id,
+        deadline=deadline,
+        seen_ids=seen_ids,
+        poll_interval=1.0,
+    )
+
+
 @app.command("send")
 def send(
     content: str = typer.Argument(..., help="Message content"),
-    wait: bool = typer.Option(False, "--wait", "-w", help="Wait for aX to respond"),
+    wait: bool = typer.Option(True, "--wait/--skip-ax", "-w", help="Wait for aX response (default: yes)"),
     timeout: int = typer.Option(60, "--timeout", "-t", help="Max seconds to wait for reply"),
     agent_id: Optional[str] = typer.Option(None, "--agent-id", help="Target agent"),
     agent_name: Optional[str] = typer.Option(None, "--agent", help="Send as agent (X-Agent-Name)"),
     channel: str = typer.Option("main", "--channel", help="Channel name"),
-    parent: Optional[str] = typer.Option(None, "--parent", help="Parent message ID (thread)"),
+    parent: Optional[str] = typer.Option(None, "--parent", "--reply-to", "-r", help="Parent message ID (thread reply)"),
     space_id: Optional[str] = typer.Option(None, "--space-id", help="Override default space"),
     as_json: bool = JSON_OPTION,
 ):
-    """Send a message. Use --wait to wait for aX's response."""
+    """Send a message and wait for aX's response by default. Use --skip-ax to send only."""
     client = get_client()
     sid = resolve_space_id(client, explicit=space_id)
 
