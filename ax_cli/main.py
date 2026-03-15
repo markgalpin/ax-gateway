@@ -1,6 +1,8 @@
 """aX Platform CLI — Typer app with subcommand registration."""
+import sys
 from typing import Optional
 
+import httpx
 import typer
 
 from .commands import auth, keys, agents, messages, tasks, events
@@ -36,3 +38,12 @@ def send_shortcut(
         space_id=space_id,
         as_json=as_json,
     )
+
+
+def main():
+    """Entry point with global error handling."""
+    try:
+        app()
+    except httpx.ConnectError:
+        typer.echo("Error: cannot reach aX API. Is the server running?", err=True)
+        sys.exit(1)

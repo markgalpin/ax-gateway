@@ -65,7 +65,7 @@ def _wait_for_reply_polling(
 
         try:
             data = client.list_replies(message_id)
-        except httpx.HTTPStatusError:
+        except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadError):
             time.sleep(poll_interval)
             continue
 
