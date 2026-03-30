@@ -92,7 +92,9 @@ def _matches(
         return False
 
     content = data.get("content", "")
-    sender = data.get("display_name") or data.get("username") or data.get("author", {}).get("name", "")
+    author = data.get("author")
+    author_name = author.get("name", "") if isinstance(author, dict) else ""
+    sender = data.get("display_name") or data.get("username") or author_name
 
     # Don't match our own messages
     if sender.lower() == agent_name.lower():
