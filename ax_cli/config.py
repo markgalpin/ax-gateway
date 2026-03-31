@@ -13,9 +13,11 @@ from .client import AxClient
 
 
 def _find_project_root() -> Path | None:
-    """Walk up from CWD looking for a .git directory (repo root)."""
+    """Walk up from CWD looking for .ax/ config dir or .git directory."""
     cur = Path.cwd()
     for parent in [cur, *cur.parents]:
+        if (parent / ".ax").is_dir():
+            return parent
         if (parent / ".git").exists():
             return parent
     return None
@@ -65,8 +67,8 @@ def _save_config(cfg: dict, *, local: bool = False) -> None:
     if local:
         d = _local_config_dir()
         if not d:
-            typer.echo("Error: Not in a git repo. Cannot save local config.", err=True)
-            raise typer.Exit(1)
+            # No .ax/ or .git found — create .ax/ in current directory
+            d = Path.cwd() / ".ax"
     else:
         d = _global_config_dir()
     d.mkdir(parents=True, exist_ok=True)

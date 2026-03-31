@@ -33,9 +33,15 @@ def print_kv(data: dict):
 
 
 def handle_error(e: httpx.HTTPStatusError):
+    url = str(e.request.url) if e.request else "unknown"
     try:
-        detail = e.response.json().get("detail", e.response.text)
+        detail = e.response.json().get("detail", e.response.text[:200])
     except Exception:
-        detail = e.response.text
+        body = e.response.text[:200]
+        if "<html" in body.lower():
+            detail = f"Got HTML instead of JSON (frontend may be catching this route)"
+        else:
+            detail = body
     typer.echo(f"Error {e.response.status_code}: {detail}", err=True)
+    typer.echo(f"  URL: {url}", err=True)
     raise typer.Exit(1)

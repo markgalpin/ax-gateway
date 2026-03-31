@@ -5,7 +5,7 @@ import typer
 import httpx
 
 from ..config import get_client, resolve_space_id
-from ..output import JSON_OPTION, print_json, print_table, print_kv, handle_error
+from ..output import JSON_OPTION, print_json, print_table, print_kv, handle_error, console
 
 app = typer.Typer(name="tasks", help="Task operations", no_args_is_help=True)
 
@@ -28,10 +28,12 @@ def create(
         )
     except httpx.HTTPStatusError as e:
         handle_error(e)
+    task = data.get("task", data)
     if as_json:
-        print_json(data)
+        print_json(task)
     else:
-        print_kv(data)
+        tid = str(task.get("id", ""))[:8]
+        console.print(f"[green]Created:[/green] \"{task.get('title')}\" (id={tid}…, priority={task.get('priority')})")
 
 
 @app.command("list")

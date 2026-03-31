@@ -9,20 +9,97 @@ Usage:
     msg = client.send_message(space_id, "hello")
     client.send_message(space_id, "do this", agent_id="<uuid>")
 """
+import hashlib
 import mimetypes
+import os
+import platform
 from pathlib import Path
 
 import httpx
+
+
+def _build_fingerprint(token: str) -> dict[str, str]:
+    """Build credential fingerprint headers sent on every request.
+
+    These allow the server to detect when a credential is used from
+    an unexpected location (copied config, stolen token, etc.).
+    All sensitive values are hashed — only non-sensitive metadata is sent in plain text.
+    """
+    cwd = str(Path.cwd().resolve())
+    hostname = platform.node()
+    username = os.getenv("USER", os.getenv("USERNAME", ""))
+
+    # Composite identity hash — changes if any of dir/host/user change
+    identity = f"{cwd}:{hostname}:{username}"
+
+    return {
+        "X-AX-FP": hashlib.sha256(identity.encode()).hexdigest()[:24],
+        "X-AX-FP-Token": hashlib.sha256(token.encode()).hexdigest()[:16],
+        "X-AX-FP-OS": f"{platform.system()}/{platform.release()}",
+        "X-AX-FP-Arch": platform.machine(),
+    }
+
+
+# Honeypot key prefixes — these look like real credentials from other
+# platforms but are actually traps. If anyone uses one, the CLI alerts
+# the aX platform immediately with full fingerprint data.
+HONEYPOT_PREFIXES = {
+    "AKIA":       "aws-iam",       # AWS IAM access key
+    "ASIA":       "aws-sts",       # AWS STS temporary key
+    "ghp_":       "github-pat",    # GitHub personal access token
+    "gho_":       "github-oauth",  # GitHub OAuth token
+    "ghs_":       "github-app",    # GitHub App token
+    "sk-":        "openai",        # OpenAI API key
+    "sk-ant-":    "anthropic",     # Anthropic API key
+    "xoxb-":      "slack-bot",     # Slack bot token
+    "xoxp-":      "slack-user",    # Slack user token
+    "SG.":        "sendgrid",      # SendGrid API key
+    "key-":       "generic",       # Generic API key
+}
+
+
+def _check_honeypot(token: str, base_url: str) -> None:
+    """Check if a token matches a honeypot pattern and alert the platform.
+
+    Honeypot keys look like real credentials from AWS, GitHub, etc.
+    They can be planted in repos, .env files, or config to detect
+    unauthorized access. When someone tries to use one, we fire an
+    alert to aX with the fingerprint of whoever triggered it.
+    """
+    for prefix, provider in HONEYPOT_PREFIXES.items():
+        if token.startswith(prefix):
+            fp = _build_fingerprint(token)
+            alert = {
+                "event": "honeypot_triggered",
+                "provider_pattern": provider,
+                "prefix": prefix,
+                "token_hash": hashlib.sha256(token.encode()).hexdigest(),
+                "fingerprint": fp,
+            }
+            try:
+                httpx.post(
+                    f"{base_url}/api/v1/security/honeypot",
+                    json=alert,
+                    timeout=5.0,
+                )
+            except Exception:
+                pass  # Best-effort — don't block the caller
+            return
 
 
 class AxClient:
     def __init__(self, base_url: str, token: str, *, agent_name: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.token = token
+
+        # Check for honeypot keys before doing anything else
+        _check_honeypot(token, self.base_url)
+
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        self._headers.update(_build_fingerprint(token))
         if agent_name:
             self._headers["X-Agent-Name"] = agent_name
         self._http = httpx.Client(
@@ -35,30 +112,42 @@ class AxClient:
             return {**self._headers, "X-Agent-Id": agent_id}
         return self._headers
 
+    def _parse_json(self, r: httpx.Response) -> dict:
+        """Parse JSON response, raising a clear error if HTML is returned."""
+        content_type = r.headers.get("content-type", "")
+        if "text/html" in content_type or r.text.lstrip().startswith("<!"):
+            raise httpx.HTTPStatusError(
+                f"Expected JSON but got HTML from {r.url} — "
+                f"the frontend may be catching this API route",
+                request=r.request,
+                response=r,
+            )
+        return r.json()
+
     # --- Identity ---
 
     def whoami(self) -> dict:
         """GET /auth/me — returns user identity."""
         r = self._http.get("/auth/me")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     # --- Spaces ---
 
     def list_spaces(self) -> list[dict]:
         r = self._http.get("/api/v1/spaces")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def get_space(self, space_id: str) -> dict:
         r = self._http.get(f"/api/v1/spaces/{space_id}")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def list_space_members(self, space_id: str) -> list[dict]:
         r = self._http.get(f"/api/v1/spaces/{space_id}/members")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     # --- Messages ---
 
@@ -77,7 +166,7 @@ class AxClient:
         r = self._http.post("/api/v1/messages", json=body,
                             headers=self._with_agent(agent_id))
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def upload_file(self, file_path: str) -> dict:
         """POST /api/v1/uploads — upload a local file.
@@ -102,7 +191,7 @@ class AxClient:
                     files={"file": (path.name, fh, content_type)},
                 )
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def list_messages(self, limit: int = 20, channel: str = "main", *,
                       agent_id: str | None = None) -> dict:
@@ -110,18 +199,18 @@ class AxClient:
                            params={"limit": limit, "channel": channel},
                            headers=self._with_agent(agent_id))
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def get_message(self, message_id: str) -> dict:
         r = self._http.get(f"/api/v1/messages/{message_id}")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def edit_message(self, message_id: str, content: str) -> dict:
         r = self._http.patch(f"/api/v1/messages/{message_id}",
                              json={"content": content})
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def delete_message(self, message_id: str) -> int:
         r = self._http.delete(f"/api/v1/messages/{message_id}")
@@ -132,12 +221,12 @@ class AxClient:
         r = self._http.post(f"/api/v1/messages/{message_id}/reactions",
                             json={"emoji": emoji})
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def list_replies(self, message_id: str) -> dict:
         r = self._http.get(f"/api/v1/messages/{message_id}/replies")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     # --- Tasks ---
 
@@ -152,36 +241,36 @@ class AxClient:
         r = self._http.post("/api/v1/tasks", json=body,
                             headers=self._with_agent(agent_id))
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def list_tasks(self, limit: int = 20, *, agent_id: str | None = None) -> dict:
         r = self._http.get("/api/v1/tasks", params={"limit": limit},
                            headers=self._with_agent(agent_id))
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def get_task(self, task_id: str) -> dict:
         r = self._http.get(f"/api/v1/tasks/{task_id}")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def update_task(self, task_id: str, **fields) -> dict:
         r = self._http.patch(f"/api/v1/tasks/{task_id}", json=fields)
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     # --- Agents ---
 
     def list_agents(self) -> dict:
         r = self._http.get("/api/v1/agents")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def get_agents_presence(self) -> dict:
         """GET /api/v1/agents/presence — bulk presence for all agents."""
         r = self._http.get("/api/v1/agents/presence")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def create_agent(self, name: str, **kwargs) -> dict:
         """POST /api/v1/agents — create a new agent."""
@@ -192,25 +281,25 @@ class AxClient:
                 body[key] = kwargs[key]
         r = self._http.post("/api/v1/agents", json=body)
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def get_agent(self, identifier: str) -> dict:
         """GET /api/v1/agents/manage/{identifier} — get by name or UUID."""
         r = self._http.get(f"/api/v1/agents/manage/{identifier}")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def update_agent(self, identifier: str, **fields) -> dict:
         """PUT /api/v1/agents/manage/{identifier} — update agent."""
         r = self._http.put(f"/api/v1/agents/manage/{identifier}", json=fields)
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def delete_agent(self, identifier: str) -> dict:
         """DELETE /api/v1/agents/manage/{identifier} — delete agent."""
         r = self._http.delete(f"/api/v1/agents/manage/{identifier}")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def get_agent_tools(self, space_id: str, agent_id: str) -> dict:
         """GET /{space_id}/roster filtered to one agent — returns enabled_tools."""
@@ -219,7 +308,7 @@ class AxClient:
             params={"entry_type": "agent"},
         )
         r.raise_for_status()
-        roster = r.json()
+        roster = self._parse_json(r)
         entries = roster.get("entries", roster) if isinstance(roster, dict) else roster
         for entry in (entries if isinstance(entries, list) else []):
             if str(entry.get("id")) == agent_id:
@@ -241,12 +330,12 @@ class AxClient:
             body["ttl"] = ttl
         r = self._http.post("/api/v1/context", json=body)
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def get_context(self, key: str) -> dict:
         r = self._http.get(f"/api/v1/context/{key}")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def list_context(self, prefix: str | None = None) -> dict:
         params = {}
@@ -254,7 +343,7 @@ class AxClient:
             params["prefix"] = prefix
         r = self._http.get("/api/v1/context", params=params)
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def delete_context(self, key: str) -> int:
         r = self._http.delete(f"/api/v1/context/{key}")
@@ -269,7 +358,7 @@ class AxClient:
                             json={"query": query, "limit": limit},
                             headers=self._with_agent(agent_id))
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     # --- Keys (PAT management) ---
 
@@ -280,12 +369,12 @@ class AxClient:
             body["allowed_agent_ids"] = allowed_agent_ids
         r = self._http.post("/api/v1/keys", json=body)
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def list_keys(self) -> list[dict]:
         r = self._http.get("/api/v1/keys")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     def revoke_key(self, credential_id: str) -> int:
         r = self._http.delete(f"/api/v1/keys/{credential_id}")
@@ -294,7 +383,7 @@ class AxClient:
     def rotate_key(self, credential_id: str) -> dict:
         r = self._http.post(f"/api/v1/keys/{credential_id}/rotate")
         r.raise_for_status()
-        return r.json()
+        return self._parse_json(r)
 
     # --- SSE ---
 

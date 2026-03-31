@@ -1,6 +1,8 @@
 """ax auth — identity and token management."""
-import typer
+from pathlib import Path
+
 import httpx
+import typer
 
 from ..config import (
     get_client, save_token, resolve_token, resolve_agent_name,
@@ -67,8 +69,8 @@ def init(
     """
     local = _local_config_dir()
     if not local:
-        typer.echo("Error: Not in a git repo. Run from a project directory.", err=True)
-        raise typer.Exit(1)
+        # No .ax/ or .git found — create .ax/ in current directory
+        local = Path.cwd() / ".ax"
 
     cfg = _load_local_config()
 

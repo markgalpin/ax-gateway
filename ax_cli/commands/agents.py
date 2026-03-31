@@ -86,10 +86,18 @@ def update_agent(
     description: str = typer.Option(None, "--description", "-d"),
     system_prompt: str = typer.Option(None, "--system-prompt"),
     model: str = typer.Option(None, "--model", "-m"),
+    agent_type: str = typer.Option(None, "--type", "-t", help="Agent type: sentinel, assistant, cloud_gcp, etc."),
+    bio: str = typer.Option(None, "--bio", "-b", help="Short bio"),
+    specialization: str = typer.Option(None, "--specialization", "-s", help="Specialization area"),
     status: str = typer.Option(None, "--status", help="active or inactive"),
     as_json: bool = JSON_OPTION,
 ):
-    """Update an agent."""
+    """Update an agent's metadata.
+
+    Examples:
+        ax agents update backend_sentinel --type sentinel --model claude-sonnet-4-6
+        ax agents update anvil --bio "Infra and ops" --specialization "server management"
+    """
     client = get_client()
     fields = {}
     if description is not None:
@@ -98,11 +106,17 @@ def update_agent(
         fields["system_prompt"] = system_prompt
     if model is not None:
         fields["model"] = model
+    if agent_type is not None:
+        fields["agent_type"] = agent_type
+    if bio is not None:
+        fields["bio"] = bio
+    if specialization is not None:
+        fields["specialization"] = specialization
     if status is not None:
         fields["status"] = status
 
     if not fields:
-        typer.echo("Nothing to update. Use --description, --system-prompt, --model, or --status.", err=True)
+        typer.echo("Nothing to update. Use --type, --model, --bio, --description, --status, etc.", err=True)
         raise typer.Exit(1)
 
     try:

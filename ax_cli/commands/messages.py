@@ -242,10 +242,11 @@ def list_messages(
         for m in messages:
             c = str(m.get("content", ""))
             m["content_short"] = c[:60] + "..." if len(c) > 60 else c
+            m["sender"] = m.get("display_name") or m.get("sender_handle") or m.get("sender_type", "")
         print_table(
             ["ID", "Sender", "Content", "Created At"],
             messages,
-            keys=["id", "sender_handle", "content_short", "created_at"],
+            keys=["id", "sender", "content_short", "created_at"],
         )
 
 
@@ -320,8 +321,9 @@ def search(
         for m in results:
             c = str(m.get("content", ""))
             m["content_short"] = c[:60] + "..." if len(c) > 60 else c
+            m["sender"] = m.get("display_name") or m.get("sender_handle") or m.get("sender_type", "")
         print_table(
             ["ID", "Sender", "Content", "Created At"],
             results,
-            keys=["id", "sender_handle", "content_short", "created_at"],
+            keys=["id", "sender", "content_short", "created_at"],
         )
