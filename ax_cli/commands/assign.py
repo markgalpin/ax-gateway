@@ -10,6 +10,30 @@ from ..output import JSON_OPTION, print_json, handle_error, console
 
 app = typer.Typer(name="assign", help="Assign work to agents and track completion", no_args_is_help=True)
 
+# Prompt templates by verb — each alias has its own tone
+_PROMPTS = {
+    "assign": "@{agent} Assignment: {instructions}\n\nTask ID: `{tid}…`\n\n@mention @orion when done.",
+    "ship": "@{agent} Ship this: {instructions}\n\nThis needs to land. Branch from dev/staging, push clean code, open PR. Task: `{tid}…`\n\n@mention @orion when shipped.",
+    "manage": "@{agent} Managed task: {instructions}\n\nPlease work through this methodically. Update status as you go. Task: `{tid}…`\n\n@mention @orion with progress or when complete.",
+    "boss": "@{agent} Get this done: {instructions}\n\nNo excuses, no investigations, no reports. Ship code. Task: `{tid}…`\n\n@mention @orion when it's done. Don't come back without a branch.",
+}
+
+_NUDGES = {
+    "assign": "@{agent} Status check — are you still working on: {instructions}? Task: `{tid}…`",
+    "ship": "@{agent} This needs to ship. Where are we on: {instructions}? Task: `{tid}…`",
+    "manage": "@{agent} Checking in — any blockers on: {instructions}? Task: `{tid}…`",
+    "boss": "@{agent} Still waiting. What's the holdup on: {instructions}? Task: `{tid}…`",
+}
+
+
+def _detect_verb() -> str:
+    """Detect which alias invoked us (assign/ship/manage/boss)."""
+    import sys
+    args = sys.argv[1:2]
+    if args and args[0] in _PROMPTS:
+        return args[0]
+    return "assign"
+
 
 @app.callback(invoke_without_command=True)
 def assign(
@@ -35,8 +59,9 @@ def assign(
     client = get_client()
     sid = resolve_space_id(client, explicit=space_id)
 
-    # Normalize agent name
+    # Normalize agent name and detect verb
     agent_name = agent.lstrip("@")
+    verb = _detect_verb()
 
     # Step 1: Create task
     console.print(f"[cyan]Creating task for @{agent_name}...[/cyan]")
@@ -53,8 +78,9 @@ def assign(
     tid_short = task_id[:8]
     console.print(f"[green]Task created:[/green] {tid_short}… ({priority})")
 
-    # Step 2: Send assignment message
-    content = f"@{agent_name} Assignment: {instructions}\n\nTask ID: `{tid_short}…`\n\n@mention @orion when done."
+    # Step 2: Send assignment message (tone varies by verb)
+    prompt_template = _PROMPTS.get(verb, _PROMPTS["assign"])
+    content = prompt_template.format(agent=agent_name, instructions=instructions, tid=tid_short)
     try:
         msg = client.send_message(sid, content)
         msg_id = msg.get("id", msg.get("message", {}).get("id", ""))
@@ -81,9 +107,10 @@ def assign(
             # Timeout — nudge
             console.print(f"[yellow]No response from @{agent_name} in {timeout}s. Nudging...[/yellow]")
             try:
+                nudge_template = _NUDGES.get(verb, _NUDGES["assign"])
                 client.send_message(
                     sid,
-                    f"@{agent_name} Status check — are you still working on: {instructions[:80]}? Task: `{tid_short}…`",
+                    nudge_template.format(agent=agent_name, instructions=instructions[:80], tid=tid_short),
                 )
             except Exception:
                 pass
