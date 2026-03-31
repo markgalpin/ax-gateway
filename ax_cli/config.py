@@ -1,7 +1,11 @@
 """Token / URL / space resolution and client factory.
 
-Config resolution: project-local .ax/config.toml → ~/.ax/config.toml
+Config resolution: CWD .ax/config.toml → project-local .ax/config.toml → ~/.ax/config.toml
 Agent identity lives with the workspace, not the machine.
+
+IMPORTANT: All writes go to the current working directory by default.
+Each agent should run from its own directory. Config is local to where
+the agent operates — never shared via ~/.ax/ unless explicitly requested.
 """
 import os
 from pathlib import Path
@@ -62,8 +66,8 @@ def _load_config() -> dict:
     return merged
 
 
-def _save_config(cfg: dict, *, local: bool = False) -> None:
-    """Save config. local=True writes to project .ax/, else ~/.ax/."""
+def _save_config(cfg: dict, *, local: bool = True) -> None:
+    """Save config. Default: writes to CWD .ax/. Use local=False for ~/.ax/."""
     if local:
         d = _local_config_dir()
         if not d:
@@ -170,13 +174,13 @@ def resolve_space_id(client: AxClient, *, explicit: str | None = None) -> str:
     raise typer.Exit(1)
 
 
-def save_token(token: str, *, local: bool = False) -> None:
+def save_token(token: str, *, local: bool = True) -> None:
     cfg = _load_local_config() if local else _load_global_config()
     cfg["token"] = token
     _save_config(cfg, local=local)
 
 
-def save_space_id(space_id: str, *, local: bool = False) -> None:
+def save_space_id(space_id: str, *, local: bool = True) -> None:
     cfg = _load_local_config() if local else _load_global_config()
     cfg["space_id"] = space_id
     _save_config(cfg, local=local)

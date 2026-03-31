@@ -107,10 +107,18 @@ def init(
 
 
 @token_app.command("set")
-def token_set(token: str = typer.Argument(..., help="PAT token (axp_u_...)")):
-    """Save token to ~/.ax/config.toml."""
-    save_token(token)
-    typer.echo(f"Token saved to {_global_config_dir() / 'config.toml'}")
+def token_set(
+    token: str = typer.Argument(..., help="PAT token (axp_u_...)"),
+    global_: bool = typer.Option(False, "--global", "-g", help="Save to ~/.ax/ instead of local .ax/"),
+):
+    """Save token to local .ax/config.toml (default) or ~/.ax/ with --global."""
+    save_token(token, local=not global_)
+    if global_:
+        config_path = _global_config_dir() / "config.toml"
+    else:
+        local_dir = _local_config_dir() or (Path.cwd() / ".ax")
+        config_path = local_dir / "config.toml"
+    typer.echo(f"Token saved to {config_path}")
 
 
 @token_app.command("show")
