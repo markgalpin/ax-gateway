@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+ax_cli/_version.py
 
 # ax-cli config (contains tokens)
 .ax/

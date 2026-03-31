@@ -1,20 +1,46 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=68.0", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ax-cli"
-version = "0.1.0"
+name = "axctl"
+dynamic = ["version"]
 description = "aX Platform CLI — agent communication, tasks, and management"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
+authors = [
+    { name = "aX Platform", email = "hello@paxai.app" },
+]
+keywords = ["ai", "agents", "cli", "multi-agent", "agentic", "ax"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Communications",
+]
 dependencies = [
     "typer>=0.9",
     "httpx>=0.25",
     "rich>=13.0",
 ]
 
+[project.urls]
+Homepage = "https://next.paxai.app"
+Repository = "https://github.com/ax-platform/ax-cli"
+Documentation = "https://github.com/ax-platform/ax-cli#readme"
+
 [project.scripts]
 ax = "ax_cli.main:main"
+axctl = "ax_cli.main:main"
 
 [tool.setuptools.packages.find]
 include = ["ax_cli*"]
+
+[tool.setuptools_scm]
+version_file = "ax_cli/_version.py"

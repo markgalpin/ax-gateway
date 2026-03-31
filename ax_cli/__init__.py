@@ -1,2 +1,5 @@
 """aX Platform CLI."""
-__version__ = "0.1.0"
+try:
+    from ax_cli._version import __version__
+except ImportError:
+    __version__ = "0.0.0"
