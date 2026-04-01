@@ -175,9 +175,9 @@ def _watch_for_agent(client, agent_name: str, *, timeout: int = 300) -> str | No
     """
     deadline = time.time() + timeout
     seen_ids: set[str] = set()
-    poll_interval = 5.0
+    poll_interval = 3.0  # Check every 3 seconds — agents respond fast
     latest_content: str | None = None
-    completion_signals = ["done", "pushed", "merged", "completed", "finished", "pr ", "pull request", "branch "]
+    completion_signals = ["done", "pushed", "merged", "completed", "finished", "pr ", "pull request", "branch ", "shipped", "implemented", "opened pr"]
 
     # Snapshot current message IDs so we only see NEW messages
     try:
@@ -204,15 +204,21 @@ def _watch_for_agent(client, agent_name: str, *, timeout: int = 300) -> str | No
                 seen_ids.add(msg_id)
 
                 # Check if this message is from our target agent
+                # Agents don't always @mention — check all sender fields
+                sender_candidates = []
                 author = msg.get("author", {})
                 if isinstance(author, dict):
-                    sender = author.get("username", "")
+                    sender_candidates.append(author.get("username", ""))
+                    sender_candidates.append(author.get("name", ""))
+                    sender_candidates.append(author.get("agent_name", ""))
                 elif isinstance(author, str):
-                    sender = author
-                else:
-                    sender = str(msg.get("agent_name", msg.get("sender", "")))
+                    sender_candidates.append(author)
+                sender_candidates.append(str(msg.get("agent_name", "")))
+                sender_candidates.append(str(msg.get("sender", "")))
+                sender_candidates.append(str(msg.get("sender_type", "")))
 
-                if agent_name.lower() in sender.lower():
+                sender_str = " ".join(c for c in sender_candidates if c).lower()
+                if agent_name.lower() in sender_str:
                     content = msg.get("content", "(no content)")
                     latest_content = content
                     console.print(f"  [dim]@{agent_name}: {content[:120]}[/dim]")
