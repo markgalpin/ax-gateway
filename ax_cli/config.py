@@ -87,7 +87,29 @@ def _save_config(cfg: dict, *, local: bool = True) -> None:
     cf.chmod(0o600)
 
 
+def _check_config_permissions() -> None:
+    """AUTH-SPEC-001 §13: Refuse PAT files with permissions broader than 0600."""
+    for config_dir_fn in (_local_config_dir, _global_config_dir):
+        try:
+            d = config_dir_fn() if callable(config_dir_fn) else config_dir_fn
+            if not d:
+                continue
+            cf = d / "config.toml" if not str(d).endswith("config.toml") else d
+            if cf.exists():
+                mode = cf.stat().st_mode & 0o777
+                if mode > 0o600:
+                    import sys
+                    print(
+                        f"WARNING: {cf} has permissions {oct(mode)} — should be 0600. "
+                        f"Run: chmod 600 {cf}",
+                        file=sys.stderr,
+                    )
+        except Exception:
+            pass
+
+
 def resolve_token() -> str | None:
+    _check_config_permissions()
     return os.environ.get("AX_TOKEN") or _load_config().get("token")
 
 
