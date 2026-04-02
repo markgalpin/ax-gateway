@@ -55,8 +55,7 @@ def whoami(as_json: bool = JSON_OPTION):
 def init(
     token: str = typer.Option(None, "--token", "-t", help="PAT token (axp_u_... or axp_a_...)"),
     base_url: str = typer.Option("http://localhost:8002", "--url", "-u", help="API base URL"),
-    agent_name: str = typer.Option(None, "--agent", "-a", help="Default agent name (auto-detected if not set)"),
-    agent_id: str = typer.Option(None, "--agent-id", help="Agent ID (auto-detected if not set)"),
+    agent: str = typer.Option(None, "--agent", "-a", help="Agent name or ID (auto-detected if not set)"),
     space_id: str = typer.Option(None, "--space-id", "-s", help="Space ID (auto-detected if not set)"),
 ):
     """Set up authentication for this project.
@@ -81,6 +80,16 @@ def init(
         console.print("[red]Token required.[/red] Get one from Settings > Credentials in the UI.")
         console.print("  ax auth init --token axp_u_YOUR_TOKEN_HERE")
         raise typer.Exit(1)
+
+    # --agent accepts both name and UUID
+    import re
+    _uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+    agent_name = None
+    agent_id = None
+    if agent and _uuid_pattern.match(agent):
+        agent_id = agent
+    elif agent:
+        agent_name = agent
 
     try:
         local = _local_config_dir(create=True)
@@ -127,6 +136,23 @@ def init(
             cfg["agent_id"] = data.get("agent_id", "")
             cfg["agent_name"] = data.get("agent_name", resolved_name or "")
             registered = True
+
+            # Cache the JWT from enrollment so AxClient doesn't double-exchange
+            if data.get("access_token") and data.get("expires_in"):
+                try:
+                    from ..token_cache import TokenExchanger
+                    exchanger = TokenExchanger(base_url, token)
+                    import time
+                    exchanger._cache["enrollment"] = {
+                        "access_token": data["access_token"],
+                        "exp": time.time() + data["expires_in"],
+                        "token_class": "agent_access",
+                        "pat_key_id": exchanger.pat_key_id,
+                    }
+                    exchanger._save_disk_cache()
+                except Exception:
+                    pass
+
             if resolved_name:
                 console.print(f"[green]Agent registered:[/green] {cfg['agent_name']} ({cfg['agent_id'][:12]}...)")
             else:
