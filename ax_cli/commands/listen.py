@@ -60,8 +60,17 @@ def _should_respond(data: dict, agent_name: str, agent_id: str | None) -> bool:
     if not isinstance(data, dict):
         return False
     content = data.get("content", "")
-    sender = data.get("display_name") or data.get("username") or ""
-    sender_id = data.get("agent_id") or ""
+
+    # SSE events use different field names depending on event type:
+    # 'message' events have author as dict {"id": ..., "name": ..., "type": ...}
+    # 'mention' events have author as string, plus sender_name
+    author = data.get("author")
+    if isinstance(author, dict):
+        sender = author.get("name", "")
+        sender_id = author.get("id", "")
+    else:
+        sender = data.get("display_name") or data.get("username") or data.get("sender_name") or (author if isinstance(author, str) else "")
+        sender_id = data.get("agent_id") or ""
 
     if sender.lower() == agent_name.lower():
         return False
@@ -312,13 +321,7 @@ def listen(
     # SSE loop with auto-reconnect
     while True:
         try:
-            url = f"{client.base_url}/api/sse/messages"
-            params = {"token": client.token}
-
-            with httpx.stream(
-                "GET", url, params=params,
-                timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0),
-            ) as resp:
+            with client.connect_sse() as resp:
                 if resp.status_code != 200:
                     console.print(f"[red]SSE failed: {resp.status_code}[/red]")
                     raise ConnectionError()

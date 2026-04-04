@@ -209,8 +209,11 @@ def save_space_id(space_id: str, *, local: bool = True) -> None:
 
 
 def resolve_agent_id() -> str | None:
-    """Resolve agent_id from env or config."""
-    return os.environ.get("AX_AGENT_ID") or _load_config().get("agent_id")
+    """Resolve agent_id from env or config. Set AX_AGENT_ID=none to explicitly clear."""
+    env = os.environ.get("AX_AGENT_ID")
+    if env is not None:
+        return None if env.lower() in ("", "none", "null") else env
+    return _load_config().get("agent_id")
 
 
 def get_client() -> AxClient:
