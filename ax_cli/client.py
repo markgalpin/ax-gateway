@@ -18,6 +18,23 @@ from pathlib import Path
 import httpx
 
 
+_EXT_MIME: dict[str, str] = {
+    ".md": "text/markdown", ".markdown": "text/markdown",
+    ".csv": "text/csv", ".json": "application/json",
+    ".pdf": "application/pdf", ".png": "image/png",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+    ".txt": "text/plain", ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+def _mime_from_ext(ext: str) -> str | None:
+    return _EXT_MIME.get(ext)
+
+
 def _build_fingerprint(token: str) -> dict[str, str]:
     """Build credential fingerprint headers sent on every request.
 
@@ -183,9 +200,13 @@ class AxClient:
         self._http = _RetryOnAuthClient(inner, get_fresh)
 
     def _get_jwt(self, *, force_refresh: bool = False) -> str:
-        """Get a JWT from the exchanger with appropriate token class."""
-        is_agent_pat = self.token.startswith("axp_a_")
-        if is_agent_pat and self.agent_id:
+        """Get a JWT from the exchanger with appropriate token class.
+
+        Token class selection: use agent_access when agent_id is set,
+        regardless of PAT prefix. Server determines class from credential
+        binding, not prefix (axp_u_ can be agent-bound).
+        """
+        if self.agent_id:
             return self._exchanger.get_token(
                 "agent_access", agent_id=self.agent_id,
                 scope="messages tasks context agents spaces search",
@@ -216,21 +237,11 @@ class AxClient:
 
         AUTH-SPEC-001 §13: --agent affects exchange parameters only.
         No X-Agent-Id/X-Agent-Name headers with exchange auth.
-        Token class follows PAT type: axp_a_ → agent_access, axp_u_ → user_access.
+        Uses agent_access when agent_id is set (server determines PAT class
+        from credential binding, not prefix).
         """
         if self._exchanger:
-            is_agent_pat = self.token.startswith("axp_a_")
-            if is_agent_pat and self.agent_id:
-                jwt = self._exchanger.get_token(
-                    "agent_access",
-                    agent_id=self.agent_id,
-                    scope="messages tasks context agents spaces search",
-                )
-            else:
-                jwt = self._exchanger.get_token(
-                    "user_access",
-                    scope="messages tasks context agents spaces search",
-                )
+            jwt = self._get_jwt()
             return {**self._base_headers, "Authorization": f"Bearer {jwt}"}
         return {**self._base_headers, "Authorization": f"Bearer {self.token}"}
 
@@ -323,7 +334,7 @@ class AxClient:
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        content_type = _mime_from_ext(path.suffix.lower()) or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         headers = {k: v for k, v in self._auth_headers().items() if k != "Content-Type"}
 
         with path.open("rb") as fh:
