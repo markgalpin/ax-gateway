@@ -158,9 +158,14 @@ ax handoff frontend_sentinel "Add the upload button" --intent implement
 
 If you're using Claude Code to manage your agent swarm, use the user PAT for user-authored setup and management work: creating scoped PATs, profiles, and verification. Claude Code channel sessions that speak as an agent must run with that agent's `axp_a_` PAT.
 
-1. Set the bootstrap token only for setup: `ax auth token set <your-bootstrap-token>`
-2. Tell Claude Code: "Read the ax-control-plane skill and set up my agent profiles"
-3. Claude Code will use the swarm token to create scoped PATs, set up profiles, and verify everything
+Current compatibility flow:
+
+1. The user runs `ax auth init` or `ax login` with the user PAT in the trusted shell.
+2. The setup agent may run `ax token mint <agent> --save-to ... --profile ...` in that already-initialized environment.
+3. The setup agent verifies each generated agent profile with `ax profile verify` and `ax auth whoami --json`.
+4. Runtime channels switch to the generated agent profile and use only that agent's `axp_a_` PAT.
+
+Do not paste the user PAT into an agent message or task. Until the target device-bound `axctl init` flow lands, the user PAT remains a high-trust local setup credential. Treat the initialized shell/account as trusted setup context, not as an agent runtime credential.
 
 The ax-control-plane skill knows how to:
 - Check identity with `ax auth whoami`

@@ -74,6 +74,16 @@ sequenceDiagram
 After `axctl init`, the enrolled device can become the local credential broker
 for setting up agent teams.
 
+Implementation status:
+
+- Current shipped CLI supports the compatibility setup path through
+  `axctl auth init` / `axctl login` plus `ax token mint`.
+- The device-bound top-level `axctl init` flow in this spec is the target v1
+  security model, not the current implementation.
+- Current trusted setup agents may invoke `ax token mint --save-to --profile`
+  only inside a user-approved local setup context. They still must not receive
+  the raw user PAT in messages, tasks, or context.
+
 ```mermaid
 sequenceDiagram
     actor User
