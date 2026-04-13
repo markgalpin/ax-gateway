@@ -26,6 +26,7 @@ Critical rule:
 | User bootstrap token | One-time or short-lived token shown once in the aX UI and pasted into `axctl init`. |
 | Device credential | Long-lived local credential created during init and bound to a local device keypair. |
 | Device keypair | Locally generated asymmetric keypair. Public key is registered with aX; private key remains local. |
+| Trusted setup agent | A local automation agent explicitly trusted by the user to run setup commands on the enrolled device. It may invoke `axctl`, but it must not receive raw user bootstrap token material. |
 | Agent PAT | Scoped token minted for one agent/audience and used only to exchange for short-lived JWTs. |
 | Access JWT | Short-lived bearer token used for actual API calls. |
 
@@ -67,6 +68,52 @@ sequenceDiagram
     CLI->>API: Verify with device credential
     API-->>CLI: Short user/device JWT
 ```
+
+## Agent Team Setup Flow
+
+After `axctl init`, the enrolled device can become the local credential broker
+for setting up agent teams.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant CLI as axctl on trusted device
+    participant Agent as Trusted setup agent
+    participant API as aX API
+    participant FS as Local secret store / mode 0600 files
+
+    User->>CLI: axctl init
+    CLI->>API: Enroll device
+    API-->>CLI: Device credential
+    User->>Agent: Set up @orion, @cipher, @sentinel
+    Agent->>CLI: ax token mint --create --profile --save-to
+    CLI->>API: Device/user authorized PAT request
+    API-->>CLI: Scoped agent PAT shown once
+    CLI->>FS: Store agent PAT and profile
+    CLI-->>Agent: Return redacted setup metadata
+    Agent->>CLI: ax profile verify <agent-profile>
+    CLI->>API: Exchange agent PAT for agent JWT
+    API-->>CLI: Verified agent identity
+```
+
+Rules:
+
+- The user bootstrap token is consumed by `axctl init` and then discarded.
+- The trusted setup agent can ask `axctl` to create profiles and scoped agent
+  PATs, but it must not read the user bootstrap token.
+- If the CLI stores a newly minted agent PAT, command output should default to
+  redacted metadata. Raw agent PAT printing requires an explicit flag.
+- Each runtime agent receives its own profile and agent-bound credential.
+- The backend remains the authority for whether the device/user context may mint
+  each agent credential.
+
+Important local trust caveat:
+
+If a setup agent has unrestricted shell access to the same Unix account as the
+user, local file permissions alone are not a hard isolation boundary. The v1
+security boundary is backend policy plus avoiding raw user-token storage. OS
+secret storage, device signing, and hardware-backed keys should progressively
+reduce local credential exposure.
 
 ## `axctl init` UX
 
@@ -122,6 +169,10 @@ Prohibited:
 - Raw bootstrap tokens in global config.
 - Raw bootstrap tokens in agent worktrees.
 - Raw bootstrap tokens exposed through `profile env`.
+
+For agent-team setup, stored agent PATs may use mode `0600` files in v1. The
+CLI must clearly distinguish these scoped runtime credentials from the user
+bootstrap credential.
 
 ## Local PIN
 
@@ -200,6 +251,8 @@ Non-negotiable v1 properties:
 - Device credential is stored in OS secure storage when available.
 - Device enrollment and credential use are audited.
 - User can revoke the device independently from agent credentials.
+- Trusted setup agents can configure agent profiles without raw user bootstrap
+  token access.
 
 ## Acceptance Criteria
 
@@ -209,3 +262,5 @@ Non-negotiable v1 properties:
 - `axctl profile env` never prints a user bootstrap token.
 - The backend records `device_id`, public key fingerprint, user id, and created time.
 - The UI can show enrolled devices and revoke one device without revoking all agent PATs.
+- `ax token mint --save-to` can store a scoped agent PAT without printing it to
+  stdout by default.

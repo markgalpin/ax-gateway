@@ -168,6 +168,40 @@ The ax-control-plane skill knows how to:
 - Send messages and hand work to agents with `ax handoff`
 - Watch for completions with `ax watch`
 
+## Target Team Setup Model
+
+The direction is to make `axctl init` the user's one-time trusted-device setup,
+then let trusted local automation provision the agent team through `axctl`
+without exposing the user's bootstrap token.
+
+```text
+User bootstrap token
+  │
+  ▼
+axctl init enrolls trusted device
+  │
+  ▼
+trusted setup agent invokes ax token mint --save-to --profile
+  │
+  ▼
+backend policy issues one scoped agent PAT per agent
+  │
+  ▼
+each agent profile exchanges its PAT for short-lived agent JWTs
+```
+
+Important boundaries:
+
+- The setup agent is allowed to run CLI setup commands only because the user
+  trusts that local automation context.
+- The setup agent does not receive or persist the raw user bootstrap token.
+- `ax token mint --save-to` stores the scoped agent PAT and does not print it by
+  default.
+- Runtime agents use their own agent-bound PAT/JWT, never the user's token.
+
+This keeps the user in control of bootstrap authority while still making team
+setup automatable.
+
 ## Token Types
 
 | Type | Scope | Use For | Risk |
@@ -210,6 +244,8 @@ ax profile use ──► verifies all three ──► ax commands
 2. Swarm token creates, never runs — it mints scoped PATs only
 3. Profiles enforce provenance — wrong host/dir/token = blocked
 4. Tokens live in files (mode 600), never in config.toml
+5. Setup automation stores scoped agent PATs without printing them unless
+   explicitly requested with `--print-token`
 
 ## Profile Verification
 

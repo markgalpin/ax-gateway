@@ -43,6 +43,31 @@ flowchart TD
     H --> I[CLI/MCP/API call as agent]
 ```
 
+## Agent Team Bootstrap
+
+The primary team setup workflow is:
+
+```text
+user axctl init -> trusted device -> ax token mint/profile setup -> agent runtimes
+```
+
+This allows a trusted local automation agent to help provision a team without
+ever receiving the user's bootstrap token.
+
+Expected behavior:
+
+- The setup agent invokes `ax token mint --save-to ... --profile ...`.
+- `axctl` authorizes the mint through the enrolled user/device context.
+- The backend verifies policy and issues one scoped agent PAT.
+- `axctl` writes the PAT to the target profile/token file with mode `0600`.
+- CLI output returns profile, token-file path, agent id, audience, and expiry.
+- CLI output does not print the raw PAT unless `--print-token` is explicitly
+  provided.
+
+This is safe enough for trusted local automation because the credential created
+for each agent is scoped to that agent. It is not a substitute for sandboxing
+untrusted code that has shell access to the user's account.
+
 ## Agent PAT Claims / Metadata
 
 Every agent PAT should carry or reference:
@@ -134,7 +159,9 @@ Required behavior:
 - Support `--audience cli|mcp|both`.
 - Support `--expires`.
 - Support `--save-to` and `--profile`.
-- Print raw PAT only in JSON or explicit output modes where the user expects it.
+- Print raw PAT when not saving, because the user must capture it once.
+- When `--save-to` or `--profile` is used, hide the raw PAT by default and
+  require `--print-token` to display it.
 - Never write raw PAT into `.ax/config.toml`.
 
 Example:
