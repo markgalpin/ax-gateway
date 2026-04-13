@@ -9,6 +9,7 @@ agent skills.
 - [AXCTL-BOOTSTRAP-001: Bootstrap and Secure Storage](AXCTL-BOOTSTRAP-001/spec.md)
 - [DEVICE-TRUST-001: Device Trust and Approval](DEVICE-TRUST-001/spec.md)
 - [AGENT-PAT-001: Agent PAT Minting and JWT Exchange](AGENT-PAT-001/spec.md)
+- [IDENTIFIER-DISPLAY-001: Human-Readable Identifier Display](IDENTIFIER-DISPLAY-001/spec.md)
 
 ## Workflow and Delivery
 

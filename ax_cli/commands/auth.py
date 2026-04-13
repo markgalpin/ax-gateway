@@ -26,6 +26,16 @@ app.add_typer(token_app, name="token")
 DEFAULT_LOGIN_BASE_URL = "https://next.paxai.app"
 
 
+def _mask_token_prefix(token: str) -> str:
+    """Show enough token shape to confirm paste without exposing the secret."""
+    token = token.strip()
+    if not token:
+        return "***"
+    if len(token) <= 4:
+        return "*" * len(token)
+    return f"{token[:6]}{'*' * 8}"
+
+
 def _resolve_login_token(token: str | None) -> str:
     """Return an explicit token or prompt for one without echoing it."""
     if token and token.strip():
@@ -36,6 +46,7 @@ def _resolve_login_token(token: str | None) -> str:
     if not entered:
         console.print("[red]Token required.[/red] Get one from Settings > Credentials in the UI.")
         raise typer.Exit(1)
+    console.print(f"[green]Token captured:[/green] {_mask_token_prefix(entered)}")
     return entered
 
 

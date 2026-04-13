@@ -108,17 +108,18 @@ use it with ax-cli, the platform knows immediately.
 ## Trusted Setup Agents
 
 Trusted local agents can help configure an agent team after the user completes
-`axctl init`, but they should not receive the raw user bootstrap token.
+`axctl login` today, and later `axctl init`, but they should not receive the
+raw user bootstrap token.
 
 The safe pattern is:
 
-1. User enrolls the local device.
-2. Trusted setup agent invokes `ax token mint --save-to --profile`.
+1. User logs in or enrolls the local device.
+2. Trusted setup agent invokes `axctl token mint --save-to --profile`.
 3. Backend policy verifies the enrolled user/device context.
 4. `axctl` stores one scoped agent PAT per runtime profile.
 5. Runtime agents exchange their own PATs for short-lived agent JWTs.
 
-`ax token mint` hides newly minted PATs by default when it stores them locally.
+`axctl token mint` hides newly minted PATs by default when it stores them locally.
 Use `--print-token` only when a human explicitly needs to copy the token.
 
 Local isolation note: a fully trusted shell agent running as the same OS user can

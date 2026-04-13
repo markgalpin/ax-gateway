@@ -19,10 +19,10 @@ pip install -e .             # from source
 
 ## Quick Start
 
-Get a user PAT from **Settings > Credentials** at [next.paxai.app](https://next.paxai.app). This is a high-privilege token — treat it like a password. The CLI exchanges it for short-lived user JWTs before calling the API; the raw PAT is not sent to business endpoints.
+Get a user PAT from **Settings > Credentials** at [next.paxai.app](https://next.paxai.app). This is a high-privilege token — treat it like a password and paste it only into your trusted terminal. The CLI exchanges it for short-lived user JWTs before calling the API; the raw PAT is not sent to business endpoints.
 
 ```bash
-# Set up — prompts for your token with hidden input
+# Set up — prompts for your token with hidden input and prints a masked receipt
 axctl login
 
 # Verify
@@ -37,6 +37,8 @@ axctl tasks create "Ship the feature" # create a task
 `axctl login` defaults to `https://next.paxai.app`. Use `--url` only for another environment, for example `axctl login --url https://dev.paxai.app`. Login does not require a space ID; the CLI auto-selects one only when it can do so unambiguously.
 
 User login is stored separately from agent runtime config under `~/.ax/user.toml`. That lets you rotate or refresh the user setup token without overwriting an existing agent workspace profile.
+
+Do not send the user PAT to an agent in chat, tasks, or context. The user should run `axctl login` directly; after that, a trusted setup agent can invoke `axctl token mint` to create scoped agent credentials without seeing the raw user token.
 
 ## Claude Code Channel — Connect from Anywhere
 
@@ -263,7 +265,7 @@ only for storage-only writes where no transcript signal is wanted.
 
 | Command | Description |
 |---------|-------------|
-| `ax auth init --token PAT` | Set up authentication (auto-discovers identity) |
+| `axctl login` | Set up or refresh the user login token without touching agent config |
 | `ax auth whoami` | Current identity + profile + fingerprint |
 | `ax agents list` | List agents in the space |
 | `ax spaces list` | List spaces you belong to |
@@ -290,21 +292,21 @@ only for storage-only writes where no transcript signal is wanted.
 
 ## How Authentication Works
 
-When you run `ax auth init`, the CLI stores your PAT locally. But your PAT never touches the API directly — here's what happens under the hood:
+When you run `axctl login`, the CLI stores your user login separately from agent runtime config in `~/.ax/user.toml`. Your PAT never touches business API endpoints directly — here's what happens under the hood:
 
 1. **You provide a PAT** (`axp_u_...`) — this is your long-lived credential
 2. **The CLI exchanges it for a short-lived JWT** at `/auth/exchange` — this is the only endpoint that ever sees your PAT
 3. **All API calls use the JWT** — messages, tasks, agents, everything
 4. **The JWT is cached** in `.ax/cache/tokens.json` (permissions locked to 0600) and auto-refreshes when it expires
 
-This means your PAT stays safe even if network traffic is logged — business endpoints only ever see a short-lived token. Add both `.ax/config.toml` and `.ax/cache/` to your `.gitignore`.
+This means your PAT stays safer even if network traffic is logged — business endpoints only ever see a short-lived token. Add `.ax/config.toml`, `.ax/user.toml`, and `.ax/cache/` to your `.gitignore` when working in a repository.
 
 ## Configuration
 
-Config lives in `.ax/config.toml` (project-local) or `~/.ax/config.toml` (global). Project-local wins.
+User login lives in `~/.ax/user.toml`. Agent/runtime config lives in `.ax/config.toml` (project-local) or named profiles. Project-local wins for runtime commands.
 
 ```toml
-token = "axp_u_..."
+token = "axp_a_..."
 base_url = "https://next.paxai.app"
 agent_name = "my_agent"
 space_id = "your-space-uuid"
@@ -312,6 +314,8 @@ space_id = "your-space-uuid"
 
 Environment variables override config: `AX_TOKEN`, `AX_BASE_URL`, `AX_AGENT_NAME`, `AX_AGENT_ID`, `AX_SPACE_ID`.
 Set `AX_AGENT_NAME=none` and `AX_AGENT_ID=none` to explicitly clear stale agent identity when you intentionally want to run as the user.
+
+Human-facing output should prefer account, space, and agent slugs/names when the API provides them. UUIDs remain available for `--json`, automation, debugging, and backend calls.
 
 ## Docs
 

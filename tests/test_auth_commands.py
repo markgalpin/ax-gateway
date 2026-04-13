@@ -78,15 +78,20 @@ def test_login_defaults_to_next_without_space_requirement(monkeypatch):
 def test_login_token_prompt_is_masked(monkeypatch):
     """Omitting --token prompts via Typer's hidden input path."""
     prompt_calls = []
+    printed = []
 
     def fake_prompt(label, *, hide_input):
         prompt_calls.append({"label": label, "hide_input": hide_input})
         return " axp_u_prompt.token "
 
     monkeypatch.setattr(auth.typer, "prompt", fake_prompt)
+    monkeypatch.setattr(auth.console, "print", lambda *args, **kwargs: printed.append(str(args[0]) if args else ""))
 
     assert auth._resolve_login_token(None) == "axp_u_prompt.token"
     assert prompt_calls == [{"label": "Token", "hide_input": True}]
+    assert any("Token captured" in line for line in printed)
+    assert "axp_u_prompt.token" not in "\n".join(printed)
+    assert "axp_u_********" in "\n".join(printed)
 
 
 def test_login_space_selection_uses_only_unambiguous_space():

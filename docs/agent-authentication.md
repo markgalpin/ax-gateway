@@ -160,12 +160,13 @@ If you're using Claude Code to manage your agent swarm, use the user PAT for use
 
 Current compatibility flow:
 
-1. The user runs `ax login` in the trusted shell and pastes the user PAT into the hidden prompt.
+1. The user runs `axctl login` in the trusted shell and pastes the user PAT into the hidden prompt.
 2. The CLI stores the user login separately from agent runtime config in `~/.ax/user.toml`.
-3. The setup agent may run `ax token mint <agent> --save-to ... --profile ...` in that already-initialized environment.
-4. `ax token mint` uses the stored user login for credential minting, even when the current working directory has an agent `.ax/config.toml`.
-5. The setup agent verifies each generated agent profile with `ax profile verify` and `ax auth whoami --json`.
-6. Runtime channels switch to the generated agent profile and use only that agent's `axp_a_` PAT.
+3. The hidden prompt prints only a masked receipt, such as `axp_u_********`, so the user can tell the paste was captured without exposing the token.
+4. The setup agent may run `axctl token mint <agent> --save-to ... --profile ...` in that already-initialized environment.
+5. `axctl token mint` uses the stored user login for credential minting, even when the current working directory has an agent `.ax/config.toml`.
+6. The setup agent verifies each generated agent profile with `axctl profile verify` and `axctl auth whoami --json`.
+7. Runtime channels switch to the generated agent profile and use only that agent's `axp_a_` PAT.
 
 Do not paste the user PAT into an agent message or task. Until the target device-bound `axctl init` flow lands, the user PAT remains a high-trust local setup credential. Treat the initialized shell/account as trusted setup context, not as an agent runtime credential.
 
@@ -185,10 +186,10 @@ without exposing the user's bootstrap token.
 User bootstrap token
   │
   ▼
-axctl init enrolls trusted device
+axctl login today / axctl init target
   │
   ▼
-trusted setup agent invokes ax token mint --save-to --profile
+trusted setup agent invokes axctl token mint --save-to --profile
   │
   ▼
 backend policy issues one scoped agent PAT per agent
@@ -202,7 +203,7 @@ Important boundaries:
 - The setup agent is allowed to run CLI setup commands only because the user
   trusts that local automation context.
 - The setup agent does not receive or persist the raw user bootstrap token.
-- `ax token mint --save-to` stores the scoped agent PAT and does not print it by
+- `axctl token mint --save-to` stores the scoped agent PAT and does not print it by
   default.
 - Runtime agents use their own agent-bound PAT/JWT, never the user's token.
 

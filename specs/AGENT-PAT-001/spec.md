@@ -48,7 +48,7 @@ flowchart TD
 The primary team setup workflow is:
 
 ```text
-user axctl init -> trusted device -> ax token mint/profile setup -> agent runtimes
+user axctl login today / axctl init target -> trusted setup context -> axctl token mint/profile setup -> agent runtimes
 ```
 
 This allows a trusted local automation agent to help provision a team without
@@ -56,7 +56,7 @@ ever receiving the user's bootstrap token.
 
 Expected behavior:
 
-- The setup agent invokes `ax token mint --save-to ... --profile ...`.
+- The setup agent invokes `axctl token mint --save-to ... --profile ...`.
 - `axctl` authorizes the mint through the enrolled user/device context.
 - The backend verifies policy and issues one scoped agent PAT.
 - `axctl` writes the PAT to the target profile/token file with mode `0600`.
@@ -145,9 +145,9 @@ Agent PAT exchange response must produce an agent principal:
 }
 ```
 
-## `ax token mint` Contract
+## `axctl token mint` Contract
 
-`ax token mint` should be the primary CLI command for issuing agent PATs.
+`axctl token mint` should be the primary CLI command for issuing agent PATs.
 
 Required behavior:
 
@@ -167,7 +167,7 @@ Required behavior:
 Example:
 
 ```bash
-ax token mint orion --audience cli --expires 30 --profile next-orion
+axctl token mint orion --audience cli --expires 30 --profile next-orion
 ```
 
 ## Approval Policy
@@ -260,7 +260,7 @@ Recommended initial TTLs:
 
 ## Acceptance Criteria
 
-- `ax token mint` can mint a scoped agent PAT from trusted user/device context.
+- `axctl token mint` can mint a scoped agent PAT from trusted user/device context.
 - Agent PAT exchange produces an agent principal, never a user principal.
 - Agent PAT metadata records issuer device id and created-by user id.
 - Raw agent PAT is shown once or stored in OS secure storage / mode `0600` file.

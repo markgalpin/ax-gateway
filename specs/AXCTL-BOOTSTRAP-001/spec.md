@@ -77,12 +77,22 @@ for setting up agent teams.
 Implementation status:
 
 - Current shipped CLI supports the compatibility setup path through
-  `axctl auth init` / `axctl login` plus `ax token mint`.
+  `axctl login` plus `axctl token mint`.
 - The device-bound top-level `axctl init` flow in this spec is the target v1
   security model, not the current implementation.
-- Current trusted setup agents may invoke `ax token mint --save-to --profile`
+- Current trusted setup agents may invoke `axctl token mint --save-to --profile`
   only inside a user-approved local setup context. They still must not receive
   the raw user PAT in messages, tasks, or context.
+
+Compatibility setup flow:
+
+1. The user runs `axctl login` directly in the trusted shell.
+2. The token prompt hides input and then prints a masked receipt, for example
+   `axp_u_********`.
+3. `axctl` stores the user setup credential in `~/.ax/user.toml`, separate from
+   local agent/runtime config.
+4. A trusted setup agent may run `axctl token mint` to create scoped agent
+   credentials, but it does not read the user's raw token.
 
 ```mermaid
 sequenceDiagram
@@ -92,11 +102,11 @@ sequenceDiagram
     participant API as aX API
     participant FS as Local secret store / mode 0600 files
 
-    User->>CLI: axctl init
-    CLI->>API: Enroll device
-    API-->>CLI: Device credential
+    User->>CLI: axctl login today / axctl init target
+    CLI->>API: Verify user setup credential
+    API-->>CLI: User/device authorization
     User->>Agent: Set up @orion, @cipher, @sentinel
-    Agent->>CLI: ax token mint --create --profile --save-to
+    Agent->>CLI: axctl token mint --create --profile --save-to
     CLI->>API: Device/user authorized PAT request
     API-->>CLI: Scoped agent PAT shown once
     CLI->>FS: Store agent PAT and profile
