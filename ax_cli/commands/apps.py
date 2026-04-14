@@ -184,6 +184,11 @@ def _build_signal_metadata(
     return metadata, tool_call_id
 
 
+def _default_signal_message(*, title: str, summary: str | None, context_key: str | None) -> str:
+    details = summary or (f"Context key `{context_key}`" if context_key else None)
+    return f"{title}: {details}" if details else f"{title} signal ready."
+
+
 @app.command("list")
 def list_apps(as_json: bool = JSON_OPTION):
     """List known MCP app surfaces the CLI adapter can signal."""
@@ -250,7 +255,11 @@ def signal(
     )
 
     prefix = _mention_prefix(to)
-    body = message or summary or f"{resolved_title} signal ready."
+    body = message or _default_signal_message(
+        title=resolved_title,
+        summary=summary,
+        context_key=context_key,
+    )
     if prefix:
         body = f"{prefix} {body}"
 

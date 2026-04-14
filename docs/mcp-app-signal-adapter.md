@@ -56,6 +56,24 @@ axctl apps signal context \
   --json
 ```
 
+If `--message` is omitted, the CLI still writes useful transcript prose using
+the app title plus `--summary` or the selected context key. The card is the
+structured signal; the message text is the durable human-readable log line.
+
+Create a task with a task card and task-detail widget metadata:
+
+```bash
+axctl tasks create 'Review the launch checklist' \
+  --description 'Check API, CLI, MCP, and UI smoke paths before promotion.' \
+  --assign orion \
+  --json
+```
+
+The task command creates the task through `/api/v1/tasks`, then posts a normal
+message containing `metadata.ui.cards[0].type = task` and a `ui://tasks/detail`
+widget descriptor. That keeps the task creation visible in the transcript and
+clickable in the app panel.
+
 Signals default to `message_type = system` because they are app events, not
 ordinary chat prose. Override with `--message-type message` only when the event
 should behave like a normal message.
@@ -107,6 +125,11 @@ Success means:
 - `metadata.ui.widget.resource_uri` matches the requested app.
 - `metadata.ui.widget.initial_data` contains the selected context or action
   payload.
+- `metadata.ui.cards[*].payload.source` identifies the CLI/API path that
+  produced the signal, for example `axctl_apps_signal` or
+  `axctl_tasks_create`.
+- The message `content` is useful by itself without requiring the user to open
+  the card.
 - The frontend renders a folded signal card.
 - Clicking the card opens the app panel without replaying the original CLI
   action.

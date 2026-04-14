@@ -141,6 +141,7 @@ def test_apps_signal_flattens_wrapped_context_payload(monkeypatch):
         ):
             calls["metadata"] = metadata
             calls["message_type"] = message_type
+            calls["content"] = content
             return {"id": "msg-2"}
 
     monkeypatch.setattr("ax_cli.commands.apps.get_client", lambda: FakeClient())
@@ -160,6 +161,7 @@ def test_apps_signal_flattens_wrapped_context_payload(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert calls["message_type"] == "system"
+    assert calls["content"] == "Context Explorer: Context key `upload:channel-flow.svg`"
     item = calls["metadata"]["ui"]["widget"]["initial_data"]["items"][0]
     assert item["value"]["type"] == "file_upload"
     assert item["value"]["filename"] == "channel-flow.svg"

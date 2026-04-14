@@ -1,6 +1,7 @@
 """ax tasks — create, list, get, update."""
 
-from typing import Optional
+import uuid
+from typing import Any, Optional
 from uuid import UUID
 
 import httpx
@@ -76,6 +77,96 @@ def _mention_prefix(mention: str | None) -> str:
     return value if value.startswith("@") else f"@{value}"
 
 
+def _task_signal_metadata(
+    task: dict[str, Any],
+    *,
+    space_id: str,
+    title: str,
+    description: str | None,
+    assignee_id: str | None,
+    assignee_label: str | None,
+) -> dict[str, Any]:
+    task_id = str(task.get("id") or "")
+    tool_call_id = f"task:{task_id}" if task_id else str(uuid.uuid4())
+    priority = str(task.get("priority") or "medium")
+    status = str(task.get("status") or "open")
+    summary = description or task.get("description") or f"Priority {priority} task created from axctl."
+    task_item = dict(task)
+    task_item.setdefault("title", title)
+    task_item.setdefault("priority", priority)
+    task_item.setdefault("status", status)
+    if description and "description" not in task_item:
+        task_item["description"] = description
+    if assignee_id and "assignee_id" not in task_item:
+        task_item["assignee_id"] = assignee_id
+
+    assignee = None
+    if assignee_id or assignee_label:
+        assignee = {
+            "id": assignee_id,
+            "name": assignee_label.strip().removeprefix("@") if assignee_label else None,
+        }
+
+    card_payload: dict[str, Any] = {
+        "title": title,
+        "summary": summary,
+        "task_id": task_id or None,
+        "priority": priority,
+        "status": status,
+        "assignee": assignee,
+        "source": "axctl_tasks_create",
+        "delivery": "task_notification",
+    }
+
+    return {
+        "ui": {
+            "cards": [
+                {
+                    "card_id": f"task-signal:{task_id or tool_call_id}",
+                    "type": "task",
+                    "version": 1,
+                    "payload": card_payload,
+                }
+            ],
+            "widget": {
+                "kind": "mcp_app",
+                "tool_name": "tasks",
+                "tool_action": "get" if task_id else "list",
+                "tool_call_id": tool_call_id,
+                "resource_uri": "ui://tasks/detail" if task_id else "ui://tasks/board",
+                "display_mode": "inline",
+                "lifecycle": "complete",
+                "revision": 1,
+                "title": "Task Detail" if task_id else "Task Board",
+                "arguments": {
+                    "action": "get" if task_id else "list",
+                    "space_id": space_id,
+                    "task_id": task_id or None,
+                },
+                "initial_data": {
+                    "kind": "task",
+                    "version": 1,
+                    "action": "get" if task_id else "list",
+                    "items": [task_item],
+                    "count": 1,
+                    "selected_task_id": task_id or None,
+                    "space_id": space_id,
+                    "source": "axctl_tasks_create",
+                },
+                "result_kind": "tasks",
+                "source": "axctl_tasks_create",
+            },
+        },
+        "app_signal": {
+            "app": "tasks/detail" if task_id else "tasks",
+            "resource_uri": "ui://tasks/detail" if task_id else "ui://tasks/board",
+            "tool_call_id": tool_call_id,
+            "task_id": task_id or None,
+            "source": "axctl_tasks_create",
+        },
+    }
+
+
 @app.command("create")
 def create(
     title: str = typer.Argument(..., help="Task title"),
@@ -116,10 +207,22 @@ def create(
         try:
             prio = task.get("priority", "medium")
             prefix = _mention_prefix(mention or assign_to)
-            msg = f"New task created: **{title}** (id: `{tid}…`, priority: {prio})"
+            msg = f"New task created: **{title}** (id: `{tid}…`, priority: {prio}). Open the task card for details."
             if prefix:
                 msg = f"{prefix} {msg}"
-            client.send_message(sid, msg)
+            client.send_message(
+                sid,
+                msg,
+                metadata=_task_signal_metadata(
+                    task,
+                    space_id=sid,
+                    title=title,
+                    description=description,
+                    assignee_id=assignee_id,
+                    assignee_label=mention or assign_to,
+                ),
+                message_type="system",
+            )
             if not as_json:
                 console.print("[dim]Team notified.[/dim]")
         except Exception:
