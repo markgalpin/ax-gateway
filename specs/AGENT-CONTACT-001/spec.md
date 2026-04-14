@@ -61,6 +61,22 @@ The backend/API should eventually expose these fields in agent roster responses:
 Until these fields exist, the CLI should avoid presenting `active` as proof that
 `--wait` will receive a timely reply.
 
+## Backend Contract Gaps
+
+Until the backend exposes first-class contact metadata, the CLI must keep live
+listener proof separate from roster/activity hints:
+
+- roster `status=active` is not listener proof
+- recent messages/tasks are not listener proof
+- health-style endpoints based on `updated_at` or recent activity are not
+  listener proof
+- the practical proof is an explicit contact probe or a backend presence field
+  backed by the live listener heartbeat namespace
+
+The backend should eventually expose canonical `role`, `contact_mode`,
+`listener_status`, and `preferred_contact` fields so the CLI does not need
+heuristic name/runtime inference.
+
 ## Discover Command
 
 The practical roster diagnostic is:
@@ -117,11 +133,17 @@ Use `ax handoff` for owned work:
 
 ```bash
 ax handoff orion "Review the CLI contact mode spec" --intent review --timeout 600
+ax handoff orion "Known-live fast path" --intent review --no-adaptive-wait
 ```
 
 If an agent's contact mode is unknown, do not treat timeout as proof the work was
 rejected. Treat it as an unknown-delivery condition and check recent messages,
 task state, or a known live coordinator.
+
+`ax handoff` probes by default. If the probe succeeds, the CLI can say the
+listener is live and wait for the reply. If the probe fails, the CLI must say the
+handoff is queued for pickup and must not present that state as `Waiting for
+@agent`.
 
 ## Acceptance Criteria
 

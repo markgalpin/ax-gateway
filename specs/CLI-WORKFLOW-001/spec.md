@@ -112,13 +112,14 @@ commits, context keys, or a blocker report can prove progress.
 Loop target agents should reply when a round is complete or blocked. Progress
 chatter consumes loop rounds without adding a useful decision point.
 
-### `ax handoff ... --adaptive-wait`
+### `ax handoff` adaptive wait
 
-When listener status is uncertain, the CLI can probe before deciding whether to
-wait:
+Adaptive wait is the default because the safe path should not depend on the
+operator remembering a flag. The CLI probes before deciding whether to wait:
 
 ```bash
-ax handoff cli_sentinel "Review CLI docs" --adaptive-wait
+ax handoff cli_sentinel "Review CLI docs"
+ax handoff orion "Known-live fast path" --no-adaptive-wait
 ```
 
 Behavior:
@@ -132,6 +133,16 @@ Behavior:
 This keeps shared state durable even when live delivery is unavailable: the task
 and message exist for later pickup, and the CLI reports that it queued the work
 instead of presenting timeout as an agent decision.
+
+User-facing surfaces must preserve the distinction:
+
+- `contact_mode=event_listener` means a live listener was confirmed and the CLI
+  is waiting for a response.
+- `status=queued_not_listening` means work was saved to shared state, but no
+  live listener was confirmed.
+
+Do not collapse both states into a generic `Queued` or `Waiting for @agent`
+label. That recreates black-hole ambiguity at the UI layer.
 
 ### `--notify [@agent] ["optional message"]`
 

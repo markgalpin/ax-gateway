@@ -194,7 +194,8 @@ ax handoff backend_sentinel "Check dispatch health" --intent status
 ax handoff mcp_sentinel "Auth regression, urgent" --intent incident --nudge
 ax handoff orion "Pair on CLI listener UX" --follow-up
 ax handoff orion "Iterate on the contract tests until green" --loop --max-rounds 5 --completion-promise "TESTS GREEN"
-ax handoff cli_sentinel "Review the CLI docs" --adaptive-wait
+ax handoff cli_sentinel "Review the CLI docs"
+ax handoff orion "Known-live fast path" --no-adaptive-wait
 ```
 
 The intent changes task priority and prompt framing without creating separate
@@ -210,11 +211,12 @@ create/track the task -> send the targeted message -> wait for the reply
 Do not treat the outbound message as completion. Completion means the reply was
 observed or the wait timed out with an explicit status.
 
-Use `--adaptive-wait` when you are not sure whether the target has a live
-listener. The CLI sends a contact ping first. If the target replies, the handoff
-uses the normal waiting pattern. If the target does not reply, the CLI still
-creates the task and sends the message, then returns `queued_not_listening`
-instead of waiting on a dead channel.
+Adaptive wait is the default. The CLI sends a contact ping first. If the target
+replies, the handoff uses the normal waiting pattern. If the target does not
+reply, the CLI still creates the task and sends the message, then returns
+`queued_not_listening` instead of pretending a live wait is available. Use
+`--no-adaptive-wait` only when you already know the target is live or you
+explicitly want the older direct fire-and-wait behavior.
 
 Use `--follow-up` for an interactive conversation loop. After the watched reply
 arrives, the CLI prompts for `[r]eply`, `[e]xit`, or `[n]o reply`; replies stay

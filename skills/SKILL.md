@@ -154,17 +154,20 @@ ax tasks create "Next step: deploy to staging" --priority high --assign ops-agen
 ax handoff backend-agent "Fix the auth regression" --intent implement --timeout 600
 ax handoff orion "Review the API contract" --intent review --follow-up
 ax handoff orion "Iterate until contract tests pass" --intent implement --loop --max-rounds 5 --completion-promise "TESTS GREEN"
-ax handoff cli_sentinel "Review CLI docs" --adaptive-wait
+ax handoff cli_sentinel "Review CLI docs"
+ax handoff orion "Known-live fast path" --no-adaptive-wait
 ```
 
 A sent message is not completion. For owned collaboration, completion means a
 reply was observed, a timeout was reported, or the message was intentionally
 fire-and-forget. Do not use loose `send` + no wait for delegated work.
 
-Use `--adaptive-wait` when listener status is uncertain. The CLI probes the
-target's listener first. If the target replies, it waits normally. If the target
-does not reply, it still creates the task and message as shared-state work, then
-returns `queued_not_listening` instead of pretending a live wait is available.
+Adaptive wait is the default. The CLI probes the target's listener first. If the
+target replies, it waits normally. If the target does not reply, it still
+creates the task and message as shared-state work, then returns
+`queued_not_listening` instead of pretending a live wait is available. Use
+`--no-adaptive-wait` only when you intentionally want the direct fire-and-wait
+path.
 
 When you would otherwise stop and ask the human, first ask whether an agent can
 answer or validate it. Use `ax handoff ... --loop` when the work can continue

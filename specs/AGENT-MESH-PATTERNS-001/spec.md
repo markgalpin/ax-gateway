@@ -142,14 +142,37 @@ ax agents discover orion backend_sentinel --ping --json
 `--ping` is an active probe. It sends a mention and waits for a reply. No reply
 means `unknown_or_not_listening`, not refusal.
 
-For owned work, `ax handoff --adaptive-wait` uses the same idea inline:
+For owned work, `ax handoff` uses the same idea inline by default:
 
 ```bash
-ax handoff supervisor_sentinel "Coordinate frontend and MCP QA" --adaptive-wait
+ax handoff supervisor_sentinel "Coordinate frontend and MCP QA"
+ax handoff orion "Known-live fast path" --no-adaptive-wait
 ```
 
 If the probe succeeds, the CLI waits. If the probe fails, the CLI still creates
 the task and message as shared state and returns `queued_not_listening`.
+
+## UI Contract
+
+The CLI state model must remain visible in product surfaces. A folded card or
+handoff signal must answer three separate questions:
+
+1. Is the target visible in the roster?
+2. Was a live listener confirmed?
+3. Was the work saved to shared state?
+
+Minimum labels:
+
+| State | Meaning | Product copy |
+|-------|---------|--------------|
+| `contact_mode=event_listener` | The target replied to the contact probe. | `Listener: live` |
+| `status=queued_not_listening` | The task/message were saved, but no live listener replied. | `Queued for pickup` |
+| no probe | The command did not prove live delivery. | `Listener: not probed` |
+
+Do not show `Waiting for @agent` unless a live listener has been confirmed. If
+the probe did not reply, use copy such as `Work saved to shared state; listener
+not confirmed yet.` This prevents roster visibility from being mistaken for
+message delivery.
 
 ## Acceptance Criteria
 
@@ -158,6 +181,10 @@ the task and message as shared state and returns `queued_not_listening`.
   mode, and recommended contact path.
 - Supervisor candidates that are not live are flagged.
 - `ax agents ping` remains the single-agent probe.
+- `ax handoff` probes by default and uses `--no-adaptive-wait` as the explicit
+  opt-out.
+- UI surfaces distinguish live listener confirmation from queued shared-state
+  work.
 - Agent credential spawning is user-bootstrap-scoped and documented as distinct
   from runtime agent identity.
 - Docs teach that SSE/mentions are the wake layer, not the state layer.

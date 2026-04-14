@@ -510,9 +510,9 @@ def run(
     create_task: bool = typer.Option(True, "--task/--no-task", help="Create a task for the handoff"),
     watch: bool = typer.Option(True, "--watch/--no-watch", help="Wait for the target agent response"),
     adaptive_wait: bool = typer.Option(
-        False,
+        True,
         "--adaptive-wait/--no-adaptive-wait",
-        help="Probe listener status first; wait only when the target replies to ping.",
+        help="Probe listener status before waiting; use --no-adaptive-wait for a direct fire-and-wait handoff.",
     ),
     probe_timeout: int = typer.Option(
         10,
@@ -551,9 +551,6 @@ def run(
     if loop and not watch:
         typer.echo("Error: --loop requires --watch so the CLI can receive agent replies.", err=True)
         raise typer.Exit(1)
-    if adaptive_wait and not watch:
-        typer.echo("Error: --adaptive-wait requires --watch so the CLI can adapt the wait path.", err=True)
-        raise typer.Exit(1)
     if loop and follow_up:
         typer.echo("Error: --loop and --follow-up are separate modes; choose one.", err=True)
         raise typer.Exit(1)
@@ -574,8 +571,9 @@ def run(
     target_agent_id = _resolve_agent_id(client, agent_name)
     contact_probe: dict[str, Any] | None = None
     effective_watch = watch
+    adaptive_enabled = adaptive_wait and watch
 
-    if adaptive_wait:
+    if adaptive_enabled:
         try:
             contact_probe = _probe_target_contact(
                 client,
