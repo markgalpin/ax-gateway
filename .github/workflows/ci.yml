@@ -70,3 +70,13 @@ jobs:
 
       - name: Validate package metadata
         run: twine check dist/*
+
+  operator-qa-promotion:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    uses: ./.github/workflows/operator-qa.yml
+    with:
+      envs: ${{ vars.AX_QA_ENVS || 'dev,next' }}
+      target: release
+      require_matrix: false
+      artifact_name: operator-qa-promotion
+    secrets: inherit

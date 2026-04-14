@@ -182,6 +182,28 @@ preflight artifact is missing or `ok` is false.
 
 The command exits non-zero when any doctor or preflight row fails.
 
+## CI Enforcement
+
+The reusable GitHub Actions workflow `.github/workflows/operator-qa.yml` must
+run the same sequence as the operator runbook:
+
+1. write temporary named user-login configs from `AX_QA_<ENV>_*` secrets/vars
+2. run `axctl auth doctor` per configured environment
+3. run `axctl qa preflight` per configured environment
+4. run `axctl qa matrix` across all configured environments
+5. upload doctor, preflight, matrix, and summary artifacts
+
+Required environment shape:
+
+- `AX_QA_<ENV>_TOKEN` secret
+- `AX_QA_<ENV>_BASE_URL` variable
+- `AX_QA_<ENV>_SPACE_ID` variable
+
+When no complete environment config is present, the workflow may skip safely for
+ordinary CI. Promotion workflows that require a configured QA matrix should set
+`require_matrix: true`. If a matrix is run and `matrix.ok` is false, the workflow
+must fail.
+
 ## Warning Semantics
 
 Warnings are not always hard failures, but they are never invisible.

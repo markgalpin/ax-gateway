@@ -61,6 +61,11 @@ Attach or summarize the generated artifacts in the promotion PR when the change
 touches auth, profiles, messages, uploads, listeners, MCP, UI validation, or
 release behavior.
 
+CI also calls the reusable `.github/workflows/operator-qa.yml` workflow for PRs
+targeting `main`. It skips safely when no complete QA environment variables and
+secrets are configured, uploads artifacts when it runs, and fails the promotion
+path when a configured matrix returns `ok: false`.
+
 ## Commit Conventions
 
 Use Conventional Commit prefixes so Release Please can choose the version bump:

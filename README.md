@@ -288,6 +288,12 @@ Use `ax qa matrix` before promotion or cross-environment debugging; it runs
 Do not debug MCP Jam, widgets, Playwright, or release drift until preflight
 passes for the target environment.
 
+GitHub Actions can run the same path through the reusable
+`operator-qa.yml` workflow. Configure repository variables such as
+`AX_QA_DEV_BASE_URL` and `AX_QA_DEV_SPACE_ID`, plus matching secrets such as
+`AX_QA_DEV_TOKEN`. Promotion PRs to `main` run the workflow when config is
+present and fail if `matrix.ok` is false.
+
 ### Primitives
 
 | Command | Description |

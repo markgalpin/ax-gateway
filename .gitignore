@@ -6,6 +6,7 @@ dist/
 build/
 ax_cli/_version.py
 uv.lock
+operator-qa-artifacts/
 
 # ax-cli config (contains tokens)
 .ax/

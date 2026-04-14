@@ -164,6 +164,52 @@ Before a release or production-facing promotion:
 - [ ] Attach or summarize the preflight/matrix artifacts in the promotion PR.
 - [ ] Only then run MCP Jam, widget, Playwright, or manual UI QA.
 
+## GitHub Actions Enforcement
+
+The reusable workflow is:
+
+```yaml
+uses: ./.github/workflows/operator-qa.yml
+with:
+  envs: dev,next
+  target: release
+  require_matrix: false
+secrets: inherit
+```
+
+Configure repository or environment variables:
+
+- `AX_QA_DEV_BASE_URL`
+- `AX_QA_DEV_SPACE_ID`
+- `AX_QA_NEXT_BASE_URL`
+- `AX_QA_NEXT_SPACE_ID`
+- `AX_QA_PROD_BASE_URL`
+- `AX_QA_PROD_SPACE_ID`
+
+Configure matching secrets:
+
+- `AX_QA_DEV_TOKEN`
+- `AX_QA_NEXT_TOKEN`
+- `AX_QA_PROD_TOKEN`
+
+The workflow writes temporary user-login configs under a job-local
+`AX_CONFIG_DIR`, runs `auth doctor`, runs `qa preflight`, then runs `qa matrix`.
+It uploads all artifacts, including:
+
+- `<env>-doctor.json`
+- `<env>-preflight.json`
+- `matrix/matrix.json`
+- `operator-qa-summary.json`
+
+If no complete `TOKEN`, `BASE_URL`, and `SPACE_ID` triple exists for any
+requested environment, the workflow skips safely by default. Set
+`require_matrix: true` for workflows that should fail closed when no QA
+environment is configured.
+
+Promotion PRs to `main` run this through CI with `require_matrix: false`. That
+keeps normal repos safe when env config is absent, while still blocking the
+promotion path whenever configured environments produce `matrix.ok = false`.
+
 ## Failure Triage
 
 Use the first failing layer to decide where to work:
