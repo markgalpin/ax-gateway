@@ -11,7 +11,7 @@ from ..config import get_client, resolve_space_id
 from ..context_keys import build_upload_context_key
 from ..output import JSON_OPTION, console, handle_error, print_json
 
-app = typer.Typer(name="upload", help="Upload files to context", no_args_is_help=True)
+app = typer.Typer(name="upload", help="Upload files to context and optionally notify the transcript", no_args_is_help=True)
 
 
 def _mention_prefix(mention: str | None) -> str:
@@ -56,10 +56,14 @@ def upload_file(
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Only output the attachment ID"),
     json_output: bool = JSON_OPTION,
 ):
-    """Upload a file to context and optionally send a message about it.
+    """Upload a file to context and send a message signal by default.
 
-    Pattern: file → upload API → context vault → message notifies agents.
-    Agents access the file through context, not inline in chat.
+    Use this when the primary intent is "share this artifact with the team".
+    Pattern: file → upload API → context vault → transcript signal.
+    The message is the visible signal; context is the backing store.
+
+    Use `ax send --file` when the primary intent is a normal chat message with
+    a polished attachment preview. Use `--no-message` for storage-only uploads.
 
     Examples:
         ax upload file screenshot.png -m "check this screenshot"

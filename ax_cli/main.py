@@ -82,7 +82,12 @@ def send_shortcut(
     act_as: Optional[str] = typer.Option(
         None, "--act-as", help="Impersonate: send as a different agent. Requires scoped token."
     ),
-    files: Optional[list[str]] = typer.Option(None, "--file", "-f", help="Attach a local file (repeatable)"),
+    files: Optional[list[str]] = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="Attach a local file to this message; creates a transcript preview backed by context metadata (repeatable)",
+    ),
     space_id: Optional[str] = typer.Option(None, "--space-id", "-s", help="Override default space"),
     as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
@@ -91,6 +96,10 @@ def send_shortcut(
     Use --to for a simple agent mention/intercom. Use `ax handoff` for
     delegated agent work that needs task ownership, response waiting, and
     evidence.
+
+    Use --file when the primary intent is a chat message with an attachment
+    preview. Use `ax upload file` when adding the artifact to context is the
+    primary event and the transcript should show a compact context signal.
     """
     messages.send(
         content=content,

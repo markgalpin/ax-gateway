@@ -195,7 +195,7 @@ def _load_context_artifact(
 
 @app.command("upload-file")
 def upload_file(
-    file_path: str = typer.Argument(..., help="Local file to upload"),
+    file_path: str = typer.Argument(..., help="Local file to upload into context storage"),
     key: Optional[str] = typer.Option(None, "--key", "-k", help="Context key (default: unique upload key)"),
     vault: bool = typer.Option(
         False, "--vault", help="Store permanently in the intelligence vault (default: ephemeral)"
@@ -209,9 +209,9 @@ def upload_file(
 
     By default, the reference is stored ephemerally (24h TTL in Redis).
     Use --vault to promote it to the permanent intelligence vault.
-    This command is storage-only unless --mention is provided. Use
-    `ax upload file` when collaborators should see a message signal with the
-    attachment by default.
+    This is the lower-level storage primitive. Use `ax send --file` for a
+    polished message attachment preview, or `ax upload file` when collaborators
+    should see a context upload signal in the transcript by default.
 
     Examples:
         ax context upload-file ./report.md

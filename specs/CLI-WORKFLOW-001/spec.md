@@ -429,11 +429,13 @@ scheduled for removal once the flag-based workflow surface ships.
 
 ## Resolved: File Upload Collaboration Path
 
-`ax upload file` is the canonical collaboration command for sharing a file. It
-uploads bytes, stores a context pointer, and sends a message signal by default.
+`ax upload file` is the canonical collaboration command for sharing a file as a
+context event. It uploads bytes, stores a context pointer, and sends one compact
+message signal by default.
 
-`ax send --file` is equivalent when the user starts from a message and attaches
-one or more files.
+`ax send --file` is the canonical message-attachment path when the user starts
+from chat and wants the file to appear as a polished inline preview. It should
+still include context metadata so agents can load the artifact later.
 
 `ax context upload-file` remains a lower-level storage-only primitive for
 scripts and backing-store writes. It should not be the path taught to users or

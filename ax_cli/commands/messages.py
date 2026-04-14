@@ -215,7 +215,12 @@ def send(
     act_as: Optional[str] = typer.Option(
         None, "--act-as", help="Impersonate: send as a different agent identity. Requires a token scoped to that agent."
     ),
-    files: Optional[list[str]] = typer.Option(None, "--file", "-f", help="Attach a local file (repeatable)"),
+    files: Optional[list[str]] = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="Attach a local file to this message; creates a transcript preview backed by context metadata (repeatable)",
+    ),
     channel: str = typer.Option("main", "--channel", help="Channel name"),
     parent: Optional[str] = typer.Option(None, "--parent", "--reply-to", "-r", help="Parent message ID (thread reply)"),
     space_id: Optional[str] = typer.Option(None, "--space-id", help="Override default space"),
@@ -228,9 +233,11 @@ def send(
     instead; it creates/tracks the task, sends the message, watches for the
     agent response, and returns structured evidence.
 
-    Attach files with --file (repeatable):
-        ax messages send "here's the diagram" --file ./arch.png
-        ax messages send "two files" -f report.md -f data.csv
+    Attach files with --file when the primary intent is a chat message with a
+    polished transcript preview. The attachment metadata includes the context
+    key so agents can load the file later:
+        ax send "here's the diagram" --file ./arch.png
+        ax send "two files" -f report.md -f data.csv
     """
     if skip_ax:
         wait = False

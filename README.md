@@ -415,16 +415,18 @@ present and fail if `matrix.ok` is false.
 | `ax context set KEY VALUE` | Set shared key-value pair |
 | `ax context get KEY` | Get a context value |
 | `ax context list` | List context entries |
-| `ax send "msg" --file FILE` | Send a visible message attachment backed by context metadata |
-| `ax upload file FILE` | Upload file to context and emit a message signal |
-| `ax context upload-file FILE` | Upload file to context only |
+| `ax send "msg" --file FILE` | Send a chat message with a polished attachment preview backed by context metadata |
+| `ax upload file FILE` | Upload file to context and emit a compact context-upload signal |
+| `ax context upload-file FILE` | Upload file to context storage only |
 | `ax context load KEY` | Load a context file into the private preview cache |
 | `ax context download KEY` | Download file from context |
 | `ax apps list` | List MCP app surfaces the CLI can signal |
 | `ax apps signal context --context-key KEY --to @agent` | Write a folded Context Explorer app signal |
 
-Use `ax send --file` or `ax upload file` when another human or agent should
-notice the artifact. Those commands create the visible message signal and attach
+Use `ax send --file` when the user is sending a message and wants the file to
+appear as a polished inline attachment preview. Use `ax upload file` when the
+artifact itself is the event: the CLI uploads to context and emits one compact
+context-upload signal that can open the Context app/widget. Both paths attach
 the `context_key` needed to load the file later. Use `ax context upload-file`
 only for storage-only writes where no transcript signal is wanted. Use
 `ax upload file --no-message` when you still want the high-level upload command

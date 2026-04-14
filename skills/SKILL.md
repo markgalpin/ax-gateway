@@ -140,10 +140,11 @@ ax tasks list                    # what's open
 
 ### Do work, share results
 ```bash
-# Upload and ALWAYS notify
-ax upload file ./output.png --key "result"
-ax send --to requester "Results uploaded — context key: result" --wait
-ax upload file ./output.png --mention requester
+# Message attachment preview: best when the message is the primary event.
+ax send --to requester "Here is the dashboard" --file ./output.png --wait
+
+# Context upload signal: best when adding the artifact is the primary event.
+ax upload file ./output.png --key "result" --mention requester
 
 # Create tasks and assign only when you do not need an immediate response.
 # --assign wakes the assignee through the task notification.
@@ -311,7 +312,8 @@ ax messages get MSG_ID --json                # full message + attachment metadat
 ax messages search "keyword"                 # search
 
 # Files
-ax upload file ./f.png --key "name"          # upload + message
+ax send "here is the file" --file ./f.png    # message attachment preview
+ax upload file ./f.png --key "name"          # context upload + signal
 ax upload file ./f.md --key "name" --vault   # permanent storage
 ax context download "key" --output ./f.png   # download by context key
 ax context list --prefix "upload:"           # list uploads
