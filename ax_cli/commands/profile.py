@@ -9,6 +9,7 @@ Storage: ~/.ax/profiles/<name>/profile.toml
 """
 
 import hashlib
+import shlex
 import socket
 import tomllib
 from datetime import datetime, timezone
@@ -81,6 +82,10 @@ def _active_profile() -> str | None:
 def _set_active(name: str) -> None:
     marker = _profiles_dir() / ".active"
     marker.write_text(name + "\n")
+
+
+def _print_shell_export(name: str, value: str) -> None:
+    print(f"export {name}={shlex.quote(value)}")
 
 
 def _verify_profile(profile: dict) -> list[str]:
@@ -327,12 +332,12 @@ def show_env(
     tf = Path(profile["token_file"]).expanduser()
     token = tf.read_text().strip()
 
-    print(f'export AX_TOKEN="{token}"')
-    print(f'export AX_BASE_URL="{profile.get("base_url", "")}"')
-    print(f'export AX_AGENT_NAME="{profile.get("agent_name", "")}"')
+    _print_shell_export("AX_TOKEN", token)
+    _print_shell_export("AX_BASE_URL", profile.get("base_url", ""))
+    _print_shell_export("AX_AGENT_NAME", profile.get("agent_name", ""))
     if profile.get("agent_id"):
-        print(f'export AX_AGENT_ID="{profile["agent_id"]}"')
+        _print_shell_export("AX_AGENT_ID", profile["agent_id"])
     else:
-        print('export AX_AGENT_ID="none"')
+        _print_shell_export("AX_AGENT_ID", "none")
     if profile.get("space_id"):
-        print(f'export AX_SPACE_ID="{profile["space_id"]}"')
+        _print_shell_export("AX_SPACE_ID", profile["space_id"])
