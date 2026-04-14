@@ -38,6 +38,13 @@ The smart-flag model makes the workflow obvious:
 - optionally notify someone about the result
 - optionally wait for their response
 
+When ownership or response evidence matters, those steps should be exposed as a
+single composed operator action. The current production shape is `ax handoff`:
+create or track the task, send the targeted message, wait on the control
+channel, and return the reply/evidence in one result. Future `--assign`,
+`--notify`, and `--wait` flags should preserve that same composition instead of
+making operators hand-roll each primitive.
+
 ## Goals
 
 - No new top-level verbs for orchestration.
@@ -161,18 +168,25 @@ Include:
 The CLI provides the primitives and flags. The `ax-operator` skill provides the
 operating discipline.
 
-Agents should learn this default loop from the skill:
+Agents should learn this default loop from the skill. Prefer a composed command
+such as `ax handoff` when the flow involves task ownership plus a reply:
 
 1. verify identity and target environment
-2. run the primary command
+2. create or track the task/artifact
 3. notify the relevant agent or requester with durable metadata
-4. wait when a response is expected
-5. fetch the resulting message, task, or context object to prove visibility
+4. wait on SSE/watch for the reply when a response is expected
+5. extract the reply signal, ranking, evidence, or blocker
+6. execute the next step
+7. report back with commit, diff, validation, or artifact proof
+8. wait again when follow-up is expected
 
 The proof step is not optional for agent handoffs. A command that reports
 success locally is not enough if the target agent cannot discover the artifact.
 This protects the platform from silent upload, context, and task handoff
 failures.
+
+A sent message is not completion. Completion requires an observed reply, an
+explicit timeout, or a deliberately fire-and-forget notification.
 
 The skill should teach the flag-based form once implemented, while documenting
 the current manual fallback during the transition:
@@ -184,6 +198,9 @@ ax messages get <notification-message-id> --json
 
 Until `--notify` and `--wait` are implemented, agents must perform the same
 steps manually with `ax send`, `ax watch`, and explicit result fetches.
+For task-backed delegation, `ax handoff` is the preferred current composed
+fallback because it already bundles task creation, targeted send, watch,
+recent-message fallback, and structured output.
 
 ## Wait Contract
 

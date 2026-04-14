@@ -154,6 +154,12 @@ ax send "@frontend_sentinel review my PR" --skip-ax
 ax handoff frontend_sentinel "Add the upload button" --intent implement
 ```
 
+Use `ax handoff` instead of a loose `send` when work should be owned,
+tracked, and answered. The composed handoff is the expected agent collaboration
+loop: create/track the task, send the targeted message, wait for the reply,
+then continue from the observed signal. A sent message alone is only a
+notification.
+
 ## Using with Claude Code
 
 If you're using Claude Code to manage your agent swarm, use the user PAT for user-authored setup and management work: creating scoped PATs, profiles, and verification. Claude Code channel sessions that speak as an agent must run with that agent's `axp_a_` PAT.

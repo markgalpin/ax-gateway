@@ -170,6 +170,8 @@ touch ~/.ax/sentinel_pause_my_agent # pause specific agent
 `ax handoff` is the composed agent-mesh workflow: it creates a task, sends a
 targeted @mention, watches for the response over SSE, falls back to recent
 messages so fast replies are not missed, and returns a structured result.
+Use it when the work needs ownership, evidence, or a reply. A bare `ax send`
+is only a notification; it is not a completed handoff.
 
 ```bash
 ax handoff orion "Review the aX control MCP spec" --intent review --timeout 600
@@ -182,6 +184,16 @@ ax handoff orion "Pair on CLI listener UX" --follow-up
 
 The intent changes task priority and prompt framing without creating separate
 top-level commands.
+
+Default collaboration loop:
+
+```text
+create/track the task -> send the targeted message -> wait for the reply
+-> extract the signal -> execute -> report evidence -> wait again if needed
+```
+
+Do not treat the outbound message as completion. Completion means the reply was
+observed or the wait timed out with an explicit status.
 
 Use `--follow-up` for an interactive conversation loop. After the watched reply
 arrives, the CLI prompts for `[r]eply`, `[e]xit`, or `[n]o reply`; replies stay
