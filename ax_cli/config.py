@@ -88,6 +88,8 @@ def _user_config_path(env_name: str | None = None) -> Path:
     by the active environment marker written by `axctl login --env`.
     """
     resolved = _normalize_user_env(env_name) if env_name else _resolve_user_env()
+    if resolved in {"default", "user"}:
+        return _global_config_dir() / "user.toml"
     if resolved:
         return _global_config_dir() / "users" / resolved / "user.toml"
     return _global_config_dir() / "user.toml"

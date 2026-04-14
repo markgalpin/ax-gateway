@@ -260,6 +260,30 @@ class TestAuthDoctorDiagnostics:
         assert diagnostic["effective"]["space_id"] == "dev-space"
         assert diagnostic["effective"]["principal_intent"] == "user"
 
+    def test_default_env_alias_reports_default_user_login(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        monkeypatch.setenv("AX_CONFIG_DIR", str(global_dir))
+        _save_user_config(
+            {
+                "token": "axp_u_next.secret",
+                "base_url": "https://next.paxai.app",
+                "principal_type": "user",
+                "space_id": "next-space",
+            },
+            env_name="default",
+            activate=False,
+        )
+
+        diagnostic = diagnose_auth_config(env_name="default")
+
+        assert diagnostic["ok"] is True
+        assert diagnostic["selected_env"] == "default"
+        assert diagnostic["effective"]["auth_source"] == "user_login:default"
+        assert diagnostic["effective"]["base_url"] == "https://next.paxai.app"
+        assert diagnostic["effective"]["space_id"] == "next-space"
+        assert diagnostic["effective"]["principal_intent"] == "user"
+
     def test_active_profile_reports_agent_runtime_source(self, tmp_path, monkeypatch):
         global_dir = tmp_path / "global"
         global_dir.mkdir()

@@ -232,3 +232,76 @@ def test_preflight_writes_ci_artifact(monkeypatch, tmp_path):
     assert payload["preflight"]["target"] == "playwright"
     assert payload["preflight"]["artifact"] == str(artifact.resolve())
     assert saved == payload
+
+
+def test_matrix_runs_doctor_and_preflight_for_each_env_and_writes_artifacts(monkeypatch, tmp_path):
+    doctor_calls = []
+    preflight_calls = []
+
+    def fake_doctor(*, env_name, explicit_space_id):
+        doctor_calls.append((env_name, explicit_space_id))
+        return {
+            "ok": True,
+            "selected_env": env_name,
+            "effective": {
+                "principal_intent": "user",
+                "auth_source": f"user_login:{env_name}",
+                "base_url": f"https://{env_name}.paxai.app",
+                "host": f"{env_name}.paxai.app",
+                "space_id": explicit_space_id,
+            },
+            "warnings": [],
+            "problems": [],
+        }
+
+    def fake_preflight(**kwargs):
+        preflight_calls.append(kwargs)
+        env_name = kwargs["env_name"]
+        return {
+            "ok": True,
+            "environment": env_name,
+            "space_id": kwargs["space_id"],
+            "preflight": {
+                "target": kwargs["target"],
+                "passed": True,
+            },
+            "checks": [
+                {"name": "auth.whoami", "ok": True},
+                {"name": "tasks.list", "ok": True, "count": 3},
+            ],
+        }
+
+    monkeypatch.setattr(qa, "diagnose_auth_config", fake_doctor)
+    monkeypatch.setattr(qa, "_preflight_result", fake_preflight)
+
+    result = runner.invoke(
+        app,
+        [
+            "qa",
+            "matrix",
+            "--env",
+            "dev",
+            "--env",
+            "next",
+            "--space",
+            "dev=space-dev",
+            "--space",
+            "next=space-next",
+            "--for",
+            "playwright",
+            "--artifact-dir",
+            str(tmp_path),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _json_output(result)
+    assert payload["ok"] is True
+    assert payload["target"] == "playwright"
+    assert [row["env"] for row in payload["envs"]] == ["dev", "next"]
+    assert doctor_calls == [("dev", "space-dev"), ("next", "space-next")]
+    assert [call["space_id"] for call in preflight_calls] == ["space-dev", "space-next"]
+    assert (tmp_path / "dev-preflight.json").exists()
+    assert (tmp_path / "next-preflight.json").exists()
+    assert (tmp_path / "matrix.json").exists()

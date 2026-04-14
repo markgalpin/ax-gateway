@@ -10,9 +10,18 @@ from typing import Any, Callable, Optional
 
 import httpx
 import typer
+from rich.table import Table
 
 from ..client import AxClient
-from ..config import _load_user_config, _normalize_user_env, get_client, resolve_space_id
+from ..config import (
+    _global_config_dir,
+    _load_user_config,
+    _normalize_user_env,
+    _user_config_path,
+    diagnose_auth_config,
+    get_client,
+    resolve_space_id,
+)
 from ..context_keys import build_upload_context_key
 from ..output import JSON_OPTION, console, print_json
 
@@ -208,6 +217,80 @@ def _resolve_env_space_id(client: AxClient, env_cfg: dict[str, Any], *, explicit
     raise typer.Exit(1)
 
 
+def _base_url_env_label(base_url: str | None) -> str | None:
+    if not base_url:
+        return None
+    host = base_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    first = host.split(".", 1)[0].strip().lower()
+    if first and first not in {"www"}:
+        return first
+    return None
+
+
+def _configured_matrix_envs() -> list[str]:
+    envs: list[str] = []
+    users_dir = _global_config_dir() / "users"
+    if users_dir.exists():
+        for path in sorted(users_dir.glob("*/user.toml")):
+            if path.parent.name.startswith("."):
+                continue
+            envs.append(path.parent.name)
+
+    default_cfg = _load_user_config("default")
+    if default_cfg:
+        default_label = _base_url_env_label(str(default_cfg.get("base_url") or "")) or "default"
+        if default_label not in envs:
+            envs.append(default_label)
+        elif "default" not in envs:
+            envs.append("default")
+    return envs
+
+
+def _matrix_actual_env(requested: str) -> tuple[str, str]:
+    """Return (display_label, env_name_to_load)."""
+    normalized = _normalize_user_env(requested)
+    if _user_config_path(normalized).exists():
+        return normalized, normalized
+
+    default_cfg = _load_user_config("default")
+    default_label = _base_url_env_label(str(default_cfg.get("base_url") or "")) if default_cfg else None
+    if default_cfg and normalized == default_label:
+        return normalized, "default"
+    return normalized, normalized
+
+
+def _parse_space_overrides(values: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for value in values or []:
+        if "=" not in value:
+            console.print(f"[red]Invalid --space value '{value}'. Expected env=space-id.[/red]")
+            raise typer.Exit(1)
+        env_name, space_id = value.split("=", 1)
+        env_key = _normalize_user_env(env_name)
+        if not space_id.strip():
+            console.print(f"[red]Invalid --space value '{value}'. Space id cannot be empty.[/red]")
+            raise typer.Exit(1)
+        overrides[env_key] = space_id.strip()
+    return overrides
+
+
+def _check_summary(result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not result:
+        return []
+    summary = []
+    for check in result.get("checks", []):
+        item = {
+            "name": check.get("name"),
+            "ok": bool(check.get("ok")),
+        }
+        if "count" in check:
+            item["count"] = check["count"]
+        if "error" in check:
+            item["error"] = check["error"]
+        summary.append(item)
+    return summary
+
+
 def _run_contracts(
     *,
     env_name: str | None,
@@ -366,6 +449,37 @@ def _write_artifact(path: str | Path, result: dict[str, Any]) -> Path:
     return artifact_path
 
 
+def _preflight_result(
+    *,
+    target: str,
+    env_name: str | None,
+    space_id: str | None,
+    limit: int,
+    write: bool,
+    upload_file: str | None,
+    send_message: bool,
+    ttl: int,
+    cleanup: bool,
+) -> dict[str, Any]:
+    result = _run_contracts(
+        env_name=env_name,
+        space_id=space_id,
+        limit=limit,
+        write=write,
+        upload_file=upload_file,
+        send_message=send_message,
+        ttl=ttl,
+        cleanup=cleanup,
+    )
+    result["preflight"] = {
+        "target": target,
+        "passed": bool(result.get("ok")),
+        "generated_at_unix": int(time.time()),
+        "command": "ax qa preflight",
+    }
+    return result
+
+
 def _emit_result(result: dict[str, Any], *, as_json: bool, artifact_path: Path | None = None) -> None:
     ok = bool(result.get("ok"))
     if as_json:
@@ -448,7 +562,8 @@ def preflight(
     as_json: bool = JSON_OPTION,
 ):
     """Gate MCP Jam, widget, or Playwright checks on API-first contracts."""
-    result = _run_contracts(
+    result = _preflight_result(
+        target=target,
         env_name=env_name,
         space_id=space_id,
         limit=limit,
@@ -458,14 +573,139 @@ def preflight(
         ttl=ttl,
         cleanup=cleanup,
     )
-    result["preflight"] = {
-        "target": target,
-        "passed": bool(result.get("ok")),
-        "generated_at_unix": int(time.time()),
-        "command": "ax qa preflight",
-    }
     artifact_path = Path(artifact).expanduser().resolve() if artifact else None
     if artifact_path:
         result["preflight"]["artifact"] = str(artifact_path)
         _write_artifact(artifact_path, result)
     _emit_result(result, as_json=as_json, artifact_path=artifact_path)
+
+
+@app.command("matrix")
+def matrix(
+    env_names: Optional[list[str]] = typer.Option(
+        None,
+        "--env",
+        "-e",
+        help="Named user-login environment to check. Repeatable. Defaults to all configured user logins.",
+    ),
+    target: str = typer.Option(
+        "mcp-ui",
+        "--for",
+        help="Target being gated, e.g. mcp-jam, widget, playwright, ui",
+    ),
+    space_id: Optional[str] = typer.Option(None, "--space-id", help="Use this space for every environment"),
+    space_overrides: Optional[list[str]] = typer.Option(
+        None,
+        "--space",
+        help="Per-env space override as env=space-id. Repeatable.",
+    ),
+    limit: int = typer.Option(10, "--limit", help="Small collection read limit"),
+    artifact_dir: Optional[str] = typer.Option(
+        None,
+        "--artifact-dir",
+        help="Write one preflight JSON artifact per environment into this directory",
+    ),
+    as_json: bool = JSON_OPTION,
+):
+    """Run auth doctor plus QA preflight across environments."""
+    requested_envs = list(env_names or _configured_matrix_envs())
+    if not requested_envs:
+        console.print("[red]No user-login environments found.[/red] Run axctl login --env dev --url <base-url>.")
+        raise typer.Exit(1)
+
+    space_map = _parse_space_overrides(space_overrides)
+    rows: list[dict[str, Any]] = []
+    artifact_root = Path(artifact_dir).expanduser().resolve() if artifact_dir else None
+    matrix_started = int(time.time())
+
+    for requested in requested_envs:
+        label, actual_env = _matrix_actual_env(requested)
+        selected_space = space_map.get(label) or space_map.get(actual_env) or space_id
+        doctor = diagnose_auth_config(env_name=actual_env, explicit_space_id=selected_space)
+        effective = doctor.get("effective", {})
+        preflight_payload: dict[str, Any] | None = None
+        preflight_error: dict[str, Any] | None = None
+        artifact_path: Path | None = None
+
+        if doctor.get("ok"):
+            try:
+                preflight_payload = _preflight_result(
+                    target=target,
+                    env_name=actual_env,
+                    space_id=selected_space,
+                    limit=limit,
+                    write=False,
+                    upload_file=None,
+                    send_message=False,
+                    ttl=300,
+                    cleanup=True,
+                )
+                if artifact_root:
+                    artifact_path = artifact_root / f"{label}-preflight.json"
+                    preflight_payload["preflight"]["artifact"] = str(artifact_path)
+                    _write_artifact(artifact_path, preflight_payload)
+            except typer.Exit as exc:
+                preflight_error = {"type": "Exit", "code": exc.exit_code}
+            except Exception as exc:
+                preflight_error = _error_payload(exc)
+
+        row = {
+            "env": label,
+            "requested_env": requested,
+            "selected_env": doctor.get("selected_env"),
+            "principal_intent": effective.get("principal_intent"),
+            "auth_source": effective.get("auth_source"),
+            "base_url": effective.get("base_url"),
+            "host": effective.get("host"),
+            "space_id": effective.get("space_id"),
+            "warnings": doctor.get("warnings", []),
+            "doctor_ok": bool(doctor.get("ok")),
+            "doctor_problems": doctor.get("problems", []),
+            "preflight_ok": bool(preflight_payload and preflight_payload.get("ok")),
+            "artifact_path": str(artifact_path) if artifact_path else None,
+            "preflight_error": preflight_error,
+            "checks": _check_summary(preflight_payload),
+        }
+        rows.append(row)
+
+    result = {
+        "ok": all(row["doctor_ok"] and row["preflight_ok"] for row in rows),
+        "target": target,
+        "generated_at_unix": matrix_started,
+        "envs": rows,
+    }
+
+    if artifact_root:
+        matrix_path = artifact_root / "matrix.json"
+        result["artifact_path"] = str(matrix_path)
+        _write_artifact(matrix_path, result)
+
+    if as_json:
+        print_json(result)
+    else:
+        table = Table(show_header=True)
+        table.add_column("Env")
+        table.add_column("Intent")
+        table.add_column("Host")
+        table.add_column("Space")
+        table.add_column("Auth")
+        table.add_column("Doctor")
+        table.add_column("Preflight")
+        table.add_column("Warnings")
+        for row in rows:
+            table.add_row(
+                str(row["env"]),
+                str(row["principal_intent"]),
+                str(row["host"]),
+                str(row["space_id"]),
+                str(row["auth_source"]),
+                "PASS" if row["doctor_ok"] else "FAIL",
+                "PASS" if row["preflight_ok"] else "FAIL",
+                str(len(row["warnings"])),
+            )
+        console.print(table)
+        if artifact_root:
+            console.print(f"artifact_dir={artifact_root}")
+
+    if not result["ok"]:
+        raise typer.Exit(1)

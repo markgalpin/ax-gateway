@@ -51,6 +51,22 @@ resolution. It reports the effective auth source, selected env/profile, resolved
 host, resolved space, principal intent, and ignored local config reasons without
 calling the API.
 
+Before promotion or cross-environment debugging, run:
+
+```bash
+axctl qa matrix \
+  --env dev \
+  --env next \
+  --space dev=<dev-space-id> \
+  --space next=<next-space-id> \
+  --for playwright \
+  --artifact-dir .ax/qa
+```
+
+The matrix command runs doctor plus preflight per environment and emits a
+comparable JSON envelope. It is the drift detector: config resolution can pass
+while contract health fails, and both signals should be visible in one place.
+
 ## Harness Modes
 
 ### Read-only default
@@ -126,6 +142,24 @@ The artifact includes:
 Downstream MCP Jam, widget, and Playwright scripts should refuse to run when the
 preflight artifact is missing or `ok` is false.
 
+## Matrix Output
+
+`axctl qa matrix` emits one row per environment with:
+
+- `env`
+- `principal_intent`
+- `auth_source`
+- `base_url`
+- `host`
+- `space_id`
+- `warnings`
+- `doctor_ok`
+- `preflight_ok`
+- `artifact_path`
+- check summaries
+
+The command exits non-zero when any doctor or preflight row fails.
+
 ## Identity Expectations
 
 The harness must not hide the current principal.
@@ -194,6 +228,7 @@ For example:
 - Failed checks include HTTP status, URL, and backend detail when available.
 - `preflight` exits `0` only when the contract suite passes.
 - `preflight --artifact` writes a reusable JSON gate for MCP/UI wrappers.
+- `matrix` runs doctor plus preflight per env and exits non-zero on any drift.
 - Write mode creates temporary context, verifies it, and deletes it by default.
 - Upload mode includes a context key in message attachment metadata.
 - JSON output is stable enough for CI and agent supervision.

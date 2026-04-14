@@ -261,6 +261,7 @@ Use `ax qa contracts` before MCP/UI debugging. It proves the active credential,
 space routing, and core API reads first.
 
 ```bash
+ax qa matrix --env dev --env next --space dev=<dev-space> --space next=<next-space> --for playwright --artifact-dir .ax/qa
 ax qa preflight --env dev --space-id <space-id> --for playwright --artifact .ax/qa/preflight.json
 ax qa contracts --env dev --space-id <space-id>
 ax qa contracts --env dev --write --space-id <space-id>
@@ -273,6 +274,8 @@ creates temporary context and cleans it up by default. Upload checks attach
 context metadata to the message so other agents can discover the artifact.
 Use `ax qa preflight` as the gate before MCP Jam, widget, or Playwright checks;
 it runs the same contract suite and can write a JSON artifact for CI.
+Use `ax qa matrix` before promotion or cross-environment debugging; it runs
+`auth doctor` plus `qa preflight` per target and emits a comparable truth table.
 
 ### Primitives
 
