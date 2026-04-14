@@ -351,6 +351,46 @@ def test_widgets_can_send_media_sidecar_probe(monkeypatch):
     assert media_call[4]["metadata"]["qa_fixture"] == {"kind": "link_media_sidecar", "run_id": "media-1"}
 
 
+def test_widgets_can_attach_uploaded_evidence_to_alert_fixture(monkeypatch, tmp_path):
+    evidence = tmp_path / "evidence.md"
+    evidence.write_text("# Evidence\n")
+    fake = FakeClient()
+    monkeypatch.setattr(qa, "get_client", lambda: fake)
+    monkeypatch.setattr(qa, "resolve_space_id", lambda client, explicit=None: "space-1")
+
+    result = runner.invoke(
+        app,
+        [
+            "qa",
+            "widgets",
+            "--run-id",
+            "evidence-1",
+            "--evidence-file",
+            str(evidence),
+            "--alert-to",
+            "cipher",
+            "--no-media-message",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _json_output(result)
+    assert payload["context_key"].startswith("upload:")
+    assert any(call[0] == "upload_file" and call[1] == str(evidence) for call in fake.calls)
+
+    alert_call = [
+        call
+        for call in fake.calls
+        if call[0] == "send_message" and call[4]["metadata"].get("alert", {}).get("kind") == "qa_widget_smoke"
+    ][0]
+    attachment = alert_call[3][0]
+    assert attachment["id"] == "att-1"
+    assert attachment["filename"] == "probe.md"
+    assert attachment["context_key"] == payload["context_key"]
+    assert alert_call[4]["metadata"]["ui"]["widget"]["initial_data"]["selected_key"] == payload["context_key"]
+
+
 def test_matrix_runs_doctor_and_preflight_for_each_env_and_writes_artifacts(monkeypatch, tmp_path):
     doctor_calls = []
     preflight_calls = []
