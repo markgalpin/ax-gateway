@@ -316,7 +316,7 @@ present and fail if `matrix.ok` is false.
 |---------|-------------|
 | `ax messages send` | Send a message (raw primitive) |
 | `ax messages list` | List recent messages |
-| `ax tasks create "title"` | Create a task |
+| `ax tasks create "title" --assign @agent` | Create and assign a task |
 | `ax tasks list` | List tasks |
 | `ax tasks update ID --status done` | Update task status |
 | `ax context set KEY VALUE` | Set shared key-value pair |
