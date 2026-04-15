@@ -24,6 +24,16 @@ def apply_envelope(data: dict, *, summary: dict | None = None, details: list | N
     return data
 
 
+def mention_prefix(mention: str | None) -> str:
+    """Normalize an optional agent/user mention to the @handle form."""
+    if not mention:
+        return ""
+    value = mention.strip()
+    if not value:
+        return ""
+    return value if value.startswith("@") else f"@{value}"
+
+
 def print_json(data):
     console.print_json(json.dumps(data, default=str))
 

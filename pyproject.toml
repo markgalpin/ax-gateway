@@ -49,6 +49,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = ["-p", "no:pytest_postgresql"]
 
 [tool.ruff]
 target-version = "py311"

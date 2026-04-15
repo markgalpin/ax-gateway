@@ -12,7 +12,7 @@ import typer
 
 from ..config import get_client, resolve_space_id
 from ..context_keys import build_upload_context_key
-from ..output import JSON_OPTION, handle_error, print_json, print_kv, print_table
+from ..output import JSON_OPTION, handle_error, mention_prefix, print_json, print_kv, print_table
 
 app = typer.Typer(name="context", help="Context & file operations", no_args_is_help=True)
 
@@ -45,13 +45,7 @@ TEXT_SUFFIXES = {
 }
 
 
-def _mention_prefix(mention: str | None) -> str:
-    if not mention:
-        return ""
-    value = mention.strip()
-    if not value:
-        return ""
-    return value if value.startswith("@") else f"@{value}"
+_mention_prefix = mention_prefix
 
 
 def _send_context_mention(client, sid: str, mention: str | None, message: str) -> str | None:

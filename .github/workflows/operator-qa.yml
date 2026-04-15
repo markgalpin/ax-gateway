@@ -21,10 +21,6 @@ on:
       artifact_name:
         description: "Uploaded artifact name"
         required: false
-        default: "operator-qa"
-      artifact_name:
-        description: "Uploaded artifact name"
-        required: false
         type: string
         default: "operator-qa"
     secrets:

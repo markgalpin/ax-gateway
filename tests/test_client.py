@@ -63,8 +63,8 @@ class TestTokenClassSelection:
         assert call_body["requested_token_class"] == "agent_access"
         assert call_body["agent_id"] == "some-agent-uuid"
 
-    def test_agent_pat_without_agent_id_uses_agent_access(self, tmp_path, monkeypatch, mock_exchange):
-        """Agent-bound PATs still request agent_access when server-side binding supplies the agent."""
+    def test_agent_pat_without_agent_id_falls_back_to_user_access(self, tmp_path, monkeypatch, mock_exchange):
+        """Agent-bound PATs need configured agent_id before requesting agent_access."""
         mock_post = mock_exchange()
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".ax").mkdir()
@@ -77,7 +77,7 @@ class TestTokenClassSelection:
         client._get_jwt()
 
         call_body = mock_post.call_args[1]["json"]
-        assert call_body["requested_token_class"] == "agent_access"
+        assert call_body["requested_token_class"] == "user_access"
         assert "agent_id" not in call_body
 
     def test_user_pat_without_agent_id_uses_user_access(self, tmp_path, monkeypatch, mock_exchange):

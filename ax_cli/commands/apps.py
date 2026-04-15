@@ -10,7 +10,7 @@ import httpx
 import typer
 
 from ..config import get_client, resolve_space_id
-from ..output import JSON_OPTION, console, handle_error, print_json, print_table
+from ..output import JSON_OPTION, console, handle_error, mention_prefix, print_json, print_table
 
 app = typer.Typer(name="apps", help="MCP app signal adapter", no_args_is_help=True)
 
@@ -28,13 +28,7 @@ APP_SPECS: dict[str, dict[str, str]] = {
 }
 
 
-def _mention_prefix(mention: str | None) -> str:
-    if not mention:
-        return ""
-    value = mention.strip()
-    if not value:
-        return ""
-    return value if value.startswith("@") else f"@{value}"
+_mention_prefix = mention_prefix
 
 
 def _parse_json_value(value: Any) -> Any:

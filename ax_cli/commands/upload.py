@@ -9,18 +9,12 @@ import typer
 
 from ..config import get_client, resolve_space_id
 from ..context_keys import build_upload_context_key
-from ..output import JSON_OPTION, console, handle_error, print_json
+from ..output import JSON_OPTION, console, handle_error, mention_prefix, print_json
 
 app = typer.Typer(name="upload", help="Upload files to context and optionally notify the transcript", no_args_is_help=True)
 
 
-def _mention_prefix(mention: str | None) -> str:
-    if not mention:
-        return ""
-    value = mention.strip()
-    if not value:
-        return ""
-    return value if value.startswith("@") else f"@{value}"
+_mention_prefix = mention_prefix
 
 
 def _message_attachment_ref(

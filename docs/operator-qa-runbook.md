@@ -181,7 +181,7 @@ Required success:
 Before a release or production-facing promotion:
 
 - [ ] `uv run ruff check .`
-- [ ] `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest`
+- [ ] `uv run pytest`
 - [ ] `python -m build && twine check dist/*` when package metadata or release
       behavior changed.
 - [ ] `axctl auth doctor --env dev --space-id <dev-space-id> --json`
@@ -290,7 +290,7 @@ git checkout dev/staging
 git pull --ff-only
 
 uv run ruff check .
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest
+uv run pytest
 
 axctl auth doctor --env dev --space-id <dev-space-id> --json
 axctl qa preflight --env dev --space-id <dev-space-id> --for release --artifact .ax/qa/dev-preflight.json --json

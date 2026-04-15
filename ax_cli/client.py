@@ -268,7 +268,8 @@ class AxClient:
         """Get a JWT from the exchanger with appropriate token class.
 
         Token class selection:
-        - axp_a_ (agent-bound PAT) → agent_access
+        - axp_a_ (agent-bound PAT) + configured agent_id → agent_access
+        - axp_a_ without configured agent_id → user_access fallback
         - axp_u_ (user PAT) → user_access always, even if agent_id is set
           (user PATs cannot exchange for agent_access — server returns 422)
 
@@ -277,7 +278,7 @@ class AxClient:
         how an agent accidentally speaks as the user.
         """
         is_agent_pat = self.token.startswith("axp_a_")
-        if is_agent_pat:
+        if self.agent_id and is_agent_pat:
             return self._exchanger.get_token(
                 "agent_access",
                 agent_id=self.agent_id,

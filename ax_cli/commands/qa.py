@@ -24,17 +24,18 @@ from ..config import (
     resolve_space_id,
 )
 from ..context_keys import build_upload_context_key
-from ..output import EXIT_NOT_OK, EXIT_SKIPPED, JSON_OPTION, apply_envelope, console, print_json
+from ..output import EXIT_NOT_OK, EXIT_SKIPPED, JSON_OPTION, apply_envelope, console, mention_prefix, print_json
 from .apps import (
     APP_SPECS,
     _build_signal_metadata,
     _context_item_from_response,
     _default_signal_message,
     _is_passive_signal,
-    _mention_prefix,
 )
 
 app = typer.Typer(name="qa", help="Regression and contract smoke checks", no_args_is_help=True)
+
+_mention_prefix = mention_prefix
 
 
 def _extract_items(payload: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:
