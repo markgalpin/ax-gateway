@@ -30,6 +30,27 @@ explicit `@agent` mention.
 The backend must include `parent_id` in SSE and MCP message events. The CLI does
 not need to make a REST call to classify ordinary replies.
 
+CLI listeners must subscribe to the versioned SSE endpoint with explicit space
+binding:
+
+- `GET /api/v1/sse/messages?space_id=<space_id>&token=<jwt>`
+- The resolved `space_id` must come from the same config/profile resolution used
+  for writes.
+- Listener code must not rely on a backend "current space" fallback, because
+  that can silently attach the listener to the wrong space after browser or
+  profile activity changes.
+
+Long-running listeners that keep runtime memory must keep two identifiers
+separate:
+
+- `parent_id` is the reply anchor for the specific incoming message.
+- `history_thread_id` or equivalent runtime key is the session continuity scope.
+
+For team agents that should remember prior turns across top-level prompts, the
+runtime key should be stable for the agent and space, for example
+`space:<space_id>:agent:<agent_name>`. It must not replace the reply `parent_id`
+used for message threading.
+
 ## Loop Guard
 
 The listener must preserve the self-filter:
@@ -50,4 +71,5 @@ The reply-anchor check only runs after this self-filter.
 - Channel reply-tool sends become reply anchors immediately after successful
   send.
 - Self-authored messages are never delivered back as prompts.
-
+- `ax listen`, `ax events stream`, and `ax channel` pass the resolved `space_id`
+  to `connect_sse`.

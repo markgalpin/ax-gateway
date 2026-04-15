@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from datetime import datetime
@@ -144,6 +145,91 @@ def _is_completion(content: str, token: str) -> bool:
     return token.lower() in text or any(word in text for word in COMPLETION_WORDS)
 
 
+def _completion_promise_satisfied(content: str, completion_promise: str | None) -> bool:
+    if not completion_promise:
+        return False
+
+    expected = " ".join(completion_promise.strip().split())
+    if not expected:
+        return False
+
+    for match in re.finditer(r"<promise>(.*?)</promise>", content, flags=re.IGNORECASE | re.DOTALL):
+        promised = " ".join(match.group(1).strip().split())
+        if promised == expected:
+            return True
+
+    return any(" ".join(line.strip().split()) == expected for line in content.splitlines())
+
+
+def _loop_continue_content(
+    *,
+    agent_name: str,
+    instructions: str,
+    handoff_id: str,
+    round_number: int,
+    max_rounds: int,
+    completion_promise: str | None,
+) -> str:
+    if completion_promise:
+        completion_line = (
+            f"When genuinely complete, reply with `<promise>{completion_promise}</promise>`. "
+            "Do not emit that promise until it is true."
+        )
+    else:
+        completion_line = "No completion promise is configured; continue until the max round limit is reached."
+
+    return (
+        f"@{agent_name} Continue agentic loop `{handoff_id}` "
+        f"(round {round_number}/{max_rounds}).\n\n"
+        "Same task:\n"
+        f"{instructions}\n\n"
+        "Use existing files, task state, previous replies, and validation output as context. "
+        "If you can continue without human judgment, continue. If blocked, report the blocker, "
+        "what was attempted, and the smallest next decision needed.\n\n"
+        f"{completion_line}\n"
+        f"Include `{handoff_id}` in the reply."
+    )
+
+
+def _probe_target_contact(
+    client,
+    *,
+    space_id: str,
+    agent_name: str,
+    current_agent_name: str,
+    timeout: int,
+) -> dict[str, Any]:
+    token = f"ping:{uuid.uuid4().hex[:8]}"
+    content = (
+        f"@{agent_name} Contact-mode ping from axctl. "
+        f"Please reply with `{token}` if this mention reached a live listener."
+    )
+    started_at = time.time()
+    sent_data = client.send_message(space_id, content)
+    sent = sent_data.get("message", sent_data)
+    sent_message_id = str(sent.get("id") or sent_data.get("id") or "")
+    reply = None
+    if sent_message_id and timeout > 0:
+        reply = _wait_for_handoff_reply(
+            client,
+            space_id=space_id,
+            agent_name=agent_name,
+            sent_message_id=sent_message_id,
+            token=token,
+            current_agent_name=current_agent_name,
+            started_at=started_at,
+            timeout=timeout,
+            require_completion=True,
+        )
+    return {
+        "sent_message_id": sent_message_id,
+        "ping_token": token,
+        "listener_status": "replied" if reply else "no_reply",
+        "contact_mode": "event_listener" if reply else "unknown_or_not_listening",
+        "reply": reply,
+    }
+
+
 def _matches_handoff_reply(
     message: dict[str, Any],
     *,
@@ -212,7 +298,7 @@ def _matches_handoff_progress(message: dict[str, Any], **kwargs) -> bool:
     return (thread_match or token_match or mention_match) and _is_handoff_progress(message)
 
 
-def _recent_match(client, *, on_progress=None, **kwargs) -> dict[str, Any] | None:
+def _recent_match(client, *, space_id: str, on_progress=None, **kwargs) -> dict[str, Any] | None:
     """Check recent messages and direct replies to avoid missing fast responses."""
     candidates: list[dict[str, Any]] = []
 
@@ -222,7 +308,7 @@ def _recent_match(client, *, on_progress=None, **kwargs) -> dict[str, Any] | Non
         pass
 
     try:
-        candidates.extend(_message_items(client.list_messages(limit=30)))
+        candidates.extend(_message_items(client.list_messages(limit=30, space_id=space_id)))
     except Exception:
         pass
 
@@ -269,7 +355,7 @@ def _wait_for_handoff_reply(
             last_progress = label
             console.print(f"[dim]@{agent_name}: {label}[/dim]")
 
-    match = _recent_match(client, on_progress=on_progress, **kwargs)
+    match = _recent_match(client, space_id=space_id, on_progress=on_progress, **kwargs)
     if match:
         return match
 
@@ -288,7 +374,7 @@ def _wait_for_handoff_reply(
                     console.print(
                         f"[yellow]SSE unavailable ({response.status_code}); falling back to recent messages.[/yellow]"
                     )
-                    return _recent_match(client, on_progress=on_progress, **kwargs)
+                    return _recent_match(client, space_id=space_id, on_progress=on_progress, **kwargs)
 
                 for event_type, data in _iter_sse(response):
                     if timeout > 0 and time.time() > deadline:
@@ -301,19 +387,19 @@ def _wait_for_handoff_reply(
                         on_progress(data)
                         continue
         except httpx.ReadTimeout:
-            match = _recent_match(client, on_progress=on_progress, **kwargs)
+            match = _recent_match(client, space_id=space_id, on_progress=on_progress, **kwargs)
             if match:
                 return match
             continue
         except (httpx.ConnectError, httpx.ReadError):
-            match = _recent_match(client, on_progress=on_progress, **kwargs)
+            match = _recent_match(client, space_id=space_id, on_progress=on_progress, **kwargs)
             if match:
                 return match
             time.sleep(1)
         except KeyboardInterrupt:
             raise typer.Exit(1)
 
-    return _recent_match(client, on_progress=on_progress, **kwargs)
+    return _recent_match(client, space_id=space_id, on_progress=on_progress, **kwargs)
 
 
 def _resolve_agent_id(client, agent_name: str) -> str | None:
@@ -423,6 +509,16 @@ def run(
     priority: Optional[str] = typer.Option(None, "--priority", help="Task priority override"),
     create_task: bool = typer.Option(True, "--task/--no-task", help="Create a task for the handoff"),
     watch: bool = typer.Option(True, "--watch/--no-watch", help="Wait for the target agent response"),
+    adaptive_wait: bool = typer.Option(
+        True,
+        "--adaptive-wait/--no-adaptive-wait",
+        help="Probe listener status before waiting; use --no-adaptive-wait for a direct fire-and-wait handoff.",
+    ),
+    probe_timeout: int = typer.Option(
+        10,
+        "--probe-timeout",
+        help="Seconds to wait for the adaptive contact probe.",
+    ),
     require_completion: bool = typer.Option(
         False,
         "--require-completion",
@@ -434,10 +530,31 @@ def run(
         "--follow-up/--no-follow-up",
         help="After a reply, prompt to send threaded follow-ups until exit.",
     ),
+    loop: bool = typer.Option(
+        False,
+        "--loop/--no-loop",
+        help="Keep the agent feedback loop going automatically until completion or max rounds.",
+    ),
+    max_rounds: int = typer.Option(3, "--max-rounds", help="Maximum reply rounds when --loop is enabled"),
+    completion_promise: Optional[str] = typer.Option(
+        None,
+        "--completion-promise",
+        help="Exact promise text the agent must return as <promise>TEXT</promise> to stop --loop early.",
+    ),
     space_id: Optional[str] = typer.Option(None, "--space-id", "-s", help="Override default space"),
     as_json: bool = JSON_OPTION,
 ):
     """Hand work to an agent: create task, send message, watch SSE, and return the result."""
+    if loop and max_rounds < 1:
+        typer.echo("Error: --max-rounds must be at least 1 when --loop is enabled.", err=True)
+        raise typer.Exit(1)
+    if loop and not watch:
+        typer.echo("Error: --loop requires --watch so the CLI can receive agent replies.", err=True)
+        raise typer.Exit(1)
+    if loop and follow_up:
+        typer.echo("Error: --loop and --follow-up are separate modes; choose one.", err=True)
+        raise typer.Exit(1)
+
     normalized_intent = intent.strip().lower()
     if normalized_intent not in INTENTS:
         allowed = ", ".join(sorted(INTENTS))
@@ -452,6 +569,28 @@ def run(
     task_priority = priority or spec["priority"]
     handoff_id = f"handoff:{uuid.uuid4().hex[:8]}"
     target_agent_id = _resolve_agent_id(client, agent_name)
+    contact_probe: dict[str, Any] | None = None
+    effective_watch = watch
+    adaptive_enabled = adaptive_wait and watch
+
+    if adaptive_enabled:
+        try:
+            contact_probe = _probe_target_contact(
+                client,
+                space_id=sid,
+                agent_name=agent_name,
+                current_agent_name=current_agent_name,
+                timeout=probe_timeout,
+            )
+        except httpx.HTTPStatusError as exc:
+            handle_error(exc)
+        if contact_probe["contact_mode"] == "event_listener":
+            console.print(f"[green]@{agent_name} is live; waiting remains enabled.[/green]")
+        else:
+            effective_watch = False
+            console.print(
+                f"[yellow]@{agent_name} did not answer the contact probe; queueing handoff without waiting.[/yellow]"
+            )
 
     task_data: dict[str, Any] | None = None
     task_error: str | None = None
@@ -486,6 +625,23 @@ def run(
     context_parts.append(
         "Reply in this thread if possible; otherwise mention the sender and include the handoff token."
     )
+    if loop:
+        if completion_promise:
+            context_parts.append(
+                f"Agentic loop mode is enabled for up to {max_rounds} reply rounds. "
+                f"When genuinely complete, reply with `<promise>{completion_promise}</promise>`. "
+                "Do not emit the promise until it is true."
+            )
+        else:
+            context_parts.append(
+                f"Agentic loop mode is enabled for {max_rounds} reply rounds. "
+                "No completion promise is configured, so the CLI will stop at the round limit."
+            )
+    if contact_probe and contact_probe["contact_mode"] != "event_listener":
+        context_parts.append(
+            "Adaptive wait contact probe did not receive a live listener reply. "
+            "This handoff is queued for the target's next check-in."
+        )
     content = spec["prompt"].format(
         agent=agent_name, instructions=instructions, context="\n".join(context_parts), token=handoff_id
     )
@@ -500,15 +656,17 @@ def run(
     sent_message_id = str(sent.get("id") or sent_data.get("id") or "")
     console.print(f"[green]Handoff sent:[/green] {sent_message_id}")
 
-    if not watch or not sent_message_id:
+    if not effective_watch or not sent_message_id:
+        status = "queued_not_listening" if contact_probe and not effective_watch else "sent"
         result = {
-            "status": "sent",
+            "status": status,
             "intent": normalized_intent,
             "agent": agent_name,
             "handoff_id": handoff_id,
             "task": task_data,
             "task_error": task_error,
             "sent": sent_data,
+            "contact_probe": contact_probe,
             "reply": None,
         }
         if as_json:
@@ -524,7 +682,7 @@ def run(
         current_agent_name=current_agent_name,
         started_at=started_at,
         timeout=timeout,
-        require_completion=require_completion,
+        require_completion=False if loop else require_completion,
     )
 
     if reply is None and nudge:
@@ -543,12 +701,79 @@ def run(
                 current_agent_name=current_agent_name,
                 started_at=started_at,
                 timeout=timeout,
-                require_completion=require_completion,
+                require_completion=False if loop else require_completion,
             )
         except Exception:
             pass
 
+    loop_result: dict[str, Any] | None = None
+    if loop:
+        loop_records: list[dict[str, Any]] = []
+        completed = False
+        stop_reason = "timeout" if reply is None else "max_rounds"
+        if reply is not None:
+            loop_records.append({"round": 1, "sent_message_id": sent_message_id, "reply": reply})
+            completed = _completion_promise_satisfied(str(reply.get("content") or ""), completion_promise)
+            if completed:
+                stop_reason = "completion_promise"
+
+        round_number = 1
+        while reply is not None and not completed and round_number < max_rounds:
+            round_number += 1
+            parent_id = str(reply.get("id") or sent_message_id)
+            loop_content = _loop_continue_content(
+                agent_name=agent_name,
+                instructions=instructions,
+                handoff_id=handoff_id,
+                round_number=round_number,
+                max_rounds=max_rounds,
+                completion_promise=completion_promise,
+            )
+            started_at = time.time()
+            try:
+                loop_sent_data = client.send_message(sid, loop_content, parent_id=parent_id)
+            except httpx.HTTPStatusError as exc:
+                handle_error(exc)
+
+            loop_sent = loop_sent_data.get("message", loop_sent_data)
+            loop_sent_message_id = str(loop_sent.get("id") or loop_sent_data.get("id") or "")
+            console.print(f"[green]Loop round {round_number} sent:[/green] {loop_sent_message_id}")
+            if not loop_sent_message_id:
+                stop_reason = "send_failed"
+                break
+
+            reply = _wait_for_handoff_reply(
+                client,
+                space_id=sid,
+                agent_name=agent_name,
+                sent_message_id=loop_sent_message_id,
+                token=handoff_id,
+                current_agent_name=current_agent_name,
+                started_at=started_at,
+                timeout=timeout,
+                require_completion=False,
+            )
+            loop_records.append({"round": round_number, "sent_message_id": loop_sent_message_id, "reply": reply})
+            if reply is None:
+                stop_reason = "timeout"
+                break
+            completed = _completion_promise_satisfied(str(reply.get("content") or ""), completion_promise)
+            stop_reason = "completion_promise" if completed else "max_rounds"
+
+        loop_result = {
+            "enabled": True,
+            "max_rounds": max_rounds,
+            "completion_promise": completion_promise,
+            "completed": completed,
+            "stop_reason": stop_reason,
+            "rounds": loop_records,
+        }
+
     status = "replied" if reply else "timeout"
+    if loop_result and loop_result.get("stop_reason") == "timeout" and loop_result.get("rounds"):
+        status = "loop_timeout"
+    elif loop_result and loop_result.get("stop_reason") == "send_failed":
+        status = "loop_send_failed"
     result = {
         "status": status,
         "intent": normalized_intent,
@@ -558,7 +783,9 @@ def run(
         "task": task_data,
         "task_error": task_error,
         "sent": sent_data,
+        "contact_probe": contact_probe,
         "reply": reply,
+        "loop": loop_result,
     }
 
     if reply:

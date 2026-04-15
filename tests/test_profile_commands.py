@@ -9,10 +9,10 @@ from ax_cli.main import app
 runner = CliRunner()
 
 
-def _write_profile(tmp_path, *, name="dev", agent_id=None):
+def _write_profile(tmp_path, *, name="dev", agent_id=None, token="axp_a_TestKey.TestSecret"):
     profiles_dir = tmp_path / "profiles"
     token_file = tmp_path / "token.pat"
-    token_file.write_text("axp_a_TestKey.TestSecret")
+    token_file.write_text(token)
     token_sha = hashlib.sha256(token_file.read_text().strip().encode()).hexdigest()
     workdir_hash = hashlib.sha256(str(tmp_path.resolve()).encode()).hexdigest()
     profile_dir = profiles_dir / name
@@ -41,7 +41,7 @@ def test_profile_env_exports_agent_id_when_present(monkeypatch, tmp_path):
     result = runner.invoke(app, ["profile", "env", "dev"])
 
     assert result.exit_code == 0
-    assert 'export AX_AGENT_ID="agent-1"' in result.stdout
+    assert "export AX_AGENT_ID=agent-1" in result.stdout
 
 
 def test_profile_env_clears_stale_agent_id_when_missing(monkeypatch, tmp_path):
@@ -52,4 +52,42 @@ def test_profile_env_clears_stale_agent_id_when_missing(monkeypatch, tmp_path):
     result = runner.invoke(app, ["profile", "env", "dev"])
 
     assert result.exit_code == 0
-    assert 'export AX_AGENT_ID="none"' in result.stdout
+    assert "export AX_AGENT_ID=none" in result.stdout
+
+
+def test_profile_env_shell_quotes_export_values(monkeypatch, tmp_path):
+    profiles_dir = _write_profile(
+        tmp_path,
+        agent_id="agent-1",
+        token='axp_a_TestKey.$(echo unsafe)"',
+    )
+    monkeypatch.setattr(profile, "PROFILES_DIR", profiles_dir)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["profile", "env", "dev"])
+
+    assert result.exit_code == 0
+    assert "export AX_TOKEN='axp_a_TestKey.$(echo unsafe)\"'" in result.stdout
+
+
+def test_profile_env_outputs_shell_failure_when_verification_fails(monkeypatch, tmp_path):
+    profiles_dir = _write_profile(tmp_path, agent_id="agent-1")
+    monkeypatch.setattr(profile, "PROFILES_DIR", profiles_dir)
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    monkeypatch.chdir(other_dir)
+
+    result = runner.invoke(app, ["profile", "env", "dev"])
+
+    assert result.exit_code == 1
+    assert "Working directory mismatch" in result.stderr
+    assert "false # ax profile env failed verification" in result.stdout
+
+
+def test_profiles_dir_respects_ax_config_dir(monkeypatch, tmp_path):
+    config_dir = tmp_path / "custom-ax-config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(profile, "PROFILES_DIR", None)
+
+    assert profile._profiles_dir() == config_dir / "profiles"
+    assert (config_dir / "profiles").is_dir()

@@ -9,7 +9,8 @@ def clean_env(monkeypatch, tmp_path):
     """Ensure no leaked env vars affect tests. Use tmp_path for config."""
     for var in (
         "AX_TOKEN", "AX_BASE_URL", "AX_AGENT_NAME", "AX_AGENT_ID",
-        "AX_SPACE_ID",
+        "AX_SPACE_ID", "AX_ENV", "AX_USER_ENV", "AX_USER_TOKEN",
+        "AX_USER_BASE_URL",
     ):
         monkeypatch.delenv(var, raising=False)
     # Point global config to an empty dir so real ~/.ax/ doesn't leak in

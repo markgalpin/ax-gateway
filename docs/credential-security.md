@@ -3,6 +3,11 @@
 ax-cli includes built-in credential fingerprinting and honeypot detection to
 protect agent workspaces from unauthorized access.
 
+> **Future device-trust model:** fingerprinting is useful for anomaly detection,
+> but the target trust anchor is a registered device public key, not a reusable
+> user-token hash. See [DEVICE-TRUST-001](../specs/DEVICE-TRUST-001/spec.md) for
+> the proposed device approval and request-signing model.
+
 ## Fingerprinting
 
 Every CLI request sends non-sensitive fingerprint headers to the aX platform:
@@ -99,3 +104,23 @@ use it with ax-cli, the platform knows immediately.
 - Honeypot alerts fire only when fake credentials are used — legitimate
   users with real `axp_u_` tokens are never flagged by the honeypot system
 - The server IP address is available from the request itself (standard HTTP)
+
+## Trusted Setup Agents
+
+Trusted local agents can help configure an agent team after the user completes
+`axctl login`, but they should not receive the raw user bootstrap token.
+
+The safe pattern is:
+
+1. User logs in locally with `axctl login`.
+2. Trusted setup agent invokes `axctl token mint --save-to --profile`.
+3. Backend policy verifies the enrolled user/device context.
+4. `axctl` stores one scoped agent PAT per runtime profile.
+5. Runtime agents exchange their own PATs for short-lived agent JWTs.
+
+`axctl token mint` hides newly minted PATs by default when it stores them locally.
+Use `--print-token` only when a human explicitly needs to copy the token.
+
+Local isolation note: a fully trusted shell agent running as the same OS user can
+generally read files that the user can read. Device trust and OS secret storage
+reduce exposure, but untrusted code still needs process/user-level isolation.

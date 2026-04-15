@@ -78,8 +78,9 @@ def issue_enrollment(
     """Issue an enrollment token that creates + binds an agent on first use.
 
     \b
-    Give this token to a new agent. They run:
-        ax auth init --token axp_a_... --agent their-name
+    Give this enrollment token to a new agent. They run the legacy
+    project-local runtime init, not the user bootstrap login:
+        axctl auth init --token axp_a_... --agent their-name
 
     The agent is created and bound automatically.
     """
@@ -102,7 +103,7 @@ def issue_enrollment(
         console.print("\n[bold]Token (save now — shown once):[/bold]")
         console.print(f"  {data.get('token', '?')}")
         console.print("\n[cyan]Give to new agent:[/cyan]")
-        console.print(f"  ax auth init --token {data.get('token', 'TOKEN')[:12]}... --agent AGENT_NAME")
+        console.print(f"  axctl auth init --token {data.get('token', 'TOKEN')[:12]}... --agent AGENT_NAME")
 
 
 @app.command("revoke")

@@ -63,6 +63,23 @@ class TestTokenClassSelection:
         assert call_body["requested_token_class"] == "agent_access"
         assert call_body["agent_id"] == "some-agent-uuid"
 
+    def test_agent_pat_without_agent_id_falls_back_to_user_access(self, tmp_path, monkeypatch, mock_exchange):
+        """Agent-bound PATs need configured agent_id before requesting agent_access."""
+        mock_post = mock_exchange()
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".ax").mkdir()
+        (tmp_path / ".ax" / "config.toml").write_text("")
+
+        client = AxClient(
+            "https://example.com",
+            "axp_a_AgentKey.AgentSecret",
+        )
+        client._get_jwt()
+
+        call_body = mock_post.call_args[1]["json"]
+        assert call_body["requested_token_class"] == "user_access"
+        assert "agent_id" not in call_body
+
     def test_user_pat_without_agent_id_uses_user_access(self, tmp_path, monkeypatch, mock_exchange):
         """User PAT without agent_id → user_access."""
         mock_post = mock_exchange()
@@ -88,6 +105,152 @@ def test_cli_mime_overrides_normalize_common_source_artifacts_to_safe_text():
     assert _mime_from_ext(".sh") == "text/plain"
     assert _mime_from_filename("Dockerfile") == "text/plain"
     assert _mime_from_filename("Makefile") == "text/plain"
+
+
+def test_connect_sse_uses_v1_route_and_explicit_space_id():
+    client = AxClient("https://example.com", "legacy-token")
+    client._http.stream = MagicMock(return_value="stream-response")
+
+    result = client.connect_sse(space_id="space-123")
+
+    assert result == "stream-response"
+    call = client._http.stream.call_args
+    assert call.args[:2] == ("GET", "/api/v1/sse/messages")
+    assert call.kwargs["params"] == {"token": "legacy-token", "space_id": "space-123"}
+
+
+def test_list_messages_passes_explicit_space_id():
+    client = AxClient("https://example.com", "legacy-token")
+    response = httpx.Response(
+        200,
+        json={"messages": []},
+        request=httpx.Request("GET", "https://example.com/api/v1/messages"),
+    )
+    client._http.get = MagicMock(return_value=response)
+
+    client.list_messages(limit=5, channel="main", space_id="space-123")
+
+    assert client._http.get.call_args.args[0] == "/api/v1/messages"
+    assert client._http.get.call_args.kwargs["params"] == {
+        "limit": 5,
+        "channel": "main",
+        "space_id": "space-123",
+    }
+
+
+def test_list_messages_can_request_unread_and_mark_read():
+    client = AxClient("https://example.com", "legacy-token")
+    response = httpx.Response(
+        200,
+        json={"messages": [], "unread_count": 0},
+        request=httpx.Request("GET", "https://example.com/api/v1/messages"),
+    )
+    client._http.get = MagicMock(return_value=response)
+
+    client.list_messages(
+        limit=5,
+        channel="main",
+        space_id="space-123",
+        unread_only=True,
+        mark_read=True,
+    )
+
+    assert client._http.get.call_args.kwargs["params"] == {
+        "limit": 5,
+        "channel": "main",
+        "space_id": "space-123",
+        "unread_only": "true",
+        "mark_read": "true",
+    }
+
+
+def test_send_message_allows_metadata_and_message_type():
+    client = AxClient("https://example.com", "legacy-token")
+    response = httpx.Response(
+        200,
+        json={"id": "msg-1"},
+        request=httpx.Request("POST", "https://example.com/api/v1/messages"),
+    )
+    client._http.post = MagicMock(return_value=response)
+
+    client.send_message(
+        "space-123",
+        "context signal",
+        channel="automation-alerts",
+        metadata={"ui": {"widget": {"resource_uri": "ui://context/explorer"}}},
+        message_type="system",
+    )
+
+    assert client._http.post.call_args.args[0] == "/api/v1/messages"
+    assert client._http.post.call_args.kwargs["json"] == {
+        "content": "context signal",
+        "space_id": "space-123",
+        "channel": "automation-alerts",
+        "message_type": "system",
+        "metadata": {"ui": {"widget": {"resource_uri": "ui://context/explorer"}}},
+    }
+
+
+def test_mark_message_read_calls_backend_read_endpoint():
+    client = AxClient("https://example.com", "legacy-token")
+    response = httpx.Response(
+        200,
+        json={"status": "success", "message_id": "msg-1"},
+        request=httpx.Request("POST", "https://example.com/api/v1/messages/msg-1/read"),
+    )
+    client._http.post = MagicMock(return_value=response)
+
+    assert client.mark_message_read("msg-1")["status"] == "success"
+    assert client._http.post.call_args.args[0] == "/api/v1/messages/msg-1/read"
+
+
+def test_mark_all_messages_read_calls_backend_endpoint():
+    client = AxClient("https://example.com", "legacy-token")
+    response = httpx.Response(
+        200,
+        json={"status": "success", "marked_read": 2},
+        request=httpx.Request("POST", "https://example.com/api/v1/messages/mark-all-read"),
+    )
+    client._http.post = MagicMock(return_value=response)
+
+    assert client.mark_all_messages_read()["marked_read"] == 2
+    assert client._http.post.call_args.args[0] == "/api/v1/messages/mark-all-read"
+
+
+def test_list_tasks_passes_explicit_space_id():
+    client = AxClient("https://example.com", "legacy-token")
+    response = httpx.Response(
+        200,
+        json={"tasks": []},
+        request=httpx.Request("GET", "https://example.com/api/v1/tasks"),
+    )
+    client._http.get = MagicMock(return_value=response)
+
+    client.list_tasks(limit=7, space_id="space-123")
+
+    assert client._http.get.call_args.args[0] == "/api/v1/tasks"
+    assert client._http.get.call_args.kwargs["params"] == {
+        "limit": 7,
+        "space_id": "space-123",
+    }
+
+
+def test_list_agents_passes_explicit_space_id_and_limit():
+    client = AxClient("https://example.com", "legacy-token")
+    response = httpx.Response(
+        200,
+        json={"agents": []},
+        request=httpx.Request("GET", "https://example.com/api/v1/agents"),
+    )
+    client._http.get = MagicMock(return_value=response)
+
+    client.list_agents(space_id="space-123", limit=500)
+
+    assert client._http.get.call_args.args[0] == "/api/v1/agents"
+    assert client._http.get.call_args.kwargs["params"] == {
+        "space_id": "space-123",
+        "limit": 500,
+    }
 
 
 class TestCredentialManagement:
@@ -286,19 +449,3 @@ class TestCredentialManagement:
             "/api/v1/agents/manage/list",
             "/agents/manage/list",
         ]
-
-    def test_agent_pat_without_agent_id_uses_user_access(self, tmp_path, monkeypatch, mock_exchange):
-        """Agent PAT without agent_id falls back to user_access."""
-        mock_post = mock_exchange()
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / ".ax").mkdir()
-        (tmp_path / ".ax" / "config.toml").write_text("")
-
-        client = AxClient(
-            "https://example.com",
-            "axp_a_AgentKey.AgentSecret",
-        )
-        client._get_jwt()
-
-        call_body = mock_post.call_args[1]["json"]
-        assert call_body["requested_token_class"] == "user_access"

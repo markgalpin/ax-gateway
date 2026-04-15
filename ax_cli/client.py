@@ -268,7 +268,8 @@ class AxClient:
         """Get a JWT from the exchanger with appropriate token class.
 
         Token class selection:
-        - axp_a_ (agent-bound PAT) + agent_id → agent_access
+        - axp_a_ (agent-bound PAT) + configured agent_id → agent_access
+        - axp_a_ without configured agent_id → user_access fallback
         - axp_u_ (user PAT) → user_access always, even if agent_id is set
           (user PATs cannot exchange for agent_access — server returns 422)
 
@@ -410,14 +411,20 @@ class AxClient:
         channel: str = "main",
         parent_id: str | None = None,
         attachments: list[dict] | None = None,
+        metadata: dict | None = None,
+        message_type: str = "text",
     ) -> dict:
         """POST /api/v1/messages — explicit space_id required."""
-        body: dict = {"content": content, "space_id": space_id, "channel": channel, "message_type": "text"}
+        body: dict = {"content": content, "space_id": space_id, "channel": channel, "message_type": message_type}
         if parent_id:
             body["parent_id"] = parent_id
+        if metadata:
+            body["metadata"] = metadata
         if attachments:
             body["attachments"] = attachments
-            body["metadata"] = {"accepted_attachments": attachments}
+            merged_metadata = dict(metadata or {})
+            merged_metadata["accepted_attachments"] = attachments
+            body["metadata"] = merged_metadata
         r = self._http.post("/api/v1/messages", json=body, headers=self._with_agent(agent_id))
         r.raise_for_status()
         return self._parse_json(r)
@@ -455,10 +462,34 @@ class AxClient:
         r.raise_for_status()
         return self._parse_json(r)
 
-    def list_messages(self, limit: int = 20, channel: str = "main", *, agent_id: str | None = None) -> dict:
-        r = self._http.get(
-            "/api/v1/messages", params={"limit": limit, "channel": channel}, headers=self._with_agent(agent_id)
-        )
+    def list_messages(
+        self,
+        limit: int = 20,
+        channel: str = "main",
+        *,
+        space_id: str | None = None,
+        agent_id: str | None = None,
+        unread_only: bool = False,
+        mark_read: bool = False,
+    ) -> dict:
+        params: dict[str, str | int] = {"limit": limit, "channel": channel}
+        if space_id:
+            params["space_id"] = space_id
+        if unread_only:
+            params["unread_only"] = "true"
+        if mark_read:
+            params["mark_read"] = "true"
+        r = self._http.get("/api/v1/messages", params=params, headers=self._with_agent(agent_id))
+        r.raise_for_status()
+        return self._parse_json(r)
+
+    def mark_message_read(self, message_id: str) -> dict:
+        r = self._http.post(f"/api/v1/messages/{message_id}/read")
+        r.raise_for_status()
+        return self._parse_json(r)
+
+    def mark_all_messages_read(self) -> dict:
+        r = self._http.post("/api/v1/messages/mark-all-read")
         r.raise_for_status()
         return self._parse_json(r)
 
@@ -509,8 +540,17 @@ class AxClient:
         r.raise_for_status()
         return self._parse_json(r)
 
-    def list_tasks(self, limit: int = 20, *, agent_id: str | None = None) -> dict:
-        r = self._http.get("/api/v1/tasks", params={"limit": limit}, headers=self._with_agent(agent_id))
+    def list_tasks(
+        self,
+        limit: int = 20,
+        *,
+        agent_id: str | None = None,
+        space_id: str | None = None,
+    ) -> dict:
+        params: dict[str, str | int] = {"limit": limit}
+        if space_id:
+            params["space_id"] = space_id
+        r = self._http.get("/api/v1/tasks", params=params, headers=self._with_agent(agent_id))
         r.raise_for_status()
         return self._parse_json(r)
 
@@ -526,8 +566,13 @@ class AxClient:
 
     # --- Agents ---
 
-    def list_agents(self) -> dict:
-        r = self._http.get("/api/v1/agents")
+    def list_agents(self, *, space_id: str | None = None, limit: int | None = None) -> dict:
+        params: dict[str, str | int] = {}
+        if space_id:
+            params["space_id"] = space_id
+        if limit:
+            params["limit"] = limit
+        r = self._http.get("/api/v1/agents", params=params or None)
         r.raise_for_status()
         return self._parse_json(r)
 
@@ -760,10 +805,10 @@ class AxClient:
         space_id: str | None = None,
         timeout: httpx.Timeout | None = None,
     ) -> httpx.Response:
-        """GET /api/sse/messages — returns streaming response.
+        """GET /api/v1/sse/messages — returns streaming response.
 
         Usage:
-            with client.connect_sse() as resp:
+            with client.connect_sse(space_id=space_id) as resp:
                 for line in resp.iter_lines():
                     if line.startswith("data:"):
                         event = json.loads(line[5:])
@@ -775,7 +820,7 @@ class AxClient:
             params["space_id"] = space_id
         return self._http.stream(
             "GET",
-            "/api/sse/messages",
+            "/api/v1/sse/messages",
             params=params,
             timeout=timeout or httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0),
         )

@@ -11,6 +11,29 @@ console = Console()
 
 JSON_OPTION = typer.Option(False, "--json", help="Output as JSON")
 SPACE_OPTION = typer.Option(None, "--space-id", help="Override default space")
+EXIT_NOT_OK = 2
+EXIT_SKIPPED = 3
+
+
+def apply_envelope(
+    data: dict, *, summary: dict | None = None, details: list | None = None, skipped: bool = False
+) -> dict:
+    """Add the stable QA/diagnostic envelope without removing legacy fields."""
+    data["version"] = 1
+    data["skipped"] = skipped
+    data["summary"] = summary or {}
+    data["details"] = details or []
+    return data
+
+
+def mention_prefix(mention: str | None) -> str:
+    """Normalize an optional agent/user mention to the @handle form."""
+    if not mention:
+        return ""
+    value = mention.strip()
+    if not value:
+        return ""
+    return value if value.startswith("@") else f"@{value}"
 
 
 def print_json(data):

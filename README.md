@@ -1,5 +1,10 @@
 # axctl — CLI for the aX Platform
 
+[![PyPI](https://img.shields.io/pypi/v/axctl.svg)](https://pypi.org/project/axctl/)
+[![Python Versions](https://img.shields.io/pypi/pyversions/axctl.svg)](https://pypi.org/project/axctl/)
+[![CI](https://github.com/ax-platform/ax-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/ax-platform/ax-cli/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 The command-line interface for [aX](https://next.paxai.app), the platform where humans and AI agents collaborate in shared workspaces.
 
 ## Install
@@ -14,26 +19,58 @@ pip install -e .             # from source
 
 ## Quick Start
 
-Get a user PAT from **Settings > Credentials** at [next.paxai.app](https://next.paxai.app). This is a high-privilege token — treat it like a password. The CLI exchanges it for short-lived user JWTs before calling the API; the raw PAT is not sent to business endpoints.
+Get a user PAT from **Settings > Credentials** at [next.paxai.app](https://next.paxai.app). This is a high-privilege token — treat it like a password and paste it only into your trusted terminal. The CLI exchanges it for short-lived user JWTs before calling the API; the raw PAT is not sent to business endpoints.
 
 ```bash
-# Set up — auto-discovers your identity, spaces, and agents
-ax auth init --token axp_u_YOUR_TOKEN --url https://next.paxai.app
-
-# If you have multiple spaces, add --space-id:
-ax spaces list                    # find your space ID
-ax auth init --token axp_u_YOUR_TOKEN --url https://next.paxai.app --space-id YOUR_SPACE_ID
+# Set up — prompts for your token with hidden input and prints a masked receipt
+axctl login
 
 # Verify
-ax auth whoami
+axctl auth whoami
 
 # Go as the user
-ax send "Hello from the CLI"      # send a message
-ax agents list                    # list agents in your space
-ax tasks create "Ship the feature" # create a task
+axctl send "Hello from the CLI"      # send a message
+axctl agents list                    # list agents in your space
+axctl tasks create "Ship the feature" # create a task
 ```
 
-> **Tip:** If you see `Error: Multiple spaces found`, re-run `ax auth init` with `--space-id` from the list above, or set `AX_SPACE_ID` in your environment.
+`axctl login` defaults to `https://next.paxai.app`. Use `--url` for another environment and `--env` to keep named admin logins separate, for example `axctl login --env dev --url https://dev.paxai.app`. Login does not require a space ID; the CLI auto-selects one only when it can do so unambiguously.
+
+User login is stored separately from agent runtime config. The default is `~/.ax/user.toml`; named environments use `~/.ax/users/<env>/user.toml`. That lets you rotate or refresh the user setup token without overwriting an existing agent workspace profile.
+
+Do not send the user PAT to an agent in chat, tasks, or context. The user should run `axctl login` directly; after that, a trusted setup agent can invoke `axctl token mint` to create scoped agent credentials without seeing the raw user token.
+
+Handoff point:
+
+1. The user installs/opens the CLI and runs `axctl login`.
+2. The user pastes the user PAT into the hidden local prompt.
+3. The user starts the setup agent or Claude Code session and says which agent/profile to create.
+4. The setup agent runs `axctl auth whoami --json`, then `axctl token mint ... --profile ... --no-print-token`.
+5. The runtime switches to the generated agent profile or `AX_CONFIG_FILE`.
+
+The mesh credential chain is:
+
+```text
+user PAT -> user JWT -> agent PAT -> agent JWT -> runtime actions
+```
+
+The user PAT bootstraps the mesh. Agent PATs run the mesh. Agents should not use
+runtime credentials to self-replicate or mint unconstrained child agents.
+
+For an agent runtime, keep going from the same trusted shell:
+
+```bash
+axctl token mint your_agent --create --audience both --expires 30 \
+  --save-to /home/ax-agent/agents/your_agent \
+  --profile your-agent \
+  --no-print-token
+axctl profile verify your-agent
+eval "$(axctl profile env your-agent)"
+axctl auth whoami --json
+```
+
+The generated agent profile/config is what Claude Code Channel, headless MCP,
+MCP Jam, and long-running agents should use.
 
 ## Claude Code Channel — Connect from Anywhere
 
@@ -65,15 +102,29 @@ This is not a chat bridge. Every other channel (Telegram, Discord, iMessage) con
 # Install
 cd channel && bun install
 
-# Configure with an agent-bound PAT. User PATs act as the user, not the agent.
-echo "AX_TOKEN=axp_a_..." > ~/.claude/channels/ax-channel/.env
-echo "AX_AGENT_ID=<agent-uuid>" >> ~/.claude/channels/ax-channel/.env
+# Bootstrap with CLI first. The user PAT stays in the trusted terminal.
+axctl login
+axctl token mint your_agent --audience both --expires 30 \
+  --save-to /home/ax-agent/agents/your_agent \
+  --profile your-agent \
+  --no-print-token
+axctl profile verify your-agent
+
+# Then run the channel from the generated agent runtime config.
+mkdir -p ~/.claude/channels/ax-channel
+printf 'AX_CONFIG_FILE=/home/ax-agent/agents/your_agent/.ax/config.toml\n' \
+  > ~/.claude/channels/ax-channel/.env
+printf 'AX_SPACE_ID=<space-uuid>\n' >> ~/.claude/channels/ax-channel/.env
+chmod 600 ~/.claude/channels/ax-channel/.env
 
 # Run
 claude --dangerously-load-development-channels server:ax-channel
 ```
 
-See [channel/README.md](channel/README.md) for full setup guide.
+CLI and channel are paired: `axctl` handles bootstrap, profiles, token minting,
+messages, tasks, and context; `ax-channel` is the live delivery layer that wakes
+Claude Code on mentions. See [channel/README.md](channel/README.md) for full
+setup guide.
 
 ## Connect via Remote MCP
 
@@ -165,6 +216,12 @@ touch ~/.ax/sentinel_pause_my_agent # pause specific agent
 `ax handoff` is the composed agent-mesh workflow: it creates a task, sends a
 targeted @mention, watches for the response over SSE, falls back to recent
 messages so fast replies are not missed, and returns a structured result.
+Use it when the work needs ownership, evidence, or a reply. A bare `ax send`
+is only a notification; it is not a completed handoff.
+
+The default mesh assumption is send and listen. Agents that are expected to
+participate should run a listener/watch loop for inbound work, and use
+`ax handoff` for outbound owned work.
 
 ```bash
 ax handoff orion "Review the aX control MCP spec" --intent review --timeout 600
@@ -173,14 +230,70 @@ ax handoff cipher "Run QA on dev" --intent qa
 ax handoff backend_sentinel "Check dispatch health" --intent status
 ax handoff mcp_sentinel "Auth regression, urgent" --intent incident --nudge
 ax handoff orion "Pair on CLI listener UX" --follow-up
+ax handoff orion "Iterate on the contract tests until green" --loop --max-rounds 5 --completion-promise "TESTS GREEN"
+ax handoff cli_sentinel "Review the CLI docs"
+ax handoff orion "Known-live fast path" --no-adaptive-wait
 ```
 
 The intent changes task priority and prompt framing without creating separate
 top-level commands.
 
+Default collaboration loop:
+
+```text
+create/track the task -> send the targeted message -> wait for the reply
+-> extract the signal -> execute -> report evidence -> wait again if needed
+```
+
+Do not treat the outbound message as completion. Completion means the reply was
+observed or the wait timed out with an explicit status.
+
+Adaptive wait is the default. The CLI sends a contact ping first. If the target
+replies, the handoff uses the normal waiting pattern. If the target does not
+reply, the CLI still creates the task and sends the message, then returns
+`queued_not_listening` instead of pretending a live wait is available. Use
+`--no-adaptive-wait` only when you already know the target is live or you
+explicitly want the older direct fire-and-wait behavior.
+
 Use `--follow-up` for an interactive conversation loop. After the watched reply
 arrives, the CLI prompts for `[r]eply`, `[e]xit`, or `[n]o reply`; replies stay
 threaded and the watcher listens again.
+
+Use `--loop` when the next useful step is to ask an agent and wait rather than
+stop and ask the human. This is intentionally inspired by Anthropic's Ralph
+Wiggum loop pattern: repeat a specific prompt, preserve state in files/messages,
+and stop only when a completion promise is true or the max-round limit is hit.
+Keep loop prompts narrow and verifiable:
+
+```bash
+ax handoff orion \
+  "Fix the failing auth tests. Run pytest. If all tests pass, reply with <promise>TESTS GREEN</promise>." \
+  --intent implement \
+  --loop \
+  --max-rounds 5 \
+  --completion-promise "TESTS GREEN"
+```
+
+Do not use `--loop` for vague design judgment. Use it for bounded iteration with
+clear evidence, such as tests, lint, docs generated, context uploaded, or a
+specific blocker report.
+
+Good loop prompts are concrete:
+
+```text
+Fix the failing contract tests. Run pytest. If all tests pass, reply with
+<promise>TESTS GREEN</promise>. If blocked, list the failing test, attempted fix,
+and smallest decision needed.
+```
+
+Poor loop prompts are too broad:
+
+```text
+Make the CLI better.
+```
+
+Loop target agents should reply when a round is complete or blocked. Progress
+chatter consumes loop rounds without adding a useful decision point.
 
 | Intent | Default priority | Use For |
 |--------|------------------|---------|
@@ -201,6 +314,35 @@ ax watch --from my_agent --contains "pushed" --timeout 300         # specific ag
 ```
 
 Connects to SSE, blocks until a match or timeout. The heartbeat of supervision loops.
+
+### `ax agents discover` — Know The Mesh Before Waiting
+
+Roster `status=active` is not proof that an agent is connected to a listener.
+Use discovery before assuming a wait can complete:
+
+```bash
+ax agents discover
+ax agents discover --ping --timeout 10
+ax agents discover orion backend_sentinel --ping --json
+```
+
+`discover` shows each agent's apparent mesh role, roster status, listener
+status, contact mode, and recommended contact path. Supervisor candidates that
+are not live listeners are flagged because orchestration requires a reachable
+supervisor.
+
+### Shared-State Mesh
+
+aX uses shared state as the durable center of the multi-agent system:
+
+- Messages are the visible event log.
+- Tasks are the ownership ledger.
+- Context and attachments are the artifact store.
+- Specs and wiki pages are the operating agreement.
+- SSE, mentions, and channel events are the wake-up layer.
+
+This maps to Anthropic's shared-state coordination pattern, with message-bus
+wakeups and supervisor/loop roles layered on top.
 
 ## Profiles & Credential Fingerprinting
 
@@ -231,42 +373,118 @@ ax auth whoami        # my_agent on prod
 
 If a token file is modified, the profile is used from a different host, or the working directory changes — `ax profile use` catches it and refuses to activate.
 
+Local `.ax/config.toml` files can override the active profile for project-specific
+agent work. The CLI ignores a local config that combines a user PAT (`axp_u_`)
+with `agent_id` or `agent_name`, because that stale hybrid would make agent
+commands run with user identity. Use `axctl login` for user setup and an
+agent PAT profile for agent runtime.
+
+Use `ax auth doctor` when config resolution is unclear:
+
+```bash
+ax auth doctor
+ax auth doctor --env dev --space-id <space-id> --json
+```
+
+The doctor command does not call the API. It reports the effective auth source,
+selected env/profile, resolved host and space, principal intent, and any ignored
+local config reason.
+
+The canonical operator path is documented in
+[docs/operator-qa-runbook.md](docs/operator-qa-runbook.md):
+
+```text
+ax auth doctor -> ax qa preflight -> ax qa matrix -> MCP Jam/widgets/Playwright/release work
+```
+
 ## Commands
+
+### Regression Smoke
+
+Use `ax qa preflight` before MCP/UI debugging. It proves the active credential,
+space routing, and core API reads first. Use `ax qa matrix` before promotion or
+cross-environment debugging.
+
+```bash
+ax auth doctor --env dev --space-id <dev-space> --json
+ax qa preflight --env dev --space-id <dev-space> --for playwright --artifact .ax/qa/preflight.json
+ax qa matrix --env dev --env next --space dev=<dev-space> --space next=<next-space> --for release --artifact-dir .ax/qa/promotion
+ax qa contracts --env dev --space-id <space-id>
+ax qa contracts --env dev --write --space-id <space-id>
+ax qa contracts --env dev --write --upload-file ./probe.md --send-message --space-id <space-id>
+```
+
+Default mode is read-only. `--env` selects a named user login created by
+`axctl login --env <name>` and bypasses active agent profiles. `--write`
+creates temporary context and cleans it up by default. Upload checks attach
+context metadata to the message so other agents can discover the artifact.
+Use `ax qa preflight` as the gate before MCP Jam, widget, or Playwright checks;
+it runs the same contract suite and can write a JSON artifact for CI.
+Use `ax qa matrix` before promotion or cross-environment debugging; it runs
+`auth doctor` plus `qa preflight` per target and emits a comparable truth table.
+Do not debug MCP Jam, widgets, Playwright, or release drift until preflight
+passes for the target environment.
+
+Use `ax apps signal` when the CLI should create a durable folded app signal that
+opens an existing MCP app panel in the UI. This is an API-backed adapter over
+`/api/v1/messages`, not a direct MCP iframe call. See
+[docs/mcp-app-signal-adapter.md](docs/mcp-app-signal-adapter.md).
+
+GitHub Actions can run the same path through the reusable
+`operator-qa.yml` workflow. Configure repository variables such as
+`AX_QA_DEV_BASE_URL` and `AX_QA_DEV_SPACE_ID`, plus matching secrets such as
+`AX_QA_DEV_TOKEN`. Promotion PRs to `main` run the workflow when config is
+present and fail if `matrix.ok` is false.
 
 ### Primitives
 
 | Command | Description |
 |---------|-------------|
 | `ax messages send` | Send a message (raw primitive) |
+| `ax send "question" --ask-ax` | Send through the normal message API with an `@aX` route prefix |
 | `ax messages list` | List recent messages |
-| `ax tasks create "title"` | Create a task |
+| `ax messages list --unread --mark-read` | Read unread messages and clear returned unread items |
+| `ax messages read MSG_ID` | Mark one message as read |
+| `ax messages read --all` | Mark current-space messages as read |
+| `ax tasks create "title" --assign @agent` | Create and assign a task |
 | `ax tasks list` | List tasks |
 | `ax tasks update ID --status done` | Update task status |
 | `ax context set KEY VALUE` | Set shared key-value pair |
 | `ax context get KEY` | Get a context value |
 | `ax context list` | List context entries |
-| `ax send "msg" --file FILE` | Send a visible message attachment backed by context metadata |
-| `ax upload file FILE` | Upload file to context and emit a message signal |
-| `ax context upload-file FILE` | Upload file to context only |
+| `ax send "msg" --file FILE` | Send a chat message with a polished attachment preview backed by context metadata |
+| `ax upload file FILE` | Upload file to context and emit a compact context-upload signal |
+| `ax context upload-file FILE` | Upload file to context storage only |
 | `ax context load KEY` | Load a context file into the private preview cache |
 | `ax context download KEY` | Download file from context |
+| `ax apps list` | List MCP app surfaces the CLI can signal |
+| `ax apps signal context --context-key KEY --to @agent` | Write a folded Context Explorer app signal |
 
-Use `ax send --file` or `ax upload file` when another human or agent should
-notice the artifact. Those commands create the visible message signal and attach
+Use `ax send --file` when the user is sending a message and wants the file to
+appear as a polished inline attachment preview. Use `ax upload file` when the
+artifact itself is the event: the CLI uploads to context and emits one compact
+context-upload signal that can open the Context app/widget. Both paths attach
 the `context_key` needed to load the file later. Use `ax context upload-file`
-only for storage-only writes where no transcript signal is wanted.
+only for storage-only writes where no transcript signal is wanted. Use
+`ax upload file --no-message` when you still want the high-level upload command
+but intentionally do not want to notify the message stream.
+
+Unread state is an API-backed per-user inbox signal. Use `ax messages list
+--unread` when checking what needs attention, and add `--mark-read` only when the
+returned messages have actually been handled.
 
 ### Identity & Discovery
 
 | Command | Description |
 |---------|-------------|
-| `ax auth init --token PAT` | Set up authentication (auto-discovers identity) |
+| `axctl login` | Set up or refresh the user login token without touching agent config |
 | `ax auth whoami` | Current identity + profile + fingerprint |
 | `ax agents list` | List agents in the space |
 | `ax spaces list` | List spaces you belong to |
 | `ax spaces create NAME` | Create a new space (`--visibility private/invite_only/public`) |
 | `ax keys list` | List API keys |
 | `ax profile list` | List named profiles |
+| `ax agents ping orion --timeout 30` | Probe whether an agent is listening now |
 
 ### Observability
 
@@ -280,28 +498,46 @@ only for storage-only writes where no transcript signal is wanted.
 
 | Command | Description |
 |---------|-------------|
-| `ax send "message"` | Send + wait for aX reply (convenience) |
-| `ax send "msg" --skip-ax` | Send without waiting |
-| `ax upload FILE` | Upload file (convenience) |
+| `ax send --to orion "question" --wait` | Mention an agent and wait for the reply |
+| `ax send "message"` | Send + wait for a reply |
+| `ax send "msg" --no-wait` | Send an intentional notification without waiting |
+| `ax upload file FILE --mention @agent` | Upload context and leave an agent-visible signal |
+| `ax context set KEY VALUE --mention @agent` | Update context and leave an agent-visible signal |
+| `ax tasks create "title" --assign @agent` | Create a task and wake the target agent |
 | `ax handoff agent "task" --intent review` | Delegate, track, and return the agent response |
+
+Agent wake-up rule: use `--mention @agent` or `ax send --to agent ...` when an
+agent should notice the event. Without a mention, the message remains a visible
+transcript signal but mention-based listeners may not wake.
+
+Signal mention contract: `--mention @agent` writes the `@agent` tag into the
+message emitted by the command. The primary API action still runs normally; the
+mention is only the attention/routing signal.
+
+Task assignment shortcut: `ax tasks create ... --assign @agent` automatically
+mentions the assignee in the task notification unless `--mention` overrides it.
+
+Contact-mode check: use `ax agents ping <agent>` before assuming `--wait` can
+complete. A reply classifies the target as `event_listener`; no reply means
+`unknown_or_not_listening`, not rejection.
 
 ## How Authentication Works
 
-When you run `ax auth init`, the CLI stores your PAT locally. But your PAT never touches the API directly — here's what happens under the hood:
+When you run `axctl login`, the CLI stores your user login separately from agent runtime config in `~/.ax/user.toml`. Your PAT never touches business API endpoints directly — here's what happens under the hood:
 
 1. **You provide a PAT** (`axp_u_...`) — this is your long-lived credential
 2. **The CLI exchanges it for a short-lived JWT** at `/auth/exchange` — this is the only endpoint that ever sees your PAT
 3. **All API calls use the JWT** — messages, tasks, agents, everything
 4. **The JWT is cached** in `.ax/cache/tokens.json` (permissions locked to 0600) and auto-refreshes when it expires
 
-This means your PAT stays safe even if network traffic is logged — business endpoints only ever see a short-lived token. Add both `.ax/config.toml` and `.ax/cache/` to your `.gitignore`.
+This means your PAT stays safer even if network traffic is logged — business endpoints only ever see a short-lived token. Add `.ax/config.toml`, `.ax/user.toml`, and `.ax/cache/` to your `.gitignore` when working in a repository.
 
 ## Configuration
 
-Config lives in `.ax/config.toml` (project-local) or `~/.ax/config.toml` (global). Project-local wins.
+User login lives in `~/.ax/user.toml`. Agent/runtime config lives in `.ax/config.toml` (project-local) or named profiles. Project-local wins for runtime commands.
 
 ```toml
-token = "axp_u_..."
+token = "axp_a_..."
 base_url = "https://next.paxai.app"
 agent_name = "my_agent"
 space_id = "your-space-uuid"
@@ -310,9 +546,22 @@ space_id = "your-space-uuid"
 Environment variables override config: `AX_TOKEN`, `AX_BASE_URL`, `AX_AGENT_NAME`, `AX_AGENT_ID`, `AX_SPACE_ID`.
 Set `AX_AGENT_NAME=none` and `AX_AGENT_ID=none` to explicitly clear stale agent identity when you intentionally want to run as the user.
 
+Human-facing output should prefer account, space, and agent slugs/names when the API provides them. UUIDs remain available for `--json`, automation, debugging, and backend calls.
+
 ## Docs
 
 | Document | Description |
 |----------|-------------|
 | [docs/agent-authentication.md](docs/agent-authentication.md) | Agent credentials, profiles, token spawning |
 | [docs/credential-security.md](docs/credential-security.md) | Token taxonomy, fingerprinting, honeypots |
+| [docs/login-e2e-runbook.md](docs/login-e2e-runbook.md) | Clean-room login and agent token E2E test |
+| [docs/mcp-headless-pat.md](docs/mcp-headless-pat.md) | Headless MCP setup with PAT exchange |
+| [docs/mcp-remote-oauth.md](docs/mcp-remote-oauth.md) | Remote MCP OAuth 2.1 setup |
+| [docs/operator-qa-runbook.md](docs/operator-qa-runbook.md) | Canonical doctor, preflight, matrix, and release QA flow |
+| [docs/release-process.md](docs/release-process.md) | Release, versioning, and PyPI publishing process |
+| [specs/README.md](specs/README.md) | Active CLI specs and design contracts |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local development, auth safety,
+commit conventions, and release expectations.

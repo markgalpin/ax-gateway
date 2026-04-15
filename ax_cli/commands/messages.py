@@ -15,9 +15,9 @@ from ..output import JSON_OPTION, console, handle_error, print_json, print_kv, p
 app = typer.Typer(name="messages", help="Message operations", no_args_is_help=True)
 
 
-def _print_wait_status(remaining: int, last_remaining: int | None) -> int:
+def _print_wait_status(remaining: int, last_remaining: int | None, wait_label: str = "reply") -> int:
     if remaining != last_remaining:
-        console.print(f"  [dim]waiting for aX... ({remaining}s remaining)[/dim]", end="\r")
+        console.print(f"  [dim]waiting for {wait_label}... ({remaining}s remaining)[/dim]", end="\r")
     return remaining
 
 
@@ -58,6 +58,7 @@ def _wait_for_reply_polling(
     *,
     deadline: float,
     seen_ids: set[str],
+    wait_label: str = "reply",
     poll_interval: float = 2.0,
 ) -> dict | None:
     """Poll for a reply as a fallback when SSE is unavailable."""
@@ -65,7 +66,7 @@ def _wait_for_reply_polling(
 
     while time.time() < deadline:
         remaining = int(deadline - time.time())
-        last_remaining = _print_wait_status(remaining, last_remaining)
+        last_remaining = _print_wait_status(remaining, last_remaining, wait_label)
 
         try:
             data = client.list_replies(message_id)
@@ -84,7 +85,7 @@ def _wait_for_reply_polling(
     return None
 
 
-def _wait_for_reply(client, message_id: str, timeout: int = 60) -> dict | None:
+def _wait_for_reply(client, message_id: str, timeout: int = 60, wait_label: str = "reply") -> dict | None:
     """Wait for a reply by polling list_replies."""
     deadline = time.time() + timeout
     seen_ids: set[str] = {message_id}
@@ -94,6 +95,7 @@ def _wait_for_reply(client, message_id: str, timeout: int = 60) -> dict | None:
         message_id,
         deadline=deadline,
         seen_ids=seen_ids,
+        wait_label=wait_label,
         poll_interval=1.0,
     )
 
@@ -106,13 +108,14 @@ def _message_items(data) -> list[dict]:
     return []
 
 
-def _resolve_message_id(client, message_id: str) -> str:
+def _resolve_message_id(client, message_id: str, *, space_id: str | None = None) -> str:
     """Resolve table-friendly short message IDs against recent messages."""
     candidate = message_id.strip()
     if not candidate or "-" in candidate or len(candidate) >= 32:
         return candidate
 
-    data = client.list_messages(limit=100)
+    sid = space_id or resolve_space_id(client)
+    data = client.list_messages(limit=100, space_id=sid)
     matches = [
         str(message.get("id") or "")
         for message in _message_items(data)
@@ -129,6 +132,14 @@ def _resolve_message_id(client, message_id: str) -> str:
         )
         raise typer.Exit(1)
     return candidate
+
+
+def _target_mention(to: str) -> str:
+    return to if to.startswith("@") else f"@{to}"
+
+
+def _starts_with_mention(content: str, mention: str) -> bool:
+    return content.lstrip().lower().startswith(mention.lower())
 
 
 def _attachment_ref(
@@ -189,26 +200,51 @@ def _context_upload_value(
 @app.command("send")
 def send(
     content: str = typer.Argument(..., help="Message content"),
-    wait: bool = typer.Option(True, "--wait/--skip-ax", "-w", help="Wait for aX response (default: yes)"),
+    wait: bool = typer.Option(
+        True,
+        "--wait/--no-wait",
+        "-w",
+        help="Wait for a reply after sending. Use --no-wait for intentional notify-only sends.",
+    ),
+    skip_ax: bool = typer.Option(False, "--skip-ax", help="Deprecated alias for --no-wait.", hidden=True),
     timeout: int = typer.Option(60, "--timeout", "-t", help="Max seconds to wait for reply"),
     to: Optional[str] = typer.Option(
         None, "--to", help="@mention another agent by name (prepends @name to your message)"
     ),
+    ask_ax: bool = typer.Option(False, "--ask-ax", help="Route this message to aX by prepending @aX"),
     act_as: Optional[str] = typer.Option(
         None, "--act-as", help="Impersonate: send as a different agent identity. Requires a token scoped to that agent."
     ),
-    files: Optional[list[str]] = typer.Option(None, "--file", "-f", help="Attach a local file (repeatable)"),
+    files: Optional[list[str]] = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="Attach a local file to this message; creates a transcript preview backed by context metadata (repeatable)",
+    ),
     channel: str = typer.Option("main", "--channel", help="Channel name"),
     parent: Optional[str] = typer.Option(None, "--parent", "--reply-to", "-r", help="Parent message ID (thread reply)"),
     space_id: Optional[str] = typer.Option(None, "--space-id", help="Override default space"),
     as_json: bool = JSON_OPTION,
 ):
-    """Send a message and wait for aX's response by default. Use --skip-ax to send only.
+    """Send a message and wait for a reply by default.
 
-    Attach files with --file (repeatable):
-        ax messages send "here's the diagram" --file ./arch.png
-        ax messages send "two files" -f report.md -f data.csv
+    Use --to to get an agent's attention by mention. Use --no-wait to send only.
+    For delegated agent work that needs ownership and a reply, use `ax handoff`
+    instead; it creates/tracks the task, sends the message, watches for the
+    agent response, and returns structured evidence.
+
+    Attach files with --file when the primary intent is a chat message with a
+    polished transcript preview. The attachment metadata includes the context
+    key so agents can load the file later:
+        ax send "here's the diagram" --file ./arch.png
+        ax send "two files" -f report.md -f data.csv
     """
+    if skip_ax:
+        wait = False
+    if ask_ax and to:
+        typer.echo("Error: use either --ask-ax or --to, not both.", err=True)
+        raise typer.Exit(1)
+
     client = get_client()
     sid = resolve_space_id(client, explicit=space_id)
 
@@ -320,14 +356,20 @@ def send(
         )
         console.print(f"  [dim]Uploaded: {attachments[-1]['filename']}[/dim]")
 
-    # --to: prepend @mention to content for targeting another agent
+    # Route helpers prepend a visible mention while keeping POST /messages as
+    # the single transport contract.
     final_content = content
-    if to:
-        mention = to if to.startswith("@") else f"@{to}"
-        final_content = f"{mention} {content}"
+    if ask_ax:
+        mention = _target_mention("aX")
+        if not _starts_with_mention(content, mention):
+            final_content = f"{mention} {content}"
+    elif to:
+        mention = _target_mention(to)
+        if not _starts_with_mention(content, mention):
+            final_content = f"{mention} {content}"
 
     try:
-        parent_id = _resolve_message_id(client, parent) if parent else None
+        parent_id = _resolve_message_id(client, parent, space_id=sid) if parent else None
         data = client.send_message(
             sid,
             final_content,
@@ -349,7 +391,8 @@ def send(
         return
 
     console.print(f"[green]Sent.[/green] id={msg_id}")
-    reply = _wait_for_reply(client, msg_id, timeout=timeout)
+    wait_label = _target_mention("aX") if ask_ax else (_target_mention(to) if to else "reply")
+    reply = _wait_for_reply(client, msg_id, timeout=timeout, wait_label=wait_label)
 
     if reply:
         if as_json:
@@ -367,12 +410,21 @@ def send(
 def list_messages(
     limit: int = typer.Option(20, "--limit", help="Max messages to return"),
     channel: str = typer.Option("main", "--channel", help="Channel name"),
+    unread: bool = typer.Option(False, "--unread", help="Show only unread messages for the current user"),
+    mark_read: bool = typer.Option(False, "--mark-read", help="Mark returned unread messages as read"),
+    space_id: Optional[str] = typer.Option(None, "--space-id", help="Override default space"),
     as_json: bool = JSON_OPTION,
 ):
     """List recent messages."""
     client = get_client()
+    sid = resolve_space_id(client, explicit=space_id)
     try:
-        data = client.list_messages(limit=limit, channel=channel)
+        kwargs = {"limit": limit, "channel": channel, "space_id": sid}
+        if unread:
+            kwargs["unread_only"] = True
+        if mark_read:
+            kwargs["mark_read"] = True
+        data = client.list_messages(**kwargs)
     except httpx.HTTPStatusError as e:
         handle_error(e)
     messages = _message_items(data)
@@ -390,6 +442,41 @@ def list_messages(
             messages,
             keys=["short_id", "sender", "content_short", "created_at"],
         )
+        if isinstance(data, dict):
+            unread_count = data.get("unread_count")
+            marked_read_count = data.get("marked_read_count")
+            if unread_count is not None:
+                console.print(f"[dim]Unread: {unread_count}[/dim]")
+            if marked_read_count:
+                console.print(f"[green]Marked read: {marked_read_count}[/green]")
+
+
+@app.command("read")
+def mark_read(
+    message_id: Optional[str] = typer.Argument(None, help="Message ID to mark read"),
+    all_messages: bool = typer.Option(False, "--all", help="Mark all messages in the current space as read"),
+    as_json: bool = JSON_OPTION,
+):
+    """Mark one message, or all current-space messages, as read."""
+    if not all_messages and not message_id:
+        typer.echo("Error: provide a message ID or --all.", err=True)
+        raise typer.Exit(1)
+    if all_messages and message_id:
+        typer.echo("Error: use either a message ID or --all, not both.", err=True)
+        raise typer.Exit(1)
+
+    client = get_client()
+    try:
+        if all_messages:
+            data = client.mark_all_messages_read()
+        else:
+            data = client.mark_message_read(_resolve_message_id(client, message_id or ""))
+    except httpx.HTTPStatusError as e:
+        handle_error(e)
+    if as_json:
+        print_json(data)
+    else:
+        print_kv(data)
 
 
 @app.command("get")

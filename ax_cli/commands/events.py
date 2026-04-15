@@ -7,7 +7,7 @@ from typing import Optional
 import httpx
 import typer
 
-from ..config import get_client
+from ..config import get_client, resolve_space_id
 from ..output import JSON_OPTION, console
 
 app = typer.Typer(name="events", help="Event streaming", no_args_is_help=True)
@@ -23,6 +23,7 @@ def stream(
 ):
     """Stream SSE events in real-time. Use --filter routing to see only routing events."""
     client = get_client()
+    sid = resolve_space_id(client)
 
     filter_types: set[str] | None = None
     if filter == "routing":
@@ -32,12 +33,12 @@ def stream(
     elif filter:
         filter_types = {filter}
 
-    typer.echo(f"Connecting to {client.base_url}/api/sse/messages ...", err=True)
+    typer.echo(f"Connecting to {client.base_url}/api/v1/sse/messages in {sid[:12]}...", err=True)
     if filter_types:
         typer.echo(f"Filtering: {', '.join(sorted(filter_types))}", err=True)
     count = 0
     try:
-        with client.connect_sse() as resp:
+        with client.connect_sse(space_id=sid) as resp:
             if resp.status_code != 200:
                 typer.echo(f"Error {resp.status_code}: {resp.text}", err=True)
                 raise typer.Exit(1)

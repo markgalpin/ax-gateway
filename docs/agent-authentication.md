@@ -2,6 +2,15 @@
 
 How to get started on the aX platform and set up agent credentials.
 
+> **Design direction:** the current CLI supports user PAT bootstrap and
+> agent-scoped PAT profiles. The target v1 model is documented in
+> [AXCTL-BOOTSTRAP-001](../specs/AXCTL-BOOTSTRAP-001/spec.md),
+> [DEVICE-TRUST-001](../specs/DEVICE-TRUST-001/spec.md), and
+> [AGENT-PAT-001](../specs/AGENT-PAT-001/spec.md): user bootstrap tokens enroll
+> trusted devices, trusted devices mint scoped agent PATs by policy, and agents
+> use short-lived agent JWTs for runtime work. Agents must never read raw user
+> bootstrap token material.
+
 ## Two Paths
 
 **Path 1: Individual agent** — You have a Personal Access Token (PAT) scoped to one agent. Use it directly.
@@ -139,25 +148,77 @@ ax profile verify prod-frontend
 ```bash
 # Send as backend_sentinel
 eval $(ax profile env prod-backend)
-ax send "@frontend_sentinel review my PR" --skip-ax
+ax send --to frontend_sentinel "review my PR" --wait
 
 # Or use the composed handoff workflow
 ax handoff frontend_sentinel "Add the upload button" --intent implement
 ```
 
+Use `ax handoff` instead of a loose `send` when work should be owned,
+tracked, and answered. The composed handoff is the expected agent collaboration
+loop: create/track the task, send the targeted message, wait for the reply,
+then continue from the observed signal. A sent message alone is only a
+notification.
+
 ## Using with Claude Code
 
 If you're using Claude Code to manage your agent swarm, use the user PAT for user-authored setup and management work: creating scoped PATs, profiles, and verification. Claude Code channel sessions that speak as an agent must run with that agent's `axp_a_` PAT.
 
-1. Set the bootstrap token only for setup: `ax auth token set <your-bootstrap-token>`
-2. Tell Claude Code: "Read the ax-control-plane skill and set up my agent profiles"
-3. Claude Code will use the swarm token to create scoped PATs, set up profiles, and verify everything
+User-to-agent handoff flow:
+
+1. The user runs `axctl login` in the trusted shell and pastes the user PAT into the hidden prompt.
+2. The CLI stores the user login separately from agent runtime config in `~/.ax/user.toml`.
+3. The hidden prompt prints only a masked receipt, such as `axp_u_********`, so the user can tell the paste was captured without exposing the token.
+4. The user starts the setup agent/Claude Code session and gives it the setup goal, not the raw token.
+5. The setup agent verifies the authenticated CLI context with `axctl auth whoami --json`.
+6. The setup agent may run `axctl token mint <agent> --save-to ... --profile ... --no-print-token` in that already-authenticated environment.
+7. `axctl token mint` uses the stored user login for credential minting, even when the current working directory has an agent `.ax/config.toml`.
+8. The setup agent verifies each generated agent profile with `axctl profile verify` and `axctl auth whoami --json`.
+9. Runtime channels switch to the generated agent profile or `AX_CONFIG_FILE` and use only that agent's `axp_a_` PAT.
+
+Do not paste the user PAT into an agent message or task. The user PAT remains a
+high-trust local setup credential. Treat the logged-in shell/account as trusted
+setup context, not as an agent runtime credential.
 
 The ax-control-plane skill knows how to:
 - Check identity with `ax auth whoami`
 - Create and manage profiles with `ax profile`
 - Send messages and hand work to agents with `ax handoff`
 - Watch for completions with `ax watch`
+
+## Team Setup Model
+
+The user runs `axctl login` as the one-time trusted local setup step, then
+trusted local automation provisions the agent team through `axctl` without
+ever receiving the user's bootstrap token.
+
+```text
+User bootstrap token
+  │
+  ▼
+axctl login in trusted terminal
+  │
+  ▼
+trusted setup agent invokes axctl token mint --save-to --profile
+  │
+  ▼
+backend policy issues one scoped agent PAT per agent
+  │
+  ▼
+each agent profile exchanges its PAT for short-lived agent JWTs
+```
+
+Important boundaries:
+
+- The setup agent is allowed to run CLI setup commands only because the user
+  trusts that local automation context.
+- The setup agent does not receive or persist the raw user bootstrap token.
+- `axctl token mint --save-to` stores the scoped agent PAT and does not print it by
+  default.
+- Runtime agents use their own agent-bound PAT/JWT, never the user's token.
+
+This keeps the user in control of bootstrap authority while still making team
+setup automatable.
 
 ## Token Types
 
@@ -201,6 +262,8 @@ ax profile use ──► verifies all three ──► ax commands
 2. Swarm token creates, never runs — it mints scoped PATs only
 3. Profiles enforce provenance — wrong host/dir/token = blocked
 4. Tokens live in files (mode 600), never in config.toml
+5. Setup automation stores scoped agent PATs without printing them unless
+   explicitly requested with `--print-token`
 
 ## Profile Verification
 

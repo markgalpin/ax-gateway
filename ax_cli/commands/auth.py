@@ -8,18 +8,201 @@ import typer
 from ..config import (
     _global_config_dir,
     _load_local_config,
+    _load_user_config,
     _local_config_dir,
     _save_config,
+    _save_user_config,
+    diagnose_auth_config,
     get_client,
     resolve_agent_name,
     resolve_token,
     save_token,
 )
-from ..output import JSON_OPTION, console, handle_error, print_json, print_kv
+from ..output import EXIT_NOT_OK, JSON_OPTION, apply_envelope, console, handle_error, print_json, print_kv
 
 app = typer.Typer(name="auth", help="Authentication & identity", no_args_is_help=True)
 token_app = typer.Typer(name="token", help="Token management", no_args_is_help=True)
 app.add_typer(token_app, name="token")
+
+DEFAULT_LOGIN_BASE_URL = "https://next.paxai.app"
+
+
+def _mask_token_prefix(token: str) -> str:
+    """Show enough token shape to confirm paste without exposing the secret."""
+    token = token.strip()
+    if not token:
+        return "***"
+    if len(token) <= 4:
+        return "*" * len(token)
+    return f"{token[:6]}{'*' * 8}"
+
+
+def _resolve_login_token(token: str | None) -> str:
+    """Return an explicit token or prompt for one without echoing it."""
+    if token and token.strip():
+        return token.strip()
+
+    console.print("[cyan]Paste your aX token. Input is hidden.[/cyan]")
+    entered = typer.prompt("Token", hide_input=True).strip()
+    if not entered:
+        console.print("[red]Token required.[/red] Get one from Settings > Credentials in the UI.")
+        raise typer.Exit(1)
+    console.print(f"[green]Token captured:[/green] {_mask_token_prefix(entered)}")
+    return entered
+
+
+def _candidate_space_id(space: dict) -> str | None:
+    value = space.get("id", space.get("space_id"))
+    return str(value) if value else None
+
+
+def _select_login_space(space_list: list[dict]) -> dict | None:
+    """Pick only an unambiguous default; login itself should not force space setup."""
+    if len(space_list) == 1:
+        return space_list[0]
+
+    for key in ("is_current", "current", "is_default", "default"):
+        matches = [space for space in space_list if space.get(key) is True]
+        if len(matches) == 1:
+            return matches[0]
+
+    personal = [
+        space
+        for space in space_list
+        if space.get("is_personal") is True or str(space.get("space_mode", "")).lower() == "personal"
+    ]
+    if len(personal) == 1:
+        return personal[0]
+
+    return None
+
+
+def login_user(
+    token: str | None = None,
+    *,
+    base_url: str = DEFAULT_LOGIN_BASE_URL,
+    space_id: str | None = None,
+    agent: str | None = None,
+    env_name: str | None = None,
+) -> None:
+    """Log in a human user without touching agent runtime config."""
+    token = _resolve_login_token(token)
+    if agent:
+        console.print("[yellow]Ignoring --agent for user login. Use an agent PAT/profile for agent runtime.[/yellow]")
+
+    cfg = _load_user_config(env_name)
+    cfg["token"] = token
+    cfg["base_url"] = base_url
+    cfg["principal_type"] = "user"
+    if env_name:
+        cfg["environment"] = env_name
+    cfg.pop("agent_id", None)
+    cfg.pop("agent_name", None)
+
+    console.print(f"\n[cyan]Connecting to {base_url}...[/cyan]")
+    try:
+        from ..token_cache import TokenExchanger
+
+        exchanger = TokenExchanger(base_url, token)
+        exchanger.get_token(
+            "user_access",
+            scope="messages tasks context agents spaces search",
+            force_refresh=True,
+        )
+        console.print("[green]Token verified.[/green] Exchange successful.")
+    except Exception as e:
+        console.print(f"[red]Token verification failed:[/red] {e}")
+        console.print("Check that the token is valid and the URL is correct.")
+        raise typer.Exit(1)
+
+    try:
+        from ..client import AxClient
+
+        client = AxClient(base_url=base_url, token=token)
+        me = client.whoami()
+        username = me.get("username", "unknown")
+        console.print(f"[green]Identity:[/green] {username} ({me.get('email', '')})")
+
+        if space_id:
+            cfg["space_id"] = space_id
+        elif not cfg.get("space_id"):
+            spaces = client.list_spaces()
+            space_list = spaces.get("spaces", spaces) if isinstance(spaces, dict) else spaces
+            if isinstance(space_list, list):
+                selected_space = _select_login_space([s for s in space_list if isinstance(s, dict)])
+                if selected_space:
+                    selected_id = _candidate_space_id(selected_space)
+                    if selected_id:
+                        cfg["space_id"] = selected_id
+                        console.print(f"[green]Space:[/green] {selected_space.get('name', selected_id)}")
+                elif len(space_list) > 1:
+                    console.print(
+                        f"\n[yellow]{len(space_list)} spaces found.[/yellow] No default space selected during login."
+                    )
+    except Exception:
+        if space_id:
+            cfg["space_id"] = space_id
+
+    config_path = _save_user_config(cfg, env_name=env_name)
+    console.print(f"\n[green]Saved user login:[/green] {config_path}")
+    for k, v in cfg.items():
+        if k == "token":
+            v = v[:6] + "..." + v[-4:] if len(v) > 10 else "***"
+        console.print(f"  {k} = {v}")
+
+    console.print("\n[cyan]You're ready.[/cyan] Try: ax auth whoami")
+
+
+@app.command("doctor")
+def doctor(
+    env_name: str = typer.Option(
+        None,
+        "--env",
+        help="Diagnose a named user-login environment created with `axctl login --env`",
+    ),
+    space_id: str = typer.Option(None, "--space-id", help="Show this explicit space override in the resolution"),
+    as_json: bool = JSON_OPTION,
+):
+    """Explain effective auth/config resolution without calling the API."""
+    data = diagnose_auth_config(env_name=env_name, explicit_space_id=space_id)
+    effective = data["effective"]
+    apply_envelope(
+        data,
+        summary={
+            "command": "ax auth doctor",
+            "principal_intent": effective.get("principal_intent"),
+            "auth_source": effective.get("auth_source"),
+            "host": effective.get("host"),
+            "space_id": effective.get("space_id"),
+            "warnings": len(data.get("warnings", [])),
+            "problems": len(data.get("problems", [])),
+        },
+        details=data.get("problems") or data.get("warnings") or [],
+    )
+    if as_json:
+        print_json(data)
+    else:
+        status = "[green]OK[/green]" if data["ok"] else "[red]PROBLEM[/red]"
+        console.print(f"[bold]aX auth doctor:[/bold] {status}")
+        console.print(f"  principal_intent = {effective.get('principal_intent')}")
+        console.print(f"  auth_source      = {effective.get('auth_source')}")
+        console.print(f"  token_kind       = {effective.get('token_kind')} ({effective.get('token')})")
+        console.print(f"  base_url         = {effective.get('base_url')} ({effective.get('base_url_source')})")
+        console.print(f"  host             = {effective.get('host')}")
+        console.print(f"  space_id         = {effective.get('space_id')} ({effective.get('space_source')})")
+        console.print(f"  agent_name       = {effective.get('agent_name')} ({effective.get('agent_name_source')})")
+        console.print(f"  agent_id         = {effective.get('agent_id')} ({effective.get('agent_id_source')})")
+        if data.get("selected_env"):
+            console.print(f"  selected_env     = {data['selected_env']}")
+        if data.get("selected_profile"):
+            console.print(f"  selected_profile = {data['selected_profile']}")
+        for warning in data.get("warnings", []):
+            console.print(f"[yellow]warning:[/yellow] {warning['code']} - {warning.get('reason')}")
+        for problem in data.get("problems", []):
+            console.print(f"[red]problem:[/red] {problem['code']} - {problem.get('reason')}")
+
+    if not data["ok"]:
+        raise typer.Exit(EXIT_NOT_OK)
 
 
 @app.command()
@@ -61,33 +244,34 @@ def whoami(as_json: bool = JSON_OPTION):
 
 @app.command("init")
 def init(
-    token: str = typer.Option(None, "--token", "-t", help="PAT token (axp_u_... or axp_a_...)"),
-    base_url: str = typer.Option("http://localhost:8002", "--url", "-u", help="API base URL"),
+    token: str = typer.Option(None, "--token", "-t", help="PAT token (prompted securely if omitted)"),
+    base_url: str = typer.Option(DEFAULT_LOGIN_BASE_URL, "--url", "-u", help="API base URL"),
     agent: str = typer.Option(None, "--agent", "-a", help="Agent name or ID (auto-detected if not set)"),
-    space_id: str = typer.Option(None, "--space-id", "-s", help="Space ID (auto-detected if not set)"),
+    space_id: str = typer.Option(None, "--space-id", "-s", help="Optional default space ID"),
 ):
-    """Set up authentication for this project.
+    """Legacy project-local runtime init.
+
+    For normal user bootstrap, run `axctl login` first. This command writes
+    local `.ax/config.toml` runtime config for a project or agent worktree.
 
     Just provide your PAT — everything else is auto-discovered:
 
     \b
-        ax auth init --token axp_u_...
-        ax auth init --token axp_u_... --url https://next.paxai.app
+        axctl login
+        axctl login --url https://next.paxai.app
 
     The CLI will:
     1. Verify the token works (exchange it for a JWT)
     2. Discover your identity, spaces, and agents
-    3. Auto-select defaults if there's only one option
+    3. Auto-select a default space only when it is unambiguous
     4. Save everything to .ax/config.toml
 
-    After init, all commands just work — no flags needed.
+    After this legacy init, project-local commands can use the saved runtime
+    config without flags.
     """
     from pathlib import Path
 
-    if not token:
-        console.print("[red]Token required.[/red] Get one from Settings > Credentials in the UI.")
-        console.print("  ax auth init --token axp_u_YOUR_TOKEN_HERE")
-        raise typer.Exit(1)
+    token = _resolve_login_token(token)
 
     # --agent accepts both name and UUID
     import re
@@ -107,11 +291,14 @@ def init(
     if not local:
         local = Path.cwd() / ".ax"
 
+    is_enrollment = token.startswith("axp_a_")
     cfg = _load_local_config()
     cfg["token"] = token
     cfg["base_url"] = base_url
-
-    is_enrollment = token.startswith("axp_a_")
+    cfg["principal_type"] = "agent" if is_enrollment else "user"
+    if not is_enrollment:
+        cfg.pop("agent_id", None)
+        cfg.pop("agent_name", None)
     console.print(f"\n[cyan]Connecting to {base_url}...[/cyan]")
 
     if is_enrollment:
@@ -211,7 +398,7 @@ def init(
         if not registered:
             if not resolved_name:
                 console.print("[yellow]This is an enrollment token. Provide an agent name:[/yellow]")
-                console.print("  ax auth init --token axp_a_... --agent my-agent-name")
+                console.print("  axctl auth init --token axp_a_... --agent my-agent-name")
             raise typer.Exit(1)
 
         console.print("[green]Token bound.[/green] Exchange successful.")
@@ -235,7 +422,11 @@ def init(
             from ..token_cache import TokenExchanger
 
             exchanger = TokenExchanger(base_url, token)
-            exchanger.get_token("user_access", scope="messages tasks context agents spaces search")
+            exchanger.get_token(
+                "user_access",
+                scope="messages tasks context agents spaces search",
+                force_refresh=True,
+            )
             console.print("[green]Token verified.[/green] Exchange successful.")
         except Exception as e:
             console.print(f"[red]Token verification failed:[/red] {e}")
@@ -249,16 +440,6 @@ def init(
             me = client.whoami()
             username = me.get("username", "unknown")
             console.print(f"[green]Identity:[/green] {username} ({me.get('email', '')})")
-
-            bound = me.get("bound_agent")
-            if bound:
-                cfg["agent_id"] = bound.get("agent_id", "")
-                cfg["agent_name"] = bound.get("agent_name", "")
-                if bound.get("default_space_id"):
-                    cfg["space_id"] = bound["default_space_id"]
-                console.print(
-                    f"[green]Bound agent:[/green] {bound.get('agent_name')} ({bound.get('agent_id', '')[:12]}...)"
-                )
         except Exception:
             pass
 
@@ -267,34 +448,30 @@ def init(
             try:
                 spaces = client.list_spaces()
                 space_list = spaces.get("spaces", spaces) if isinstance(spaces, dict) else spaces
-                if isinstance(space_list, list) and len(space_list) == 1:
-                    cfg["space_id"] = str(space_list[0].get("id"))
-                    console.print(f"[green]Space:[/green] {space_list[0].get('name')} (auto-selected)")
-                elif isinstance(space_list, list) and len(space_list) > 1:
-                    console.print(f"\n[yellow]{len(space_list)} spaces found.[/yellow] Use --space-id to pick one:")
-                    for s in space_list[:5]:
-                        console.print(f"  {s.get('name')} — {s.get('id')}")
+                if isinstance(space_list, list):
+                    selected_space = _select_login_space([s for s in space_list if isinstance(s, dict)])
+                    if selected_space:
+                        selected_id = _candidate_space_id(selected_space)
+                        if selected_id:
+                            cfg["space_id"] = selected_id
+                            console.print(f"[green]Space:[/green] {selected_space.get('name', selected_id)}")
+                    elif len(space_list) > 1:
+                        console.print(
+                            f"\n[yellow]{len(space_list)} spaces found.[/yellow] "
+                            "No default space selected during login."
+                        )
             except Exception:
                 pass
 
-        # Discover agents
-        if not cfg.get("agent_id") and not agent_id:
-            try:
-                agents_data = client.list_agents()
-                agent_list = agents_data.get("agents", agents_data) if isinstance(agents_data, dict) else agents_data
-                if isinstance(agent_list, list) and len(agent_list) == 1:
-                    cfg["agent_id"] = str(agent_list[0].get("id"))
-                    cfg["agent_name"] = agent_list[0].get("name", "")
-                    console.print(f"[green]Agent:[/green] {agent_list[0].get('name')} (auto-selected)")
-                elif isinstance(agent_list, list) and len(agent_list) > 1:
-                    console.print(f"\n[cyan]{len(agent_list)} agents available.[/cyan] Use --agent-id to pick one.")
-            except Exception:
-                pass
+        if agent:
+            console.print(
+                "[yellow]Ignoring --agent for user login. Use an agent PAT/profile for agent runtime.[/yellow]"
+            )
 
     # Apply explicit overrides
-    if agent_name:
+    if is_enrollment and agent_name:
         cfg["agent_name"] = agent_name
-    if agent_id:
+    if is_enrollment and agent_id:
         cfg["agent_id"] = agent_id
     if space_id:
         cfg["space_id"] = space_id

@@ -424,7 +424,7 @@ def listen(
     # SSE loop with auto-reconnect
     while True:
         try:
-            with client.connect_sse() as resp:
+            with client.connect_sse(space_id=sid) as resp:
                 if resp.status_code != 200:
                     console.print(f"[red]SSE failed: {resp.status_code}[/red]")
                     raise ConnectionError()

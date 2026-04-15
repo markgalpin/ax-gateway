@@ -38,6 +38,29 @@ The smart-flag model makes the workflow obvious:
 - optionally notify someone about the result
 - optionally wait for their response
 
+The current implemented attention flag is `--mention @agent` on primary commands
+that already emit or can emit a message signal. The command performs the primary
+API action first, then writes the `@agent` tag into the message content so
+message routing and mention-based listeners can wake the right agent.
+
+When ownership or response evidence matters, those steps should be exposed as a
+single composed operator action. The current production shape is `ax handoff`:
+create or track the task, send the targeted message, wait on the control
+channel, and return the reply/evidence in one result. Future `--assign`,
+`--notify`, and `--wait` flags should preserve that same composition instead of
+making operators hand-roll each primitive.
+
+The mesh model is bidirectional by default: agents listen for inbound work and
+use composed handoffs for outbound owned work. Sending and listening should be
+part of the runtime posture, not an optional afterthought that each operator has
+to remember.
+
+For iterative work, the CLI should let an operator ask an agent and wait again
+instead of stopping to ask the human. The implemented form is `ax handoff
+... --loop`, inspired by Anthropic's Ralph Wiggum plugin. The aX version keeps
+the loop explicit and bounded: task, message, SSE wait, threaded continuation,
+structured result, and max-round/promise escape hatches.
+
 ## Goals
 
 - No new top-level verbs for orchestration.
@@ -56,6 +79,70 @@ The smart-flag model makes the workflow obvious:
 - No implementation changes in this document; this is a contract draft only.
 
 ## Proposed Flags
+
+### `ax handoff ... --loop`
+
+When a task can be advanced by another agent without human judgment, `--loop`
+keeps the feedback loop active:
+
+```bash
+ax handoff orion \
+  "Fix the failing contract tests. Run pytest. Reply with <promise>TESTS GREEN</promise> only when true." \
+  --intent implement \
+  --loop \
+  --max-rounds 5 \
+  --completion-promise "TESTS GREEN"
+```
+
+Rules:
+
+1. The instructions must be specific and evidence-based.
+2. `--max-rounds` is required as the safety cap, even when a completion promise
+   is present.
+3. `--completion-promise` stops the loop only when a reply contains the exact
+   `<promise>TEXT</promise>` value or the exact text as its own line.
+4. Timeout means unknown or blocked delivery, not task failure.
+5. If the next step requires human judgment, the loop should stop and report the
+   decision needed.
+
+`--loop` is not a replacement for product design judgment or production
+incident debugging. It is for bounded iteration where validation output, files,
+commits, context keys, or a blocker report can prove progress.
+
+Loop target agents should reply when a round is complete or blocked. Progress
+chatter consumes loop rounds without adding a useful decision point.
+
+### `ax handoff` adaptive wait
+
+Adaptive wait is the default because the safe path should not depend on the
+operator remembering a flag. The CLI probes before deciding whether to wait:
+
+```bash
+ax handoff cli_sentinel "Review CLI docs"
+ax handoff orion "Known-live fast path" --no-adaptive-wait
+```
+
+Behavior:
+
+1. Send a contact-mode ping to the target.
+2. If the target replies, continue with the normal wait/loop behavior.
+3. If the target does not reply, create the task and send the message, but do
+   not wait on a channel that is not proven live.
+4. Return `status=queued_not_listening` with the contact probe details.
+
+This keeps shared state durable even when live delivery is unavailable: the task
+and message exist for later pickup, and the CLI reports that it queued the work
+instead of presenting timeout as an agent decision.
+
+User-facing surfaces must preserve the distinction:
+
+- `contact_mode=event_listener` means a live listener was confirmed and the CLI
+  is waiting for a response.
+- `status=queued_not_listening` means work was saved to shared state, but no
+  live listener was confirmed.
+
+Do not collapse both states into a generic `Queued` or `Waiting for @agent`
+label. That recreates black-hole ambiguity at the UI layer.
 
 ### `--notify [@agent] ["optional message"]`
 
@@ -161,18 +248,25 @@ Include:
 The CLI provides the primitives and flags. The `ax-operator` skill provides the
 operating discipline.
 
-Agents should learn this default loop from the skill:
+Agents should learn this default loop from the skill. Prefer a composed command
+such as `ax handoff` when the flow involves task ownership plus a reply:
 
 1. verify identity and target environment
-2. run the primary command
+2. create or track the task/artifact
 3. notify the relevant agent or requester with durable metadata
-4. wait when a response is expected
-5. fetch the resulting message, task, or context object to prove visibility
+4. wait on SSE/watch for the reply when a response is expected
+5. extract the reply signal, ranking, evidence, or blocker
+6. execute the next step
+7. report back with commit, diff, validation, or artifact proof
+8. wait again when follow-up is expected
 
 The proof step is not optional for agent handoffs. A command that reports
 success locally is not enough if the target agent cannot discover the artifact.
 This protects the platform from silent upload, context, and task handoff
 failures.
+
+A sent message is not completion. Completion requires an observed reply, an
+explicit timeout, or a deliberately fire-and-forget notification.
 
 The skill should teach the flag-based form once implemented, while documenting
 the current manual fallback during the transition:
@@ -184,6 +278,9 @@ ax messages get <notification-message-id> --json
 
 Until `--notify` and `--wait` are implemented, agents must perform the same
 steps manually with `ax send`, `ax watch`, and explicit result fetches.
+For task-backed delegation, `ax handoff` is the preferred current composed
+fallback because it already bundles task creation, targeted send, watch,
+recent-message fallback, and structured output.
 
 ## Wait Contract
 
@@ -325,9 +422,21 @@ scheduled for removal once the flag-based workflow surface ships.
 - Final argument parsing shape for `--notify`: one option with optional values,
   or split flags such as `--notify`, `--notify-agent`, `--message` under the
   hood while documenting a friendlier shorthand?
-- Whether `ax upload file` and `ax context upload-file` should share the exact
-  same workflow flags or whether one becomes the canonical documented path.
 - Whether `--wait` needs a dedicated timeout flag on every command or should
   inherit an existing global workflow timeout.
 - Whether notify messages should always thread off the created artifact when the
   command can produce a parent/message anchor.
+
+## Resolved: File Upload Collaboration Path
+
+`ax upload file` is the canonical collaboration command for sharing a file as a
+context event. It uploads bytes, stores a context pointer, and sends one compact
+message signal by default.
+
+`ax send --file` is the canonical message-attachment path when the user starts
+from chat and wants the file to appear as a polished inline preview. It should
+still include context metadata so agents can load the artifact later.
+
+`ax context upload-file` remains a lower-level storage-only primitive for
+scripts and backing-store writes. It should not be the path taught to users or
+agents when the goal is "share this artifact with the team."

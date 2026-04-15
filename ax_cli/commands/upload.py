@@ -9,9 +9,14 @@ import typer
 
 from ..config import get_client, resolve_space_id
 from ..context_keys import build_upload_context_key
-from ..output import JSON_OPTION, console, handle_error, print_json
+from ..output import JSON_OPTION, console, handle_error, mention_prefix, print_json
 
-app = typer.Typer(name="upload", help="Upload files to context", no_args_is_help=True)
+app = typer.Typer(
+    name="upload", help="Upload files to context and optionally notify the transcript", no_args_is_help=True
+)
+
+
+_mention_prefix = mention_prefix
 
 
 def _message_attachment_ref(
@@ -38,22 +43,29 @@ def _message_attachment_ref(
 def upload_file(
     file_path: str = typer.Argument(..., help="Path to the file to upload"),
     message: Optional[str] = typer.Option(None, "--message", "-m", help="Message to send referencing the upload"),
+    mention: Optional[str] = typer.Option(None, "--mention", help="@mention a user or agent in the upload message"),
     key: Optional[str] = typer.Option(None, "--key", "-k", help="Context key (default: unique upload key)"),
     vault: bool = typer.Option(False, "--vault", help="Store permanently in vault (default: ephemeral 24h)"),
-    skip_ax: bool = typer.Option(True, "--skip-ax/--wait", help="Skip waiting for aX reply (default: skip)"),
+    wait: bool = typer.Option(False, "--wait/--no-wait", help="Wait for a reply to the upload message"),
+    skip_ax: bool = typer.Option(False, "--skip-ax", help="Deprecated alias for --no-wait.", hidden=True),
+    no_message: bool = typer.Option(False, "--no-message", help="Store context without sending a chat signal"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Only output the attachment ID"),
     json_output: bool = JSON_OPTION,
 ):
-    """Upload a file to context and optionally send a message about it.
+    """Upload a file to context and send a message signal by default.
 
-    Pattern: file → upload API → context vault → message notifies agents.
-    Agents access the file through context, not inline in chat.
+    Use this when the primary intent is "share this artifact with the team".
+    Pattern: file → upload API → context vault → transcript signal.
+    The message is the visible signal; context is the backing store.
+
+    Use `ax send --file` when the primary intent is a normal chat message with
+    a polished attachment preview. Use `--no-message` for storage-only uploads.
 
     Examples:
         ax upload file screenshot.png -m "check this screenshot"
         ax upload file report.pdf --vault --message "aX review this report"
         ax upload file data.csv --key "sales-q1" --vault
-        ax upload file arch.png --quiet   # just get the ID
+        ax upload file arch.png --no-message --quiet   # context only, print ID
     """
     client = get_client()
     space_id = resolve_space_id(client)
@@ -80,11 +92,7 @@ def upload_file(
     original_name = result.get("original_filename", path.name)
     context_key = key or build_upload_context_key(original_name, attachment_id)
 
-    if quiet:
-        typer.echo(attachment_id)
-        return
-
-    if not json_output:
+    if not json_output and not quiet:
         console.print(f"[green]Uploaded:[/green] {original_name} ({content_type}, {size} bytes)")
 
     # Step 2: Store reference in context
@@ -121,21 +129,24 @@ def upload_file(
             client.set_context(space_id, context_key, json.dumps(context_value))
             storage_type = "ephemeral (24h)"
 
-        if not json_output:
+        if not json_output and not quiet:
             console.print(f"[green]Context:[/green] key={context_key} ({storage_type})")
     except httpx.HTTPStatusError:
-        if not json_output:
+        if not json_output and not quiet:
             console.print("[yellow]Warning: upload succeeded but context store failed[/yellow]")
         storage_type = "failed"
 
     # Step 3: Send message referencing the upload
-    # Default: always notify. Use --quiet to skip message.
+    # Default: always notify. Use --no-message (or --quiet) for storage-only.
     msg_id = None
-    if not quiet:
+    if not no_message and not quiet:
         if message is not None:
             content = f"{message}\n\n📎 Uploaded `{original_name}` to context (key: `{context_key}`)"
         else:
             content = f"📎 Uploaded `{original_name}` to context (key: `{context_key}`)"
+        prefix = _mention_prefix(mention)
+        if prefix:
+            content = f"{prefix} {content}"
         attachments = [
             _message_attachment_ref(
                 attachment_id=attachment_id,
@@ -156,11 +167,15 @@ def upload_file(
             handle_error(exc)
             raise typer.Exit(1)
 
-        # Wait for aX reply
-        if not skip_ax and msg_id:
+        # Wait for a reply when explicitly requested.
+        if wait and not skip_ax and msg_id:
             from .messages import _wait_for_reply
 
             _wait_for_reply(client, msg_id, timeout=60)
+
+    if quiet:
+        typer.echo(attachment_id)
+        return
 
     if json_output:
         print_json(

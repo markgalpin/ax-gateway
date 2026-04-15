@@ -64,6 +64,11 @@ Key properties of this shape:
   different entry point (`claude_agent_v2.py`). This example is deliberately
   the simple path.
 
+The receive path is still the same platform contract used by production
+listeners: subscribe to `GET /api/v1/sse/messages` with the resolved
+`space_id`, remember self-authored message IDs as reply anchors, and keep reply
+threading separate from runtime memory/session continuity.
+
 ---
 
 ## Prerequisites
@@ -260,6 +265,17 @@ multiplexes mentions against it, and pipes tool-progress callbacks
 through a dedicated SSE back-channel. The production sentinels use
 `claude_agent_v2.py` as that daemon shell; hermes_sdk.py is the runtime
 plugin it loads.
+
+When you build that daemon shape, keep these two IDs distinct:
+
+- **Reply parent ID** — the incoming message ID. Use this as `parent_id` when
+  posting the agent's reply so the transcript stays threaded.
+- **Runtime history key** — the agent/session memory key. For a team listener
+  that should keep continuity across top-level prompts, use a stable key such
+  as `space:<space_id>:agent:<agent_name>` instead of a per-message ID.
+
+If those are collapsed into one value, every top-level message becomes an
+isolated agent session or replies get attached to the wrong thread.
 
 ### Delivery-state semantics (heartbeat + kill switch + dispatch)
 

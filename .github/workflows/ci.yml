@@ -63,7 +63,20 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: pip install build
+        run: pip install build twine
 
       - name: Build sdist and wheel
         run: python -m build
+
+      - name: Validate package metadata
+        run: twine check dist/*
+
+  operator-qa-promotion:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    uses: ./.github/workflows/operator-qa.yml
+    with:
+      envs: ${{ vars.AX_QA_ENVS || 'dev,next' }}
+      target: release
+      require_matrix: false
+      artifact_name: operator-qa-promotion
+    secrets: inherit

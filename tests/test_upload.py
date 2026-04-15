@@ -66,6 +66,8 @@ def test_upload_file_passes_resolved_space_to_upload_api(monkeypatch, tmp_path):
             "sample-key",
             "--message",
             "@madtank sample",
+            "--mention",
+            "orion",
             "--json",
         ],
     )
@@ -74,6 +76,85 @@ def test_upload_file_passes_resolved_space_to_upload_api(monkeypatch, tmp_path):
     assert calls["upload"]["space_id"] == "space-1"
     assert calls["context"]["space_id"] == "space-1"
     assert calls["message"]["space_id"] == "space-1"
+    assert calls["message"]["content"].startswith("@orion @madtank sample")
+
+
+def test_upload_file_no_message_still_stores_context(monkeypatch, tmp_path):
+    calls = {}
+    sample = tmp_path / "sample.txt"
+    sample.write_text("hello\n")
+
+    class FakeClient:
+        def upload_file(self, path, *, space_id=None):
+            calls["upload"] = {"path": path, "space_id": space_id}
+            return {
+                "attachment_id": "att-1",
+                "url": "/api/v1/uploads/files/sample.txt",
+                "content_type": "text/plain",
+                "size": sample.stat().st_size,
+                "original_filename": "sample.txt",
+            }
+
+        def set_context(self, space_id, key, value):
+            calls["context"] = {"space_id": space_id, "key": key, "value": value}
+
+        def send_message(self, space_id, content, attachments=None):
+            calls["message"] = {"space_id": space_id, "content": content, "attachments": attachments}
+            return {"id": "msg-1"}
+
+    monkeypatch.setattr("ax_cli.commands.upload.get_client", lambda: FakeClient())
+    monkeypatch.setattr("ax_cli.commands.upload.resolve_space_id", lambda client: "space-1")
+
+    result = runner.invoke(
+        app,
+        [
+            "upload",
+            "file",
+            str(sample),
+            "--no-message",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls["upload"]["space_id"] == "space-1"
+    assert calls["context"]["space_id"] == "space-1"
+    assert "message" not in calls
+    assert json.loads(result.output)["message_id"] is None
+
+
+def test_upload_file_quiet_still_stores_context_without_message(monkeypatch, tmp_path):
+    calls = {}
+    sample = tmp_path / "quiet.txt"
+    sample.write_text("quiet\n")
+
+    class FakeClient:
+        def upload_file(self, path, *, space_id=None):
+            calls["upload"] = {"path": path, "space_id": space_id}
+            return {
+                "attachment_id": "att-quiet",
+                "url": "/api/v1/uploads/files/quiet.txt",
+                "content_type": "text/plain",
+                "size": sample.stat().st_size,
+                "original_filename": "quiet.txt",
+            }
+
+        def set_context(self, space_id, key, value):
+            calls["context"] = {"space_id": space_id, "key": key, "value": value}
+
+        def send_message(self, space_id, content, attachments=None):
+            calls["message"] = {"space_id": space_id, "content": content, "attachments": attachments}
+            return {"id": "msg-1"}
+
+    monkeypatch.setattr("ax_cli.commands.upload.get_client", lambda: FakeClient())
+    monkeypatch.setattr("ax_cli.commands.upload.resolve_space_id", lambda client: "space-1")
+
+    result = runner.invoke(app, ["upload", "file", str(sample), "--quiet"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "att-quiet"
+    assert calls["context"]["space_id"] == "space-1"
+    assert "message" not in calls
 
 
 def test_upload_file_vault_stores_context_before_promote(monkeypatch, tmp_path):

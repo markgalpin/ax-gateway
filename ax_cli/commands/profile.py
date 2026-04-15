@@ -9,6 +9,7 @@ Storage: ~/.ax/profiles/<name>/profile.toml
 """
 
 import hashlib
+import shlex
 import socket
 import tomllib
 from datetime import datetime, timezone
@@ -19,15 +20,16 @@ import httpx
 import typer
 from rich.table import Table
 
+from ..config import _global_config_dir
 from ..output import console
 
 app = typer.Typer(help="Named profiles with credential fingerprinting")
 
-PROFILES_DIR = Path.home() / ".ax" / "profiles"
+PROFILES_DIR: Path | None = None
 
 
 def _profiles_dir() -> Path:
-    d = PROFILES_DIR
+    d = PROFILES_DIR or (_global_config_dir() / "profiles")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -80,6 +82,10 @@ def _active_profile() -> str | None:
 def _set_active(name: str) -> None:
     marker = _profiles_dir() / ".active"
     marker.write_text(name + "\n")
+
+
+def _print_shell_export(name: str, value: str) -> None:
+    print(f"export {name}={shlex.quote(value)}")
 
 
 def _verify_profile(profile: dict) -> list[str]:
@@ -317,17 +323,21 @@ def show_env(
         typer.echo(f"# Profile '{name}' failed verification:", err=True)
         for f in failures:
             typer.echo(f"#   {f}", err=True)
+        # Command substitutions mask the child's exit code:
+        # `eval "$(ax profile env bad)" && next` would otherwise run `next`
+        # with whatever stale AX_* variables are already present.
+        print("false # ax profile env failed verification")
         raise typer.Exit(1)
 
     tf = Path(profile["token_file"]).expanduser()
     token = tf.read_text().strip()
 
-    print(f'export AX_TOKEN="{token}"')
-    print(f'export AX_BASE_URL="{profile.get("base_url", "")}"')
-    print(f'export AX_AGENT_NAME="{profile.get("agent_name", "")}"')
+    _print_shell_export("AX_TOKEN", token)
+    _print_shell_export("AX_BASE_URL", profile.get("base_url", ""))
+    _print_shell_export("AX_AGENT_NAME", profile.get("agent_name", ""))
     if profile.get("agent_id"):
-        print(f'export AX_AGENT_ID="{profile["agent_id"]}"')
+        _print_shell_export("AX_AGENT_ID", profile["agent_id"])
     else:
-        print('export AX_AGENT_ID="none"')
+        _print_shell_export("AX_AGENT_ID", "none")
     if profile.get("space_id"):
-        print(f'export AX_SPACE_ID="{profile["space_id"]}"')
+        _print_shell_export("AX_SPACE_ID", profile["space_id"])

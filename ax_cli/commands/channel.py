@@ -341,7 +341,7 @@ def _sse_loop(bridge: ChannelBridge) -> None:
     while not bridge.shutdown.is_set():
         try:
             connect_time = time.monotonic()
-            with bridge.client.connect_sse() as response:
+            with bridge.client.connect_sse(space_id=bridge.space_id) as response:
                 if response.status_code != 200:
                     raise ConnectionError(f"SSE failed: {response.status_code}")
                 backoff = 1
