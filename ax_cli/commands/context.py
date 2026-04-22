@@ -110,6 +110,39 @@ def _context_file_payload(data: dict, key: str) -> dict:
     }
 
 
+def _looks_like_html(content: bytes) -> bool:
+    prefix = content[:512].lstrip().lower()
+    return prefix.startswith(b"<!doctype html") or prefix.startswith(b"<html")
+
+
+def _validate_context_file_response(payload: dict, response: httpx.Response, download_url: str) -> None:
+    expected_content_type = str(payload.get("content_type") or "").split(";", 1)[0].strip().lower()
+    if _is_text_like(payload):
+        return
+
+    headers = getattr(response, "headers", {}) or {}
+    actual_content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    content = getattr(response, "content", b"") or b""
+    suspicious_text_response = (
+        actual_content_type.startswith("text/")
+        or actual_content_type in TEXT_CONTENT_TYPES
+        or actual_content_type == "application/json"
+        or _looks_like_html(content)
+    )
+    if not suspicious_text_response:
+        return
+
+    preview = content[:160].decode("utf-8", errors="replace").strip().replace("\n", " ")
+    filename = payload.get("filename") or "context artifact"
+    expected_label = expected_content_type or "binary file"
+    actual_label = actual_content_type or "unknown content-type"
+    raise ValueError(
+        f"Expected {filename} to download as {expected_label}, but {download_url} returned "
+        f"{actual_label} instead. This usually means the upload URL resolved to an app shell "
+        f"or error page instead of file bytes. Response preview: {preview}"
+    )
+
+
 def _fetch_context_file(client, sid: str | None, payload: dict) -> bytes:
     url = payload.get("url", "")
     if not url:
@@ -123,6 +156,7 @@ def _fetch_context_file(client, sid: str | None, payload: dict) -> bytes:
         # into a 404 after the user switches spaces.
         response = http.get(download_url)
         response.raise_for_status()
+        _validate_context_file_response(payload, response, download_url)
         return response.content
 
 
