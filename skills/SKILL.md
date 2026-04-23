@@ -461,6 +461,22 @@ axctl token mint name --create --audience both  # create/mint agent PAT (user PA
 axctl handoff agent "bounded task" --loop --max-rounds 5 --completion-promise DONE
 ```
 
+## Gateway-Managed Agent Setup
+
+When the job is to create or modify a managed local runtime, treat Gateway as
+the control plane and use the companion skill
+[`gateway-agent-setup`](gateway-agent-setup/SKILL.md).
+
+That flow is for:
+- `ax gateway start`
+- `ax gateway agents add ...`
+- `ax gateway agents update ...`
+- `ax gateway agents doctor ...`
+- `ax gateway approvals ...`
+
+The browser UI is a human-readable view over the same Gateway state, but the
+setup flow itself must stay agent-operable through the CLI and local API.
+
 ## Troubleshooting
 
 | Error | Meaning | Fix |

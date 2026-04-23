@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import os
+import platform
 import queue
 import re
 import shlex
@@ -23,6 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -46,6 +48,7 @@ DEFAULT_HANDLER_TIMEOUT_SECONDS = 900
 SSE_IDLE_TIMEOUT_SECONDS = 45.0
 RUNTIME_STALE_AFTER_SECONDS = 75.0
 GATEWAY_EVENT_PREFIX = "AX_GATEWAY_EVENT "
+DEFAULT_OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 ENV_DENYLIST = {
     "AX_AGENT_ID",
     "AX_AGENT_NAME",
@@ -60,11 +63,1700 @@ ENV_DENYLIST = {
     "AX_USER_TOKEN",
 }
 _ACTIVITY_LOCK = threading.Lock()
-_GATEWAY_PROCESS_RE = re.compile(r"(?:^|\s)(?:uv\s+run\s+ax\s+gateway\s+run|.+?/ax\s+gateway\s+run)(?:\s|$)")
+_GATEWAY_PROCESS_RE = re.compile(
+    r"(?:uv\s+run\s+ax\s+gateway\s+run|(?:^|\s).+?/ax(?:ctl)?\s+gateway\s+run(?:\s|$)|-m\s+ax_cli\.main\s+gateway\s+run(?:\s|$))"
+)
+_GATEWAY_UI_PROCESS_RE = re.compile(
+    r"(?:uv\s+run\s+ax\s+gateway\s+ui|(?:^|\s).+?/ax(?:ctl)?\s+gateway\s+ui(?:\s|$)|-m\s+ax_cli\.main\s+gateway\s+ui(?:\s|$))"
+)
+
+_CONTROLLED_PLACEMENTS = {"hosted", "attached", "brokered", "mailbox"}
+_CONTROLLED_ACTIVATIONS = {"persistent", "on_demand", "attach_only", "queue_worker"}
+_CONTROLLED_LIVENESS = {"connected", "stale", "offline", "setup_error"}
+_CONTROLLED_WORK_STATES = {"idle", "queued", "working", "blocked"}
+_CONTROLLED_REPLY_MODES = {"interactive", "background", "summary_only", "silent"}
+_CONTROLLED_TELEMETRY_LEVELS = {"rich", "basic", "silent"}
+_CONTROLLED_ASSET_CLASSES = {"interactive_agent", "background_worker", "scheduled_job", "alert_listener", "service_proxy"}
+_CONTROLLED_INTAKE_MODELS = {"live_listener", "launch_on_send", "queue_accept", "queue_drain", "scheduled_run", "event_triggered", "manual_only"}
+_CONTROLLED_TRIGGER_SOURCES = {"direct_message", "queued_job", "scheduled_invocation", "external_alert", "manual_trigger", "tool_call"}
+_CONTROLLED_RETURN_PATHS = {"inline_reply", "sender_inbox", "summary_post", "task_update", "event_log", "silent"}
+_CONTROLLED_TELEMETRY_SHAPES = {"rich", "basic", "heartbeat_only", "opaque"}
+_CONTROLLED_WORKER_MODELS = {"queue_drain"}
+_CONTROLLED_ATTESTATION_STATES = {"verified", "drifted", "unknown", "blocked"}
+_CONTROLLED_APPROVAL_STATES = {"not_required", "pending", "approved", "rejected"}
+_CONTROLLED_IDENTITY_STATUSES = {"verified", "unknown_identity", "credential_mismatch", "fallback_blocked", "bootstrap_only", "blocked"}
+_CONTROLLED_SPACE_STATUSES = {"active_allowed", "active_not_allowed", "no_active_space", "unknown"}
+_CONTROLLED_ENVIRONMENT_STATUSES = {"environment_allowed", "environment_mismatch", "environment_unknown", "environment_blocked"}
+_CONTROLLED_ACTIVE_SPACE_SOURCES = {"explicit_request", "gateway_binding", "visible_default", "none"}
+_CONTROLLED_MODES = {"LIVE", "ON-DEMAND", "INBOX"}
+_CONTROLLED_PRESENCE = {"IDLE", "QUEUED", "WORKING", "BLOCKED", "STALE", "OFFLINE", "ERROR"}
+_CONTROLLED_REPLY = {"REPLY", "SUMMARY", "SILENT"}
+_CONTROLLED_CONFIDENCE = {"HIGH", "MEDIUM", "LOW", "BLOCKED"}
+_CONTROLLED_REACHABILITY = {"live_now", "queue_available", "launch_available", "attach_required", "unavailable"}
+_CONTROLLED_CONFIDENCE_REASONS = {
+    "live_now",
+    "queue_available",
+    "launch_available",
+    "attach_required",
+    "unavailable",
+    "setup_blocked",
+    "recent_test_failed",
+    "completion_degraded",
+    "approval_required",
+    "binding_drift",
+    "new_gateway",
+    "unknown_asset",
+    "asset_mismatch",
+    "approval_denied",
+    "identity_unbound",
+    "identity_mismatch",
+    "fallback_blocked",
+    "bootstrap_only",
+    "active_space_not_allowed",
+    "no_active_space",
+    "space_unknown",
+    "environment_mismatch",
+    "unknown",
+    "other",
+}
+_WORKING_STATUSES = {"accepted", "started", "processing", "thinking", "tool_call", "tool_started", "streaming", "working"}
+_BLOCKED_STATUSES = {"rate_limited"}
+
+
+def _normalized_controlled(value: object, allowed: set[str], *, fallback: str) -> str:
+    normalized = str(value or "").strip()
+    if normalized in allowed:
+        return normalized
+    lowered_map = {item.lower(): item for item in allowed}
+    lowered = normalized.lower()
+    if lowered in lowered_map:
+        return lowered_map[lowered]
+    return fallback
+
+
+def _normalized_controlled_list(value: object, allowed: set[str], *, fallback: list[str]) -> list[str]:
+    raw_items: list[str] = []
+    if isinstance(value, str):
+        parts = value.split(",") if "," in value else [value]
+        raw_items = [part.strip() for part in parts if part.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = [str(item).strip() for item in value if str(item).strip()]
+
+    lowered_map = {item.lower(): item for item in allowed}
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        candidate = item if item in allowed else lowered_map.get(item.lower())
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+    return normalized or list(fallback)
+
+
+def _normalized_optional_controlled(value: object, allowed: set[str]) -> str | None:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    if normalized in allowed:
+        return normalized
+    lowered_map = {item.lower(): item for item in allowed}
+    return lowered_map.get(normalized.lower())
+
+
+def _normalized_string_list(value: object, *, fallback: list[str]) -> list[str]:
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",") if part.strip()]
+        return items or list(fallback)
+    if isinstance(value, (list, tuple, set)):
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return items or list(fallback)
+    return list(fallback)
+
+
+def _bool_with_fallback(value: object, *, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+    return fallback
+
+
+def _override_fields(snapshot: dict[str, Any], *, domain: str) -> set[str]:
+    names: set[str] = set()
+    nested = snapshot.get("user_overrides")
+    if isinstance(nested, dict):
+        scoped = nested.get(domain)
+        if isinstance(scoped, dict):
+            names.update(str(key).strip() for key in scoped.keys() if str(key).strip())
+        elif isinstance(scoped, (list, tuple, set)):
+            names.update(str(item).strip() for item in scoped if str(item).strip())
+
+    direct_key = f"{domain}_overrides"
+    direct = snapshot.get(direct_key)
+    if isinstance(direct, dict):
+        names.update(str(key).strip() for key in direct.keys() if str(key).strip())
+    elif isinstance(direct, (list, tuple, set)):
+        names.update(str(item).strip() for item in direct if str(item).strip())
+    return names
+
+
+def _template_operator_defaults(template_id: str | None, runtime_type: object) -> dict[str, str]:
+    template_key = str(template_id or "").strip().lower()
+    runtime_key = str(runtime_type or "").strip().lower()
+    defaults_by_template = {
+        "echo_test": {
+            "placement": "hosted",
+            "activation": "persistent",
+            "reply_mode": "interactive",
+            "telemetry_level": "basic",
+        },
+        "ollama": {
+            "placement": "hosted",
+            "activation": "on_demand",
+            "reply_mode": "interactive",
+            "telemetry_level": "basic",
+        },
+        "hermes": {
+            "placement": "hosted",
+            "activation": "persistent",
+            "reply_mode": "interactive",
+            "telemetry_level": "rich",
+        },
+        "claude_code_channel": {
+            "placement": "attached",
+            "activation": "attach_only",
+            "reply_mode": "interactive",
+            "telemetry_level": "basic",
+        },
+        "inbox": {
+            "placement": "mailbox",
+            "activation": "queue_worker",
+            "reply_mode": "summary_only",
+            "telemetry_level": "basic",
+        },
+    }
+    defaults_by_runtime = {
+        "echo": {
+            "placement": "hosted",
+            "activation": "persistent",
+            "reply_mode": "interactive",
+            "telemetry_level": "basic",
+        },
+        "exec": {
+            "placement": "hosted",
+            "activation": "persistent",
+            "reply_mode": "interactive",
+            "telemetry_level": "basic",
+        },
+        "inbox": {
+            "placement": "mailbox",
+            "activation": "queue_worker",
+            "reply_mode": "summary_only",
+            "telemetry_level": "basic",
+        },
+    }
+    return dict(defaults_by_template.get(template_key) or defaults_by_runtime.get(runtime_key) or defaults_by_runtime["exec"])
+
+
+def _template_asset_defaults(template_id: str | None, runtime_type: object) -> dict[str, Any]:
+    template_key = str(template_id or "").strip().lower()
+    runtime_key = str(runtime_type or "").strip().lower()
+    defaults_by_template: dict[str, dict[str, Any]] = {
+        "echo_test": {
+            "asset_class": "interactive_agent",
+            "intake_model": "live_listener",
+            "trigger_sources": ["direct_message"],
+            "return_paths": ["inline_reply"],
+            "telemetry_shape": "basic",
+            "worker_model": None,
+            "addressable": True,
+            "messageable": True,
+            "schedulable": False,
+            "externally_triggered": False,
+            "tags": ["local", "live-listener", "test-agent"],
+            "capabilities": ["reply"],
+            "constraints": [],
+        },
+        "ollama": {
+            "asset_class": "interactive_agent",
+            "intake_model": "launch_on_send",
+            "trigger_sources": ["direct_message"],
+            "return_paths": ["inline_reply"],
+            "telemetry_shape": "basic",
+            "worker_model": None,
+            "addressable": True,
+            "messageable": True,
+            "schedulable": False,
+            "externally_triggered": False,
+            "tags": ["local", "on-demand", "cold-start"],
+            "capabilities": ["reply"],
+            "constraints": ["requires-model"],
+        },
+        "hermes": {
+            "asset_class": "interactive_agent",
+            "intake_model": "live_listener",
+            "trigger_sources": ["direct_message"],
+            "return_paths": ["inline_reply"],
+            "telemetry_shape": "rich",
+            "worker_model": None,
+            "addressable": True,
+            "messageable": True,
+            "schedulable": False,
+            "externally_triggered": False,
+            "tags": ["local", "live-listener", "hosted-by-gateway", "rich-telemetry", "repo-bound"],
+            "capabilities": ["reply", "progress", "tool_events"],
+            "constraints": ["requires-repo", "requires-provider-auth"],
+        },
+        "claude_code_channel": {
+            "asset_class": "interactive_agent",
+            "intake_model": "live_listener",
+            "trigger_sources": ["direct_message"],
+            "return_paths": ["inline_reply"],
+            "telemetry_shape": "basic",
+            "worker_model": None,
+            "addressable": True,
+            "messageable": True,
+            "schedulable": False,
+            "externally_triggered": False,
+            "tags": ["attached-session", "live-listener", "basic-telemetry"],
+            "capabilities": ["reply"],
+            "constraints": ["requires-attached-session"],
+        },
+        "inbox": {
+            "asset_class": "background_worker",
+            "intake_model": "queue_accept",
+            "trigger_sources": ["queued_job", "manual_trigger"],
+            "return_paths": ["summary_post"],
+            "telemetry_shape": "basic",
+            "worker_model": "queue_drain",
+            "addressable": True,
+            "messageable": True,
+            "schedulable": False,
+            "externally_triggered": False,
+            "tags": ["queue-backed", "summary-later"],
+            "capabilities": ["queue_work", "post_summary"],
+            "constraints": [],
+        },
+    }
+    defaults_by_runtime: dict[str, dict[str, Any]] = {
+        "echo": defaults_by_template["echo_test"],
+        "exec": {
+            "asset_class": "interactive_agent",
+            "intake_model": "live_listener",
+            "trigger_sources": ["direct_message"],
+            "return_paths": ["inline_reply"],
+            "telemetry_shape": "basic",
+            "worker_model": None,
+            "addressable": True,
+            "messageable": True,
+            "schedulable": False,
+            "externally_triggered": False,
+            "tags": ["local", "custom-bridge"],
+            "capabilities": ["reply"],
+            "constraints": [],
+        },
+        "inbox": defaults_by_template["inbox"],
+    }
+    resolved = defaults_by_template.get(template_key) or defaults_by_runtime.get(runtime_key) or defaults_by_runtime["exec"]
+    return {
+        "asset_class": resolved["asset_class"],
+        "intake_model": resolved["intake_model"],
+        "trigger_sources": list(resolved["trigger_sources"]),
+        "return_paths": list(resolved["return_paths"]),
+        "telemetry_shape": resolved["telemetry_shape"],
+        "worker_model": resolved.get("worker_model"),
+        "addressable": bool(resolved.get("addressable", True)),
+        "messageable": bool(resolved.get("messageable", True)),
+        "schedulable": bool(resolved.get("schedulable", False)),
+        "externally_triggered": bool(resolved.get("externally_triggered", False)),
+        "tags": list(resolved.get("tags", [])),
+        "capabilities": list(resolved.get("capabilities", [])),
+        "constraints": list(resolved.get("constraints", [])),
+    }
+
+
+def _asset_type_label(*, asset_class: str, intake_model: str, worker_model: str | None = None) -> str:
+    if asset_class == "interactive_agent":
+        if intake_model == "live_listener":
+            return "Live Listener"
+        if intake_model == "launch_on_send":
+            return "On-Demand Agent"
+    if asset_class == "background_worker":
+        if intake_model == "queue_accept" or worker_model == "queue_drain":
+            return "Inbox Worker"
+        return "Background Worker"
+    if asset_class == "scheduled_job":
+        return "Scheduled Job"
+    if asset_class == "alert_listener":
+        return "Alert Listener"
+    if asset_class == "service_proxy":
+        return "Service / Tool Proxy"
+    return "Connected Asset"
+
+
+def _output_label(return_paths: list[str]) -> str:
+    primary = return_paths[0] if return_paths else "inline_reply"
+    return {
+        "inline_reply": "Reply",
+        "sender_inbox": "Inbox",
+        "summary_post": "Summary",
+        "task_update": "Task",
+        "event_log": "Event Log",
+        "silent": "Silent",
+    }.get(primary, "Reply")
+
+
+def infer_asset_descriptor(snapshot: dict[str, Any], *, operator_profile: dict[str, str] | None = None) -> dict[str, Any]:
+    defaults = _template_asset_defaults(str(snapshot.get("template_id") or "").strip() or None, snapshot.get("runtime_type"))
+    overrides = _override_fields(snapshot, domain="asset")
+    telemetry_fallback = defaults["telemetry_shape"]
+    if operator_profile:
+        telemetry_fallback = {
+            "rich": "rich",
+            "basic": "basic",
+            "silent": "opaque",
+        }.get(operator_profile.get("telemetry_level", ""), telemetry_fallback)
+
+    asset_class = defaults["asset_class"]
+    if "asset_class" in overrides:
+        asset_class = _normalized_controlled(snapshot.get("asset_class"), _CONTROLLED_ASSET_CLASSES, fallback=defaults["asset_class"])
+
+    intake_model = defaults["intake_model"]
+    if "intake_model" in overrides:
+        intake_model = _normalized_controlled(snapshot.get("intake_model"), _CONTROLLED_INTAKE_MODELS, fallback=defaults["intake_model"])
+
+    worker_model = defaults.get("worker_model")
+    if "worker_model" in overrides:
+        worker_model = _normalized_optional_controlled(snapshot.get("worker_model"), _CONTROLLED_WORKER_MODELS) or defaults.get("worker_model")
+
+    trigger_sources = list(defaults["trigger_sources"])
+    if "trigger_sources" in overrides or "trigger_source" in overrides:
+        trigger_sources = _normalized_controlled_list(
+            snapshot.get("trigger_sources") if snapshot.get("trigger_sources") is not None else snapshot.get("trigger_source"),
+            _CONTROLLED_TRIGGER_SOURCES,
+            fallback=defaults["trigger_sources"],
+        )
+
+    return_paths = list(defaults["return_paths"])
+    if "return_paths" in overrides or "return_path" in overrides:
+        return_paths = _normalized_controlled_list(
+            snapshot.get("return_paths") if snapshot.get("return_paths") is not None else snapshot.get("return_path"),
+            _CONTROLLED_RETURN_PATHS,
+            fallback=defaults["return_paths"],
+        )
+
+    telemetry_shape = telemetry_fallback
+    if "telemetry_shape" in overrides:
+        telemetry_shape = _normalized_controlled(
+            snapshot.get("telemetry_shape"),
+            _CONTROLLED_TELEMETRY_SHAPES,
+            fallback=telemetry_fallback,
+        )
+
+    tags = list(defaults["tags"])
+    if "tags" in overrides:
+        tags = _normalized_string_list(snapshot.get("tags"), fallback=defaults["tags"])
+
+    capabilities = list(defaults["capabilities"])
+    if "capabilities" in overrides:
+        capabilities = _normalized_string_list(snapshot.get("capabilities"), fallback=defaults["capabilities"])
+
+    constraints = list(defaults["constraints"])
+    if "constraints" in overrides:
+        constraints = _normalized_string_list(snapshot.get("constraints"), fallback=defaults["constraints"])
+
+    descriptor = {
+        "asset_id": str(snapshot.get("asset_id") or snapshot.get("agent_id") or snapshot.get("name") or "").strip() or None,
+        "gateway_id": str(snapshot.get("gateway_id") or "").strip() or None,
+        "display_name": str(snapshot.get("display_name") or snapshot.get("name") or snapshot.get("template_label") or snapshot.get("runtime_type") or "Managed Asset"),
+        "asset_class": asset_class,
+        "intake_model": intake_model,
+        "worker_model": worker_model,
+        "trigger_sources": trigger_sources,
+        "return_paths": return_paths,
+        "telemetry_shape": telemetry_shape,
+        "addressable": _bool_with_fallback(snapshot.get("addressable"), fallback=defaults["addressable"])
+        if "addressable" in overrides
+        else defaults["addressable"],
+        "messageable": _bool_with_fallback(snapshot.get("messageable"), fallback=defaults["messageable"])
+        if "messageable" in overrides
+        else defaults["messageable"],
+        "schedulable": _bool_with_fallback(snapshot.get("schedulable"), fallback=defaults["schedulable"])
+        if "schedulable" in overrides
+        else defaults["schedulable"],
+        "externally_triggered": _bool_with_fallback(snapshot.get("externally_triggered"), fallback=defaults["externally_triggered"])
+        if "externally_triggered" in overrides
+        else defaults["externally_triggered"],
+        "tags": tags,
+        "capabilities": capabilities,
+        "constraints": constraints,
+    }
+    descriptor["type_label"] = _asset_type_label(
+        asset_class=descriptor["asset_class"],
+        intake_model=descriptor["intake_model"],
+        worker_model=descriptor.get("worker_model"),
+    )
+    descriptor["output_label"] = _output_label(descriptor["return_paths"])
+    descriptor["primary_trigger_source"] = descriptor["trigger_sources"][0] if descriptor["trigger_sources"] else None
+    descriptor["primary_return_path"] = descriptor["return_paths"][0] if descriptor["return_paths"] else None
+    return descriptor
+
+
+def _hermes_repo_candidates(entry: dict[str, Any] | None = None) -> list[Path]:
+    entry = entry or {}
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def add(path_value: object) -> None:
+        raw = str(path_value or "").strip()
+        if not raw:
+            return
+        expanded = Path(raw).expanduser()
+        key = str(expanded)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(expanded)
+
+    add(entry.get("hermes_repo_path"))
+    add(os.environ.get("HERMES_REPO_PATH"))
+
+    workdir_raw = str(entry.get("workdir") or "").strip()
+    if workdir_raw:
+        workdir = Path(workdir_raw).expanduser()
+        add(workdir.parent / "hermes-agent")
+
+    add(Path.home() / "hermes-agent")
+    return candidates
+
+
+def hermes_setup_status(entry: dict[str, Any]) -> dict[str, Any]:
+    template_id = str(entry.get("template_id") or "").strip().lower()
+    if template_id != "hermes":
+        return {"ready": True, "template_id": template_id}
+
+    candidates = _hermes_repo_candidates(entry)
+    resolved = next((candidate for candidate in candidates if candidate.exists()), None)
+    if resolved is not None:
+        return {
+            "ready": True,
+            "template_id": template_id,
+            "resolved_path": str(resolved),
+            "summary": f"Hermes checkout found at {resolved}.",
+        }
+
+    expected = candidates[0] if candidates else (Path.home() / "hermes-agent")
+    return {
+        "ready": False,
+        "template_id": template_id,
+        "resolved_path": None,
+        "expected_path": str(expected),
+        "summary": f"Hermes checkout not found at {expected}.",
+        "detail": (
+            f"Hermes checkout not found at {expected}. "
+            "Set HERMES_REPO_PATH or clone hermes-agent to ~/hermes-agent."
+        ),
+    }
+
+
+def _ollama_model_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return rows
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or "").strip()
+        if not name:
+            continue
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        families = details.get("families") if isinstance(details.get("families"), list) else []
+        family_values = [str(value).strip() for value in families if str(value).strip()]
+        remote_host = str(item.get("remote_host") or "").strip() or None
+        lowered_name = name.lower()
+        is_embedding = "embed" in lowered_name or any("bert" in family.lower() for family in family_values)
+        rows.append(
+            {
+                "name": name,
+                "family": str(details.get("family") or "").strip() or None,
+                "families": family_values,
+                "parameter_size": str(details.get("parameter_size") or "").strip() or None,
+                "modified_at": str(item.get("modified_at") or "").strip() or None,
+                "remote_host": remote_host,
+                "is_cloud": bool(remote_host or lowered_name.endswith(":cloud") or lowered_name.endswith("-cloud")),
+                "is_embedding": is_embedding,
+            }
+        )
+    return rows
+
+
+def _recommended_ollama_model(rows: list[dict[str, Any]]) -> str | None:
+    if not rows:
+        return None
+
+    def pick(candidates: list[dict[str, Any]]) -> str | None:
+        if not candidates:
+            return None
+        ordered = sorted(
+            candidates,
+            key=lambda item: (
+                str(item.get("modified_at") or ""),
+                str(item.get("parameter_size") or ""),
+                str(item.get("name") or ""),
+            ),
+            reverse=True,
+        )
+        return str(ordered[0].get("name") or "").strip() or None
+
+    local_rows = [item for item in rows if not bool(item.get("is_cloud"))]
+    local_chat_rows = [item for item in local_rows if not bool(item.get("is_embedding"))]
+    chat_rows = [item for item in rows if not bool(item.get("is_embedding"))]
+    return pick(local_chat_rows) or pick(local_rows) or pick(chat_rows) or pick(rows)
+
+
+def ollama_setup_status(*, preferred_model: str | None = None) -> dict[str, Any]:
+    base_url = DEFAULT_OLLAMA_BASE_URL
+    endpoint = f"{base_url}/api/tags"
+    preferred = str(preferred_model or "").strip() or None
+    try:
+        response = httpx.get(endpoint, timeout=3.0)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Ollama returned a non-object response.")
+    except Exception as exc:
+        return {
+            "ready": False,
+            "server_reachable": False,
+            "base_url": base_url,
+            "endpoint": endpoint,
+            "preferred_model": preferred,
+            "preferred_model_available": False,
+            "recommended_model": None,
+            "available_models": [],
+            "local_models": [],
+            "models": [],
+            "summary": f"Ollama server not reachable at {base_url}.",
+            "detail": str(exc),
+        }
+
+    rows = _ollama_model_rows(payload)
+    available_models = [str(item.get("name") or "") for item in rows if str(item.get("name") or "").strip()]
+    local_models = [str(item.get("name") or "") for item in rows if not bool(item.get("is_cloud"))]
+    preferred_available = bool(preferred and preferred in available_models)
+    recommended_model = preferred if preferred_available else _recommended_ollama_model(rows)
+    ready = bool(available_models)
+    if preferred and not preferred_available:
+        summary = f"Ollama is reachable, but {preferred} is not installed locally."
+    elif recommended_model:
+        summary = f"Ollama is reachable. Recommended model: {recommended_model}."
+    elif available_models:
+        summary = f"Ollama is reachable with {len(available_models)} model(s) available."
+    else:
+        summary = "Ollama is reachable, but no models are installed yet."
+    return {
+        "ready": ready,
+        "server_reachable": True,
+        "base_url": base_url,
+        "endpoint": endpoint,
+        "preferred_model": preferred,
+        "preferred_model_available": preferred_available,
+        "recommended_model": recommended_model,
+        "available_models": available_models,
+        "local_models": local_models,
+        "models": rows,
+        "summary": summary,
+        "detail": None,
+    }
+
+
+def infer_operator_profile(snapshot: dict[str, Any]) -> dict[str, str]:
+    defaults = _template_operator_defaults(str(snapshot.get("template_id") or "").strip() or None, snapshot.get("runtime_type"))
+    overrides = _override_fields(snapshot, domain="operator")
+    return {
+        "placement": _normalized_controlled(snapshot.get("placement"), _CONTROLLED_PLACEMENTS, fallback=defaults["placement"])
+        if "placement" in overrides
+        else defaults["placement"],
+        "activation": _normalized_controlled(snapshot.get("activation"), _CONTROLLED_ACTIVATIONS, fallback=defaults["activation"])
+        if "activation" in overrides
+        else defaults["activation"],
+        "reply_mode": _normalized_controlled(snapshot.get("reply_mode"), _CONTROLLED_REPLY_MODES, fallback=defaults["reply_mode"])
+        if "reply_mode" in overrides
+        else defaults["reply_mode"],
+        "telemetry_level": _normalized_controlled(
+            snapshot.get("telemetry_level"),
+            _CONTROLLED_TELEMETRY_LEVELS,
+            fallback=defaults["telemetry_level"],
+        )
+        if "telemetry_level" in overrides
+        else defaults["telemetry_level"],
+    }
+
+
+def _looks_like_setup_error(snapshot: dict[str, Any], raw_state: str) -> bool:
+    if raw_state == "error":
+        return True
+    last_error = str(snapshot.get("last_error") or "").lower()
+    preview = str(snapshot.get("last_reply_preview") or "").lower()
+    if "repo not found" in last_error or "repo not found" in preview:
+        return True
+    if preview.startswith("(stderr:") or last_error.startswith("stderr:"):
+        return True
+    return False
+
+
+def _derive_liveness(snapshot: dict[str, Any], *, raw_state: str, last_seen_age: int | None) -> tuple[str, bool]:
+    if _looks_like_setup_error(snapshot, raw_state):
+        return "setup_error", False
+    if raw_state == "running":
+        if last_seen_age is None or last_seen_age > RUNTIME_STALE_AFTER_SECONDS:
+            return "stale", False
+        return "connected", True
+    if raw_state in {"starting", "reconnecting", "stale"}:
+        return "stale", False
+    return "offline", False
+
+
+def _derive_work_state(snapshot: dict[str, Any], *, liveness: str) -> str:
+    attestation_state = _normalized_optional_controlled(snapshot.get("attestation_state"), _CONTROLLED_ATTESTATION_STATES)
+    approval_state = _normalized_optional_controlled(snapshot.get("approval_state"), _CONTROLLED_APPROVAL_STATES)
+    identity_status = _normalized_optional_controlled(snapshot.get("identity_status"), _CONTROLLED_IDENTITY_STATUSES)
+    environment_status = _normalized_optional_controlled(snapshot.get("environment_status"), _CONTROLLED_ENVIRONMENT_STATUSES)
+    space_status = _normalized_optional_controlled(snapshot.get("space_status"), _CONTROLLED_SPACE_STATUSES)
+    if liveness == "setup_error":
+        return "blocked"
+    if attestation_state in {"drifted", "unknown", "blocked"} or approval_state in {"pending", "rejected"}:
+        return "blocked"
+    if identity_status in {"unknown_identity", "credential_mismatch", "fallback_blocked", "bootstrap_only", "blocked"}:
+        return "blocked"
+    if environment_status in {"environment_mismatch", "environment_blocked"}:
+        return "blocked"
+    if space_status in {"active_not_allowed", "no_active_space"}:
+        return "blocked"
+    status = str(snapshot.get("current_status") or "").strip().lower()
+    backlog_depth = int(snapshot.get("backlog_depth") or 0)
+    if status in _WORKING_STATUSES:
+        return "working"
+    if status == "queued" or backlog_depth > 0:
+        return "queued"
+    if status in _BLOCKED_STATUSES:
+        return "blocked"
+    return "idle"
+
+
+def _doctor_has_failed(snapshot: dict[str, Any]) -> bool:
+    result = snapshot.get("last_doctor_result")
+    if not isinstance(result, dict):
+        return False
+    status = str(result.get("status") or "").strip().lower()
+    if status in {"failed", "error"}:
+        return True
+    checks = result.get("checks")
+    if isinstance(checks, list):
+        return any(isinstance(item, dict) and str(item.get("status") or "").strip().lower() == "failed" for item in checks)
+    return False
+
+
+def _derive_mode(profile: dict[str, str]) -> str:
+    if profile["placement"] == "mailbox":
+        return "INBOX"
+    if profile["activation"] in {"persistent", "attach_only"}:
+        return "LIVE"
+    return "ON-DEMAND"
+
+
+def _derive_presence(*, mode: str, liveness: str, work_state: str) -> str:
+    if liveness == "setup_error":
+        return "ERROR"
+    if work_state == "blocked":
+        return "BLOCKED"
+    if liveness == "stale":
+        return "STALE"
+    if liveness == "offline" and mode == "LIVE":
+        return "OFFLINE"
+    if work_state == "working":
+        return "WORKING"
+    if work_state == "queued":
+        return "QUEUED"
+    return "IDLE"
+
+
+def _derive_reply(reply_mode: str) -> str:
+    if reply_mode == "interactive":
+        return "REPLY"
+    if reply_mode == "silent":
+        return "SILENT"
+    return "SUMMARY"
+
+
+def _derive_reachability(*, snapshot: dict[str, Any], mode: str, liveness: str, activation: str) -> str:
+    attestation_state = _normalized_optional_controlled(snapshot.get("attestation_state"), _CONTROLLED_ATTESTATION_STATES)
+    approval_state = _normalized_optional_controlled(snapshot.get("approval_state"), _CONTROLLED_APPROVAL_STATES)
+    identity_status = _normalized_optional_controlled(snapshot.get("identity_status"), _CONTROLLED_IDENTITY_STATUSES)
+    environment_status = _normalized_optional_controlled(snapshot.get("environment_status"), _CONTROLLED_ENVIRONMENT_STATUSES)
+    space_status = _normalized_optional_controlled(snapshot.get("space_status"), _CONTROLLED_SPACE_STATUSES)
+    if liveness == "setup_error":
+        return "unavailable"
+    if attestation_state in {"drifted", "unknown", "blocked"} or approval_state in {"pending", "rejected"}:
+        return "unavailable"
+    if identity_status in {"unknown_identity", "credential_mismatch", "fallback_blocked", "bootstrap_only", "blocked"}:
+        return "unavailable"
+    if environment_status in {"environment_mismatch", "environment_blocked"}:
+        return "unavailable"
+    if space_status in {"active_not_allowed", "no_active_space"}:
+        return "unavailable"
+    if mode == "INBOX":
+        return "queue_available"
+    if activation == "attach_only" and liveness in {"stale", "offline"}:
+        return "attach_required"
+    if mode == "LIVE" and liveness == "connected":
+        return "live_now"
+    if mode == "ON-DEMAND" and liveness != "setup_error":
+        return "launch_available"
+    return "unavailable"
+
+
+def _setup_error_detail(snapshot: dict[str, Any]) -> str:
+    if _doctor_has_failed(snapshot):
+        summary = _doctor_summary(snapshot)
+        if summary:
+            return summary
+    return str(snapshot.get("last_error") or snapshot.get("last_reply_preview") or "Setup must be fixed before Gateway can send work.")
+
+
+def _doctor_summary(snapshot: dict[str, Any]) -> str:
+    result = snapshot.get("last_doctor_result")
+    if not isinstance(result, dict):
+        return ""
+    summary = str(result.get("summary") or "").strip()
+    if summary:
+        return summary
+    checks = result.get("checks")
+    if isinstance(checks, list):
+        failed = [str(item.get("name") or "").strip() for item in checks if isinstance(item, dict) and str(item.get("status") or "").strip().lower() == "failed"]
+        if failed:
+            return f"Doctor failed: {', '.join(filter(None, failed))}."
+    return ""
+
+
+def _derive_confidence(
+    snapshot: dict[str, Any],
+    *,
+    mode: str,
+    liveness: str,
+    reachability: str,
+) -> tuple[str, str, str]:
+    attestation_state = _normalized_optional_controlled(snapshot.get("attestation_state"), _CONTROLLED_ATTESTATION_STATES)
+    approval_state = _normalized_optional_controlled(snapshot.get("approval_state"), _CONTROLLED_APPROVAL_STATES)
+    governance_reason = _normalized_optional_controlled(snapshot.get("confidence_reason"), _CONTROLLED_CONFIDENCE_REASONS)
+    governance_detail = str(snapshot.get("confidence_detail") or "").strip() or "Gateway blocked this runtime until its binding is approved."
+    identity_status = _normalized_optional_controlled(snapshot.get("identity_status"), _CONTROLLED_IDENTITY_STATUSES)
+    environment_status = _normalized_optional_controlled(snapshot.get("environment_status"), _CONTROLLED_ENVIRONMENT_STATUSES)
+    space_status = _normalized_optional_controlled(snapshot.get("space_status"), _CONTROLLED_SPACE_STATUSES)
+    if liveness == "setup_error":
+        return ("BLOCKED", "setup_blocked", _setup_error_detail(snapshot))
+    if identity_status == "unknown_identity":
+        return ("BLOCKED", "identity_unbound", "Gateway does not have a bound acting identity for this asset in the requested environment.")
+    if identity_status in {"credential_mismatch", "fallback_blocked"}:
+        return ("BLOCKED", "identity_mismatch", "Gateway blocked a mismatched acting identity instead of borrowing another identity.")
+    if identity_status == "bootstrap_only":
+        return ("BLOCKED", "bootstrap_only", "Gateway bootstrap credentials can only be used for setup, verification, or repair flows.")
+    if environment_status == "environment_mismatch":
+        return ("BLOCKED", "environment_mismatch", "Requested environment does not match the bound Gateway environment for this asset.")
+    if environment_status == "environment_blocked":
+        return ("BLOCKED", "environment_mismatch", "Gateway blocked this asset in the requested environment.")
+    if space_status == "active_not_allowed":
+        return ("BLOCKED", "active_space_not_allowed", "The resolved target space is not allowed for this acting identity.")
+    if space_status == "no_active_space":
+        return ("BLOCKED", "no_active_space", "Gateway does not have an active space selected for this asset.")
+    if space_status == "unknown":
+        return ("LOW", "space_unknown", "Gateway could not verify the allowed-space list for this acting identity.")
+    if approval_state == "rejected":
+        return ("BLOCKED", governance_reason or "approval_denied", governance_detail)
+    if attestation_state in {"blocked", "unknown", "drifted"} or approval_state == "pending":
+        return ("BLOCKED", governance_reason or "approval_required", governance_detail)
+    if _doctor_has_failed(snapshot):
+        detail = _doctor_summary(snapshot) or "Gateway Doctor reported a failed send path."
+        return ("LOW", "recent_test_failed", detail)
+    completion_rate = snapshot.get("completion_rate")
+    try:
+        if completion_rate is not None and float(completion_rate) < 0.5:
+            return ("LOW", "completion_degraded", "Recent completion rate is below the healthy threshold.")
+    except (TypeError, ValueError):
+        pass
+    if mode == "INBOX":
+        return ("HIGH", "queue_available", "Gateway can safely accept and queue work now.")
+    if mode == "ON-DEMAND" and reachability == "launch_available":
+        return ("MEDIUM", "launch_available", "Gateway can launch this runtime on send. Cold start possible.")
+    if liveness in {"offline", "stale"}:
+        if reachability == "attach_required":
+            return ("LOW", "attach_required", "Reconnect the attached session before sending.")
+        return ("LOW", "unavailable", "Gateway does not currently have a healthy live path.")
+    if liveness == "connected":
+        return ("HIGH", "live_now", "A live runtime is attached and ready to claim work.")
+    return ("MEDIUM", "unknown", "Gateway has partial health signals but no stronger confidence signal yet.")
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _gateway_id_from_registry(registry: dict[str, Any]) -> str:
+    gateway = registry.setdefault("gateway", {})
+    gateway_id = str(gateway.get("gateway_id") or "").strip()
+    if gateway_id:
+        return gateway_id
+    gateway_id = str(uuid.uuid4())
+    gateway["gateway_id"] = gateway_id
+    return gateway_id
+
+
+def _asset_id_for_entry(entry: dict[str, Any]) -> str:
+    return str(entry.get("agent_id") or entry.get("asset_id") or entry.get("name") or "").strip()
+
+
+def _binding_type_for_entry(entry: dict[str, Any]) -> str:
+    activation = str(entry.get("activation") or "").strip()
+    if activation == "attach_only":
+        return "attached_session"
+    if activation == "queue_worker" or str(entry.get("runtime_type") or "").strip().lower() == "inbox":
+        return "queue_worker"
+    return "local_runtime"
+
+
+def _launch_spec_for_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "runtime_type": str(entry.get("runtime_type") or "").strip() or None,
+        "template_id": str(entry.get("template_id") or "").strip() or None,
+        "command": str(entry.get("exec_command") or "").strip() or None,
+        "workdir": str(entry.get("workdir") or "").strip() or None,
+        "ollama_model": str(entry.get("ollama_model") or "").strip() or None,
+        "transport": str(entry.get("transport") or "").strip() or None,
+    }
+
+
+def _payload_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _host_fingerprint() -> str:
+    host = platform.node() or "unknown-host"
+    return f"host:{hashlib.sha256(host.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _normalized_base_url(value: object) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _environment_label_for_base_url(base_url: object) -> str:
+    normalized = _normalized_base_url(base_url)
+    if not normalized:
+        return "unknown"
+    parsed = urlparse(normalized if "://" in normalized else f"https://{normalized}")
+    host = str(parsed.netloc or parsed.path or "").lower()
+    if host == "paxai.app":
+        return "prod"
+    if host == "dev.paxai.app":
+        return "dev"
+    if host in {"localhost", "127.0.0.1"} or host.startswith("localhost:") or host.startswith("127.0.0.1:"):
+        return "local"
+    return host or "custom"
+
+
+def _redacted_path(value: object) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        path = Path(raw).expanduser().resolve()
+        home = Path.home().resolve()
+        try:
+            rel = path.relative_to(home)
+            return str(Path("~") / rel)
+        except ValueError:
+            return str(path)
+    except Exception:
+        return raw
+
+
+def _space_cache_rows(value: object) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    items = value if isinstance(value, list) else []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        space_id = str(item.get("space_id") or item.get("id") or "").strip()
+        if not space_id or space_id in seen:
+            continue
+        seen.add(space_id)
+        rows.append(
+            {
+                "space_id": space_id,
+                "name": str(item.get("name") or item.get("space_name") or space_id),
+                "is_default": bool(item.get("is_default", False)),
+            }
+        )
+    return rows
+
+
+def _space_name_from_cache(allowed_spaces: list[dict[str, Any]], space_id: str | None) -> str | None:
+    if not space_id:
+        return None
+    for item in allowed_spaces:
+        if str(item.get("space_id") or "") == str(space_id):
+            return str(item.get("name") or space_id)
+    return None
+
+
+def _fallback_allowed_spaces(entry: dict[str, Any], session: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    session = session or {}
+    default_id = str(entry.get("default_space_id") or entry.get("space_id") or session.get("space_id") or "").strip()
+    active_id = str(entry.get("active_space_id") or entry.get("space_id") or default_id).strip()
+    rows: list[dict[str, Any]] = []
+    if default_id:
+        rows.append(
+            {
+                "space_id": default_id,
+                "name": str(entry.get("default_space_name") or entry.get("space_name") or session.get("space_name") or default_id),
+                "is_default": True,
+            }
+        )
+    if active_id and active_id != default_id:
+        rows.append(
+            {
+                "space_id": active_id,
+                "name": str(entry.get("active_space_name") or entry.get("space_name") or active_id),
+                "is_default": False,
+            }
+        )
+    return _space_cache_rows(rows)
+
+
+def _space_id_allowed(allowed_spaces: list[dict[str, Any]], space_id: str | None) -> bool:
+    if not space_id:
+        return False
+    return any(str(item.get("space_id") or "") == str(space_id) for item in allowed_spaces)
+
+
+def _binding_candidate_for_entry(entry: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+    asset_id = _asset_id_for_entry(entry)
+    install_id = str(entry.get("install_id") or "").strip() or str(uuid.uuid4())
+    launch_spec = _launch_spec_for_entry(entry)
+    workdir = str(entry.get("workdir") or "").strip() or None
+    path = str(Path(workdir).expanduser()) if workdir else None
+    candidate = {
+        "asset_id": asset_id,
+        "gateway_id": _gateway_id_from_registry(registry),
+        "install_id": install_id,
+        "binding_type": _binding_type_for_entry(entry),
+        "path": path,
+        "launch_spec": launch_spec,
+        "launch_spec_hash": _payload_hash(launch_spec),
+        "created_from": str(entry.get("created_from") or ("ax_template" if entry.get("template_id") else "custom_bridge")),
+        "created_via": str(entry.get("created_via") or "cli"),
+        "approved_state": str(entry.get("approved_state") or "approved"),
+        "first_seen_at": str(entry.get("first_seen_at") or _now_iso()),
+        "last_verified_at": str(entry.get("last_verified_at") or _now_iso()),
+    }
+    candidate["candidate_signature"] = _payload_hash(
+        {
+            "asset_id": candidate["asset_id"],
+            "gateway_id": candidate["gateway_id"],
+            "install_id": candidate["install_id"],
+            "path": candidate["path"],
+            "launch_spec_hash": candidate["launch_spec_hash"],
+        }
+    )
+    return candidate
+
+
+def _ensure_registry_lists(registry: dict[str, Any]) -> None:
+    registry.setdefault("bindings", [])
+    registry.setdefault("identity_bindings", [])
+    registry.setdefault("approvals", [])
+
+
+def find_binding(
+    registry: dict[str, Any],
+    *,
+    asset_id: str | None = None,
+    install_id: str | None = None,
+    gateway_id: str | None = None,
+) -> dict[str, Any] | None:
+    _ensure_registry_lists(registry)
+    for binding in registry.get("bindings", []):
+        if asset_id and str(binding.get("asset_id") or "") != asset_id:
+            continue
+        if install_id and str(binding.get("install_id") or "") != install_id:
+            continue
+        if gateway_id and str(binding.get("gateway_id") or "") != gateway_id:
+            continue
+        return binding
+    return None
+
+
+def _bindings_for_asset(registry: dict[str, Any], asset_id: str) -> list[dict[str, Any]]:
+    _ensure_registry_lists(registry)
+    return [binding for binding in registry.get("bindings", []) if str(binding.get("asset_id") or "") == asset_id]
+
+
+def upsert_binding(registry: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any]:
+    _ensure_registry_lists(registry)
+    bindings = registry["bindings"]
+    target_install_id = str(binding.get("install_id") or "")
+    for idx, existing in enumerate(bindings):
+        if str(existing.get("install_id") or "") == target_install_id and target_install_id:
+            merged = dict(existing)
+            merged.update(binding)
+            bindings[idx] = merged
+            return merged
+    bindings.append(binding)
+    return binding
+
+
+def find_identity_binding(
+    registry: dict[str, Any],
+    *,
+    identity_binding_id: str | None = None,
+    install_id: str | None = None,
+    asset_id: str | None = None,
+    gateway_id: str | None = None,
+    base_url: str | None = None,
+) -> dict[str, Any] | None:
+    _ensure_registry_lists(registry)
+    normalized_base_url = _normalized_base_url(base_url)
+    for binding in registry.get("identity_bindings", []):
+        if identity_binding_id and str(binding.get("identity_binding_id") or "") != identity_binding_id:
+            continue
+        if install_id and str(binding.get("install_id") or "") != install_id:
+            continue
+        if asset_id and str(binding.get("asset_id") or "") != asset_id:
+            continue
+        if gateway_id and str(binding.get("gateway_id") or "") != gateway_id:
+            continue
+        if normalized_base_url and _normalized_base_url(((binding.get("environment") or {}) if isinstance(binding.get("environment"), dict) else {}).get("base_url")) != normalized_base_url:
+            continue
+        return binding
+    return None
+
+
+def _identity_bindings_for_asset(registry: dict[str, Any], asset_id: str, *, gateway_id: str | None = None) -> list[dict[str, Any]]:
+    _ensure_registry_lists(registry)
+    rows = [binding for binding in registry.get("identity_bindings", []) if str(binding.get("asset_id") or "") == asset_id]
+    if gateway_id:
+        rows = [binding for binding in rows if str(binding.get("gateway_id") or "") == gateway_id]
+    return rows
+
+
+def upsert_identity_binding(registry: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any]:
+    _ensure_registry_lists(registry)
+    bindings = registry["identity_bindings"]
+    target_id = str(binding.get("identity_binding_id") or "")
+    target_install_id = str(binding.get("install_id") or "")
+    target_base_url = _normalized_base_url(((binding.get("environment") or {}) if isinstance(binding.get("environment"), dict) else {}).get("base_url"))
+    for idx, existing in enumerate(bindings):
+        existing_base_url = _normalized_base_url(((existing.get("environment") or {}) if isinstance(existing.get("environment"), dict) else {}).get("base_url"))
+        if target_id and str(existing.get("identity_binding_id") or "") == target_id:
+            merged = dict(existing)
+            merged.update(binding)
+            bindings[idx] = merged
+            return merged
+        if target_install_id and str(existing.get("install_id") or "") == target_install_id and existing_base_url == target_base_url:
+            merged = dict(existing)
+            merged.update(binding)
+            bindings[idx] = merged
+            return merged
+    bindings.append(binding)
+    return binding
+
+
+def _normalize_allowed_spaces_payload(payload: object) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        if isinstance(payload.get("spaces"), list):
+            return _space_cache_rows(payload.get("spaces"))
+        if isinstance(payload.get("items"), list):
+            return _space_cache_rows(payload.get("items"))
+        if isinstance(payload.get("results"), list):
+            return _space_cache_rows(payload.get("results"))
+    return _space_cache_rows(payload)
+
+
+def _fetch_allowed_spaces_for_entry(entry: dict[str, Any]) -> list[dict[str, Any]] | None:
+    token_file = Path(str(entry.get("token_file") or "")).expanduser()
+    base_url = _normalized_base_url(entry.get("base_url"))
+    if not token_file.exists() or not base_url:
+        return None
+    token = token_file.read_text().strip()
+    if not token:
+        return None
+    client = AxClient(
+        base_url=base_url,
+        token=token,
+        agent_name=str(entry.get("name") or "") or None,
+        agent_id=str(entry.get("agent_id") or "") or None,
+    )
+    try:
+        return _normalize_allowed_spaces_payload(client.list_spaces())
+    except Exception:
+        return None
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def ensure_gateway_identity_binding(
+    registry: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    session: dict[str, Any] | None = None,
+    created_via: str | None = None,
+    verify_spaces: bool = False,
+) -> dict[str, Any]:
+    _ensure_registry_lists(registry)
+    gateway_id = _gateway_id_from_registry(registry)
+    asset_id = _asset_id_for_entry(entry)
+    install_id = str(entry.get("install_id") or "").strip()
+    if not install_id:
+        install_id = str(uuid.uuid4())
+        entry["install_id"] = install_id
+    base_url = _normalized_base_url(entry.get("base_url") or (session or {}).get("base_url"))
+    existing = find_identity_binding(
+        registry,
+        identity_binding_id=str(entry.get("identity_binding_id") or "").strip() or None,
+        install_id=install_id,
+        base_url=base_url or None,
+    )
+    allowed_spaces = _space_cache_rows(entry.get("allowed_spaces"))
+    if not allowed_spaces and existing:
+        allowed_spaces = _space_cache_rows(existing.get("allowed_spaces_cache"))
+    if verify_spaces:
+        fetched = _fetch_allowed_spaces_for_entry(entry)
+        if fetched:
+            allowed_spaces = fetched
+    if not allowed_spaces:
+        allowed_spaces = _fallback_allowed_spaces(entry, session=session)
+    default_space_id = str(
+        entry.get("default_space_id")
+        or ((existing or {}).get("default_space_id") if isinstance(existing, dict) else "")
+        or next((item.get("space_id") for item in allowed_spaces if bool(item.get("is_default"))), None)
+        or entry.get("space_id")
+        or (session or {}).get("space_id")
+        or ""
+    ).strip() or None
+    active_space_id = str(
+        entry.get("active_space_id")
+        or ((existing or {}).get("active_space_id") if isinstance(existing, dict) else "")
+        or entry.get("space_id")
+        or default_space_id
+        or ""
+    ).strip() or None
+    default_space_name = _space_name_from_cache(allowed_spaces, default_space_id) or str(entry.get("default_space_name") or entry.get("space_name") or default_space_id or "")
+    active_space_name = _space_name_from_cache(allowed_spaces, active_space_id) or str(entry.get("active_space_name") or entry.get("space_name") or active_space_id or "")
+    binding = {
+        "identity_binding_id": str((existing or {}).get("identity_binding_id") or f"idbind_{str(uuid.uuid4())}"),
+        "asset_id": asset_id,
+        "gateway_id": gateway_id,
+        "install_id": install_id,
+        "environment": {
+            "base_url": base_url or None,
+            "label": _environment_label_for_base_url(base_url),
+            "host": urlparse(base_url).netloc if base_url else None,
+        },
+        "acting_identity": (
+            dict(existing.get("acting_identity") or {})
+            if isinstance(existing, dict) and isinstance(existing.get("acting_identity"), dict)
+            else {
+                "agent_id": str(entry.get("agent_id") or asset_id or "") or None,
+                "agent_name": str(entry.get("name") or "") or None,
+                "principal_type": "agent",
+            }
+        ),
+        "credential_ref": {
+            "kind": "token_file" if str(entry.get("token_file") or "").strip() else "unknown",
+            "id": str((existing or {}).get("credential_ref", {}).get("id") if isinstance((existing or {}).get("credential_ref"), dict) else "") or f"cred_{str(entry.get('name') or asset_id or 'asset')}_{_environment_label_for_base_url(base_url)}",
+            "display": "Gateway-managed agent token" if str(entry.get("credential_source") or "gateway") == "gateway" else "Non-gateway credential",
+            "path_redacted": _redacted_path(entry.get("token_file")),
+        },
+        "active_space_id": active_space_id,
+        "active_space_name": active_space_name or None,
+        "default_space_id": default_space_id,
+        "default_space_name": default_space_name or None,
+        "allowed_spaces_cache": allowed_spaces,
+        "binding_state": "verified" if base_url and str(entry.get("agent_id") or "") else "unbound",
+        "created_via": str(created_via or entry.get("created_via") or "gateway_setup"),
+        "last_verified_at": _now_iso(),
+    }
+    stored = upsert_identity_binding(registry, binding)
+    entry["identity_binding_id"] = stored["identity_binding_id"]
+    entry["default_space_id"] = stored.get("default_space_id")
+    entry["default_space_name"] = stored.get("default_space_name")
+    if stored.get("active_space_id"):
+        entry["active_space_id"] = stored.get("active_space_id")
+    if stored.get("active_space_name"):
+        entry["active_space_name"] = stored.get("active_space_name")
+    return stored
+
+
+def evaluate_identity_space_binding(
+    registry: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    explicit_space_id: str | None = None,
+    requested_base_url: str | None = None,
+) -> dict[str, Any]:
+    _ensure_registry_lists(registry)
+    gateway_id = _gateway_id_from_registry(registry)
+    asset_id = _asset_id_for_entry(entry)
+    install_id = str(entry.get("install_id") or "").strip() or None
+    requested_url = _normalized_base_url(requested_base_url or entry.get("base_url"))
+    binding = find_identity_binding(
+        registry,
+        identity_binding_id=str(entry.get("identity_binding_id") or "").strip() or None,
+        install_id=install_id,
+        base_url=requested_url or None,
+    )
+    asset_bindings = _identity_bindings_for_asset(registry, asset_id, gateway_id=gateway_id) if asset_id else []
+    fallback_binding = asset_bindings[0] if asset_bindings else None
+    acting_identity = (
+        (binding.get("acting_identity") if isinstance(binding, dict) and isinstance(binding.get("acting_identity"), dict) else None)
+        or (fallback_binding.get("acting_identity") if isinstance(fallback_binding, dict) and isinstance(fallback_binding.get("acting_identity"), dict) else None)
+        or {}
+    )
+    bound_base_url = _normalized_base_url(((binding.get("environment") or {}) if isinstance(binding, dict) and isinstance(binding.get("environment"), dict) else {}).get("base_url"))
+    environment_status = "environment_unknown"
+    if binding:
+        environment_status = "environment_allowed"
+        if requested_url and bound_base_url and requested_url != bound_base_url:
+            environment_status = "environment_mismatch"
+    elif requested_url and asset_bindings:
+        environment_status = "environment_mismatch"
+
+    identity_status = "verified"
+    if not binding:
+        identity_status = "verified" if asset_bindings else "unknown_identity"
+    elif str(entry.get("credential_source") or "gateway").strip().lower() not in {"gateway", ""}:
+        identity_status = "bootstrap_only"
+    elif not str(entry.get("token_file") or "").strip():
+        identity_status = "bootstrap_only"
+    else:
+        bound_agent_id = str(acting_identity.get("agent_id") or "").strip()
+        bound_agent_name = str(acting_identity.get("agent_name") or "").strip().lower()
+        entry_agent_id = str(entry.get("agent_id") or "").strip()
+        entry_agent_name = str(entry.get("name") or "").strip().lower()
+        if bound_agent_id and entry_agent_id and bound_agent_id != entry_agent_id:
+            identity_status = "credential_mismatch"
+        elif bound_agent_name and entry_agent_name and bound_agent_name != entry_agent_name:
+            identity_status = "fallback_blocked"
+
+    allowed_spaces = _space_cache_rows((binding or {}).get("allowed_spaces_cache"))
+    if not allowed_spaces and binding:
+        allowed_spaces = _fallback_allowed_spaces(entry)
+    active_space_source = "none"
+    active_space_id = str(explicit_space_id or "").strip() or None
+    if active_space_id:
+        active_space_source = "explicit_request"
+    elif binding and str(binding.get("active_space_id") or "").strip():
+        active_space_id = str(binding.get("active_space_id") or "").strip()
+        active_space_source = "gateway_binding"
+    elif binding and str(binding.get("default_space_id") or "").strip():
+        active_space_id = str(binding.get("default_space_id") or "").strip()
+        active_space_source = "visible_default"
+
+    default_space_id = str((binding or {}).get("default_space_id") or "").strip() or None
+    default_space_name = str((binding or {}).get("default_space_name") or _space_name_from_cache(allowed_spaces, default_space_id) or default_space_id or "").strip() or None
+    active_space_name = _space_name_from_cache(allowed_spaces, active_space_id) or str((binding or {}).get("active_space_name") or active_space_id or "").strip() or None
+
+    if not active_space_id:
+        space_status = "no_active_space"
+    elif not allowed_spaces:
+        space_status = "unknown"
+    elif _space_id_allowed(allowed_spaces, active_space_id):
+        space_status = "active_allowed"
+    else:
+        space_status = "active_not_allowed"
+
+    return {
+        "identity_binding_id": str((binding or {}).get("identity_binding_id") or entry.get("identity_binding_id") or "") or None,
+        "asset_id": asset_id or None,
+        "gateway_id": gateway_id,
+        "install_id": install_id,
+        "acting_agent_id": str(acting_identity.get("agent_id") or entry.get("agent_id") or "").strip() or None,
+        "acting_agent_name": str(acting_identity.get("agent_name") or entry.get("name") or "").strip() or None,
+        "principal_type": str(acting_identity.get("principal_type") or "agent"),
+        "base_url": bound_base_url or requested_url or None,
+        "environment_label": _environment_label_for_base_url(bound_base_url or requested_url),
+        "environment_status": environment_status,
+        "active_space_id": active_space_id,
+        "active_space_name": active_space_name,
+        "active_space_source": active_space_source,
+        "default_space_id": default_space_id,
+        "default_space_name": default_space_name,
+        "allowed_spaces": allowed_spaces,
+        "allowed_space_count": len(allowed_spaces),
+        "identity_status": identity_status,
+        "space_status": space_status,
+        "last_space_verification_at": str((binding or {}).get("last_verified_at") or ""),
+        "identity_binding_state": str((binding or {}).get("binding_state") or "unbound"),
+        "credential_ref": dict((binding or {}).get("credential_ref") or {}) if isinstance((binding or {}).get("credential_ref"), dict) else None,
+    }
+
+
+def _approval_status(approval: dict[str, Any]) -> str:
+    status = str(approval.get("status") or "").strip().lower()
+    if status == "denied":
+        return "rejected"
+    return status
+
+
+def _find_approval_by_id(registry: dict[str, Any], approval_id: str) -> dict[str, Any] | None:
+    _ensure_registry_lists(registry)
+    for approval in registry.get("approvals", []):
+        if str(approval.get("approval_id") or "") == approval_id:
+            return approval
+    return None
+
+
+def _find_approval_for_signature(registry: dict[str, Any], candidate_signature: str) -> dict[str, Any] | None:
+    _ensure_registry_lists(registry)
+    matches = [
+        approval
+        for approval in registry.get("approvals", [])
+        if str(approval.get("candidate_signature") or "") == candidate_signature
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda item: str(item.get("requested_at") or ""))[-1]
+
+
+def list_gateway_approvals(*, status: str | None = None) -> list[dict[str, Any]]:
+    registry = load_gateway_registry()
+    _ensure_registry_lists(registry)
+    normalized_status = _normalized_optional_controlled(status, {"pending", "approved", "rejected"})
+    approvals: list[dict[str, Any]] = []
+    for approval in registry.get("approvals", []):
+        row = dict(approval)
+        row["status"] = _approval_status(row)
+        if normalized_status and row["status"] != normalized_status:
+            continue
+        approvals.append(row)
+    approvals.sort(key=lambda item: str(item.get("requested_at") or ""), reverse=True)
+    return approvals
+
+
+def get_gateway_approval(approval_id: str) -> dict[str, Any]:
+    registry = load_gateway_registry()
+    approval = _find_approval_by_id(registry, approval_id)
+    if approval is None:
+        raise LookupError(f"Approval not found: {approval_id}")
+    result = dict(approval)
+    result["status"] = _approval_status(result)
+    return result
+
+
+def _refresh_attestation_for_matching_entries(
+    registry: dict[str, Any],
+    *,
+    install_id: str | None = None,
+    asset_id: str | None = None,
+) -> None:
+    for entry in registry.get("agents", []):
+        if install_id and str(entry.get("install_id") or "") != install_id:
+            continue
+        if asset_id and _asset_id_for_entry(entry) != asset_id:
+            continue
+        ensure_gateway_identity_binding(registry, entry)
+        entry.update(evaluate_identity_space_binding(registry, entry))
+        entry.update(evaluate_runtime_attestation(registry, entry))
+
+
+def approve_gateway_approval(approval_id: str, *, scope: str = "asset", decided_by: str | None = None) -> dict[str, Any]:
+    normalized_scope = str(scope or "asset").strip().lower()
+    if normalized_scope not in {"once", "asset", "gateway"}:
+        raise ValueError("Approval scope must be one of: once, asset, gateway.")
+    registry = load_gateway_registry()
+    approval = _find_approval_by_id(registry, approval_id)
+    if approval is None:
+        raise LookupError(f"Approval not found: {approval_id}")
+    candidate_binding = approval.get("candidate_binding") if isinstance(approval.get("candidate_binding"), dict) else None
+    if not candidate_binding:
+        raise ValueError("Approval is missing its candidate binding.")
+    now = _now_iso()
+    approval["status"] = "approved"
+    approval["decision"] = "approve"
+    approval["decision_scope"] = normalized_scope
+    approval["decided_at"] = now
+    approval["decided_by"] = decided_by or "local_gateway_operator"
+    binding = dict(candidate_binding)
+    binding["approved_state"] = "approved"
+    binding["approved_at"] = now
+    binding["approval_scope"] = normalized_scope
+    binding["last_verified_at"] = now
+    stored_binding = upsert_binding(registry, binding)
+    _refresh_attestation_for_matching_entries(
+        registry,
+        install_id=str(approval.get("install_id") or "") or None,
+        asset_id=str(approval.get("asset_id") or "") or None,
+    )
+    save_gateway_registry(registry)
+    _record_governance_activity(
+        "approval_granted",
+        asset_id=approval.get("asset_id"),
+        install_id=approval.get("install_id"),
+        approval_id=approval.get("approval_id"),
+        decision_scope=normalized_scope,
+        decided_by=approval["decided_by"],
+        gateway_id=approval.get("gateway_id"),
+        path=stored_binding.get("path"),
+    )
+    result = dict(approval)
+    result["status"] = _approval_status(result)
+    return {"approval": result, "binding": stored_binding}
+
+
+def deny_gateway_approval(approval_id: str, *, decided_by: str | None = None) -> dict[str, Any]:
+    registry = load_gateway_registry()
+    approval = _find_approval_by_id(registry, approval_id)
+    if approval is None:
+        raise LookupError(f"Approval not found: {approval_id}")
+    now = _now_iso()
+    approval["status"] = "rejected"
+    approval["decision"] = "deny"
+    approval["decided_at"] = now
+    approval["decided_by"] = decided_by or "local_gateway_operator"
+    _refresh_attestation_for_matching_entries(
+        registry,
+        install_id=str(approval.get("install_id") or "") or None,
+        asset_id=str(approval.get("asset_id") or "") or None,
+    )
+    save_gateway_registry(registry)
+    _record_governance_activity(
+        "approval_denied",
+        asset_id=approval.get("asset_id"),
+        install_id=approval.get("install_id"),
+        approval_id=approval.get("approval_id"),
+        decided_by=approval["decided_by"],
+        gateway_id=approval.get("gateway_id"),
+    )
+    result = dict(approval)
+    result["status"] = _approval_status(result)
+    return result
+
+
+def _record_governance_activity(event: str, *, entry: dict[str, Any] | None = None, **fields: Any) -> dict[str, Any]:
+    return record_gateway_activity(event, entry=entry, **fields)
+
+
+def ensure_local_asset_binding(
+    registry: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    created_via: str | None = None,
+    auto_approve: bool = True,
+) -> dict[str, Any]:
+    _ensure_registry_lists(registry)
+    gateway_id = _gateway_id_from_registry(registry)
+    asset_id = _asset_id_for_entry(entry)
+    install_id = str(entry.get("install_id") or "").strip()
+    if not install_id:
+        install_id = str(uuid.uuid4())
+        entry["install_id"] = install_id
+    existing = find_binding(registry, install_id=install_id) or find_binding(registry, asset_id=asset_id, gateway_id=gateway_id)
+    if existing:
+        entry.setdefault("install_id", str(existing.get("install_id") or install_id))
+        return existing
+    candidate = _binding_candidate_for_entry({**entry, "created_via": created_via or entry.get("created_via")}, registry)
+    if auto_approve:
+        candidate["approved_state"] = "approved"
+        candidate["approved_at"] = _now_iso()
+    binding = upsert_binding(registry, candidate)
+    entry["install_id"] = str(binding.get("install_id") or install_id)
+    _record_governance_activity(
+        "asset_bound",
+        entry=entry,
+        asset_id=asset_id,
+        install_id=entry["install_id"],
+        binding_type=binding.get("binding_type"),
+        gateway_id=gateway_id,
+        path=binding.get("path"),
+    )
+    return binding
+
+
+def _create_binding_approval(
+    registry: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    candidate_binding: dict[str, Any],
+    action: str,
+    reason: str,
+    risk: str,
+    approval_kind: str,
+) -> dict[str, Any]:
+    existing = _find_approval_for_signature(registry, str(candidate_binding.get("candidate_signature") or ""))
+    if existing:
+        return existing
+    approval = {
+        "approval_id": str(uuid.uuid4()),
+        "asset_id": candidate_binding.get("asset_id"),
+        "gateway_id": candidate_binding.get("gateway_id"),
+        "install_id": candidate_binding.get("install_id"),
+        "action": action,
+        "resource": candidate_binding.get("path") or candidate_binding.get("launch_spec_hash"),
+        "reason": reason,
+        "risk": risk,
+        "status": "pending",
+        "decision": None,
+        "requested_at": _now_iso(),
+        "expires_at": None,
+        "candidate_signature": candidate_binding.get("candidate_signature"),
+        "candidate_binding": candidate_binding,
+        "approval_kind": approval_kind,
+    }
+    registry.setdefault("approvals", []).append(approval)
+    _record_governance_activity(
+        "approval_requested",
+        entry=entry,
+        approval_id=approval["approval_id"],
+        asset_id=approval["asset_id"],
+        install_id=approval["install_id"],
+        approval_kind=approval_kind,
+        reason=reason,
+        risk=risk,
+    )
+    return approval
+
+
+def evaluate_runtime_attestation(registry: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+    _ensure_registry_lists(registry)
+    gateway_id = _gateway_id_from_registry(registry)
+    asset_id = _asset_id_for_entry(entry)
+    install_id = str(entry.get("install_id") or "").strip()
+    candidate = _binding_candidate_for_entry(entry, registry)
+    latest_approval = _find_approval_for_signature(registry, candidate["candidate_signature"])
+
+    def blocked(reason: str, detail: str, *, approval: dict[str, Any] | None = None, state: str = "blocked") -> dict[str, Any]:
+        return {
+            "asset_id": asset_id or None,
+            "gateway_id": gateway_id,
+            "install_id": install_id or candidate["install_id"],
+            "binding": None,
+            "candidate_binding": candidate,
+            "runtime_instance_id": str(entry.get("runtime_instance_id") or "") or None,
+            "attestation_state": state,
+            "drift_reason": reason,
+            "approval_state": "rejected" if approval and _approval_status(approval) == "rejected" else ("pending" if approval and _approval_status(approval) == "pending" else "not_required"),
+            "approval_id": approval.get("approval_id") if approval else None,
+            "confidence_reason": reason,
+            "confidence_detail": detail,
+        }
+
+    if not asset_id:
+        return blocked("unknown_asset", "Runtime is missing a registered asset identity.")
+
+    install_binding = find_binding(registry, install_id=install_id) if install_id else None
+    asset_bindings = _bindings_for_asset(registry, asset_id)
+
+    if install_binding and str(install_binding.get("asset_id") or "") != asset_id:
+        return blocked("asset_mismatch", "Runtime install is bound to a different asset id than the one it claimed.")
+
+    if latest_approval and _approval_status(latest_approval) == "rejected":
+        return blocked("approval_denied", "A prior approval request for this runtime binding was denied.", approval=latest_approval)
+
+    if not install_binding:
+        if asset_bindings:
+            same_gateway = next((binding for binding in asset_bindings if str(binding.get("gateway_id") or "") == gateway_id), None)
+            if same_gateway is None:
+                approval = latest_approval or _create_binding_approval(
+                    registry,
+                    entry,
+                    candidate_binding=candidate,
+                    action="runtime.bind",
+                    reason="Asset is requesting access from a different Gateway than the approved binding.",
+                    risk="high",
+                    approval_kind="new_gateway",
+                )
+                return blocked("new_gateway", "This asset is requesting access from a new Gateway and needs approval.", approval=approval, state="unknown")
+        approval = latest_approval or _create_binding_approval(
+            registry,
+            entry,
+            candidate_binding=candidate,
+            action="runtime.bind",
+            reason="Gateway discovered a runtime binding that has not been approved yet.",
+            risk="medium",
+            approval_kind="new_binding",
+        )
+        return blocked("approval_required", "Gateway needs approval before trusting this new asset binding.", approval=approval, state="unknown")
+
+    binding = install_binding
+    if str(binding.get("gateway_id") or "") != gateway_id:
+        approval = latest_approval or _create_binding_approval(
+            registry,
+            entry,
+            candidate_binding=candidate,
+            action="runtime.bind",
+            reason="Asset binding is attempting to run from a different Gateway than the approved one.",
+            risk="high",
+            approval_kind="new_gateway",
+        )
+        return blocked("new_gateway", "This asset binding is tied to a different Gateway and needs approval.", approval=approval, state="unknown")
+
+    if str(binding.get("approved_state") or "approved").lower() == "rejected":
+        return blocked("approval_denied", "This asset binding was previously rejected.")
+
+    current_path = str(candidate.get("path") or "")
+    bound_path = str(binding.get("path") or "")
+    current_hash = str(candidate.get("launch_spec_hash") or "")
+    bound_hash = str(binding.get("launch_spec_hash") or "")
+    if current_path != bound_path or current_hash != bound_hash:
+        approval = latest_approval or _create_binding_approval(
+            registry,
+            entry,
+            candidate_binding=candidate,
+            action="runtime.attest",
+            reason="Runtime launch path or launch spec changed since approval.",
+            risk="high",
+            approval_kind="binding_drift",
+        )
+        detail = "Runtime launch path or spec changed since approval. Review and approve the new binding before Gateway will trust it."
+        return {
+            "asset_id": asset_id,
+            "gateway_id": gateway_id,
+            "install_id": str(binding.get("install_id") or candidate["install_id"]),
+            "binding": binding,
+            "candidate_binding": candidate,
+            "runtime_instance_id": str(entry.get("runtime_instance_id") or "") or None,
+            "attestation_state": "drifted",
+            "drift_reason": "binding_drift",
+            "approval_state": "pending" if approval and _approval_status(approval) == "pending" else "not_required",
+            "approval_id": approval.get("approval_id") if approval else None,
+            "confidence_reason": "binding_drift",
+            "confidence_detail": detail,
+        }
+
+    return {
+        "asset_id": asset_id,
+        "gateway_id": gateway_id,
+        "install_id": str(binding.get("install_id") or candidate["install_id"]),
+        "binding": binding,
+        "candidate_binding": candidate,
+        "runtime_instance_id": str(entry.get("runtime_instance_id") or "") or None,
+        "attestation_state": "verified",
+        "drift_reason": None,
+        "approval_state": "not_required",
+        "approval_id": None,
+        "confidence_reason": None,
+        "confidence_detail": "Runtime matches the approved local binding.",
+    }
 
 
 def _parse_iso8601(value: object) -> datetime | None:
@@ -87,8 +1779,26 @@ def _age_seconds(value: object, *, now: datetime | None = None) -> int | None:
     return max(0, int(delta.total_seconds()))
 
 
-def annotate_runtime_health(snapshot: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+def annotate_runtime_health(
+    snapshot: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    registry: dict[str, Any] | None = None,
+    explicit_space_id: str | None = None,
+) -> dict[str, Any]:
     enriched = dict(snapshot)
+    resolved_registry = registry
+    if resolved_registry is None:
+        try:
+            resolved_registry = load_gateway_registry()
+        except Exception:
+            resolved_registry = None
+    if resolved_registry and (
+        resolved_registry.get("identity_bindings")
+        or enriched.get("identity_binding_id")
+    ):
+        identity_space = evaluate_identity_space_binding(resolved_registry, enriched, explicit_space_id=explicit_space_id)
+        enriched.update(identity_space)
     last_seen_age = _age_seconds(enriched.get("last_seen_at"), now=now)
     last_error_age = _age_seconds(enriched.get("last_listener_error_at"), now=now)
     if last_seen_age is not None:
@@ -96,15 +1806,73 @@ def annotate_runtime_health(snapshot: dict[str, Any], *, now: datetime | None = 
     if last_error_age is not None:
         enriched["last_listener_error_age_seconds"] = last_error_age
 
+    profile = infer_operator_profile(enriched)
+    asset_descriptor = infer_asset_descriptor(enriched, operator_profile=profile)
     state = str(enriched.get("effective_state") or "stopped").lower()
-    connected = False
-    if state == "running":
-        if last_seen_age is None or last_seen_age > RUNTIME_STALE_AFTER_SECONDS:
-            state = "stale"
-        else:
-            connected = True
+    raw_state = state
+    liveness, connected = _derive_liveness(enriched, raw_state=state, last_seen_age=last_seen_age)
+    if liveness == "stale" and raw_state == "running":
+        state = "stale"
+    elif liveness == "setup_error":
+        state = "error"
+    elif liveness == "offline" and state not in {"stopped", "error"}:
+        state = "stopped"
+
+    work_state = _derive_work_state(enriched, liveness=liveness)
+    mode = _derive_mode(profile)
+    presence = _derive_presence(mode=mode, liveness=liveness, work_state=work_state)
+    reply = _derive_reply(profile["reply_mode"])
+    reachability = _derive_reachability(snapshot=enriched, mode=mode, liveness=liveness, activation=profile["activation"])
+    confidence, confidence_reason, confidence_detail = _derive_confidence(
+        enriched,
+        mode=mode,
+        liveness=liveness,
+        reachability=reachability,
+    )
+
+    enriched.update(profile)
+    enriched["asset_class"] = _normalized_controlled(asset_descriptor["asset_class"], _CONTROLLED_ASSET_CLASSES, fallback="interactive_agent")
+    enriched["intake_model"] = _normalized_controlled(asset_descriptor["intake_model"], _CONTROLLED_INTAKE_MODELS, fallback="launch_on_send")
+    if asset_descriptor.get("worker_model"):
+        enriched["worker_model"] = asset_descriptor["worker_model"]
+    enriched["trigger_sources"] = list(asset_descriptor.get("trigger_sources") or [])
+    enriched["return_paths"] = list(asset_descriptor.get("return_paths") or [])
+    enriched["telemetry_shape"] = _normalized_controlled(
+        asset_descriptor.get("telemetry_shape"),
+        _CONTROLLED_TELEMETRY_SHAPES,
+        fallback="basic",
+    )
+    enriched["asset_type_label"] = str(asset_descriptor.get("type_label") or "Connected Asset")
+    enriched["output_label"] = str(asset_descriptor.get("output_label") or "Reply")
+    enriched["tags"] = list(asset_descriptor.get("tags") or [])
+    enriched["capabilities"] = list(asset_descriptor.get("capabilities") or [])
+    enriched["constraints"] = list(asset_descriptor.get("constraints") or [])
+    enriched["asset_descriptor"] = asset_descriptor
     enriched["effective_state"] = state
     enriched["connected"] = connected
+    enriched["liveness"] = _normalized_controlled(liveness, _CONTROLLED_LIVENESS, fallback="offline")
+    enriched["work_state"] = _normalized_controlled(work_state, _CONTROLLED_WORK_STATES, fallback="idle")
+    enriched["mode"] = _normalized_controlled(mode, _CONTROLLED_MODES, fallback="ON-DEMAND")
+    enriched["presence"] = _normalized_controlled(presence, _CONTROLLED_PRESENCE, fallback="OFFLINE")
+    enriched["reply"] = _normalized_controlled(reply, _CONTROLLED_REPLY, fallback="REPLY")
+    enriched["reachability"] = _normalized_controlled(reachability, _CONTROLLED_REACHABILITY, fallback="unavailable")
+    enriched["confidence"] = _normalized_controlled(confidence, _CONTROLLED_CONFIDENCE, fallback="MEDIUM")
+    enriched["confidence_reason"] = _normalized_controlled(
+        confidence_reason,
+        _CONTROLLED_CONFIDENCE_REASONS,
+        fallback="unknown",
+    )
+    enriched["confidence_detail"] = str(confidence_detail or "").strip() or None
+    enriched["attestation_state"] = _normalized_optional_controlled(enriched.get("attestation_state"), _CONTROLLED_ATTESTATION_STATES)
+    enriched["approval_state"] = _normalized_optional_controlled(enriched.get("approval_state"), _CONTROLLED_APPROVAL_STATES)
+    enriched["identity_status"] = _normalized_optional_controlled(enriched.get("identity_status"), _CONTROLLED_IDENTITY_STATUSES)
+    enriched["space_status"] = _normalized_optional_controlled(enriched.get("space_status"), _CONTROLLED_SPACE_STATUSES)
+    enriched["environment_status"] = _normalized_optional_controlled(enriched.get("environment_status"), _CONTROLLED_ENVIRONMENT_STATUSES)
+    enriched["active_space_source"] = _normalized_optional_controlled(enriched.get("active_space_source"), _CONTROLLED_ACTIVE_SPACE_SOURCES)
+    enriched["queue_capable"] = profile["placement"] == "mailbox"
+    enriched["queue_depth"] = int(enriched.get("backlog_depth") or 0)
+    enriched.setdefault("last_successful_doctor_at", None)
+    enriched.setdefault("last_doctor_result", None)
     return enriched
 
 
@@ -132,6 +1900,18 @@ def registry_path() -> Path:
 
 def pid_path() -> Path:
     return gateway_dir() / "gateway.pid"
+
+
+def ui_state_path() -> Path:
+    return gateway_dir() / "gateway-ui.json"
+
+
+def daemon_log_path() -> Path:
+    return gateway_dir() / "gateway.log"
+
+
+def ui_log_path() -> Path:
+    return gateway_dir() / "gateway-ui.log"
 
 
 def activity_log_path() -> Path:
@@ -162,6 +1942,9 @@ def _default_registry() -> dict[str, Any]:
             "last_reconcile_at": None,
         },
         "agents": [],
+        "bindings": [],
+        "identity_bindings": [],
+        "approvals": [],
     }
 
 
@@ -196,6 +1979,9 @@ def load_gateway_registry() -> dict[str, Any]:
     registry.setdefault("version", 1)
     registry.setdefault("gateway", {})
     registry.setdefault("agents", [])
+    registry.setdefault("bindings", [])
+    registry.setdefault("identity_bindings", [])
+    registry.setdefault("approvals", [])
     gateway = registry["gateway"]
     gateway.setdefault("gateway_id", str(uuid.uuid4()))
     gateway.setdefault("desired_state", "stopped")
@@ -229,18 +2015,23 @@ def daemon_status() -> dict[str, Any]:
             pid = int(pid_path().read_text().strip())
         except ValueError:
             pid = None
+    running = _pid_alive(pid)
+    if not running:
+        scanned = _scan_gateway_process_pids()
+        if scanned:
+            pid = scanned[0]
+            running = True
     registry = load_gateway_registry()
     return {
         "pid": pid,
-        "running": _pid_alive(pid),
+        "running": running,
         "registry_path": str(registry_path()),
         "session_path": str(session_path()),
         "registry": registry,
     }
 
 
-def _scan_gateway_process_pids() -> list[int]:
-    """Best-effort fallback for live daemons that predate the pid file."""
+def _scan_process_pids(pattern: re.Pattern[str]) -> list[int]:
     current_pid = os.getpid()
     parent_pid = os.getppid()
     try:
@@ -265,9 +2056,116 @@ def _scan_gateway_process_pids() -> list[int]:
         if pid in {current_pid, parent_pid} or not _pid_alive(pid):
             continue
         command = command.strip()
-        if command and _GATEWAY_PROCESS_RE.search(command):
+        if command and pattern.search(command):
             pids.append(pid)
     return sorted(set(pids))
+
+
+def _scan_gateway_process_pids() -> list[int]:
+    """Best-effort fallback for live daemons that predate the pid file."""
+    return _scan_process_pids(_GATEWAY_PROCESS_RE)
+
+
+def _default_ui_state() -> dict[str, Any]:
+    return {
+        "pid": None,
+        "host": "127.0.0.1",
+        "port": 8765,
+        "last_started_at": None,
+    }
+
+
+def load_gateway_ui_state() -> dict[str, Any]:
+    state = _read_json(ui_state_path(), default=_default_ui_state())
+    state.setdefault("pid", None)
+    state.setdefault("host", "127.0.0.1")
+    state.setdefault("port", 8765)
+    state.setdefault("last_started_at", None)
+    return state
+
+
+def save_gateway_ui_state(data: dict[str, Any]) -> Path:
+    payload = _default_ui_state()
+    payload.update(data)
+    _write_json(ui_state_path(), payload)
+    return ui_state_path()
+
+
+def ui_status() -> dict[str, Any]:
+    state = load_gateway_ui_state()
+    pid = state.get("pid")
+    try:
+        pid_value = int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        pid_value = None
+    host = str(state.get("host") or "127.0.0.1")
+    try:
+        port = int(state.get("port") or 8765)
+    except (TypeError, ValueError):
+        port = 8765
+    running = _pid_alive(pid_value)
+    if not running:
+        scanned = _scan_gateway_ui_process_pids()
+        if scanned:
+            pid_value = scanned[0]
+            running = True
+    return {
+        "pid": pid_value,
+        "running": running,
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}",
+        "state_path": str(ui_state_path()),
+        "log_path": str(ui_log_path()),
+        "last_started_at": state.get("last_started_at"),
+    }
+
+
+def _scan_gateway_ui_process_pids() -> list[int]:
+    """Best-effort fallback for live UIs that predate the ui state file."""
+    return _scan_process_pids(_GATEWAY_UI_PROCESS_RE)
+
+
+def active_gateway_ui_pids() -> list[int]:
+    """Return all known live Gateway UI PIDs except the current process."""
+    status = ui_status()
+    pids: list[int] = []
+    pid = status.get("pid")
+    if isinstance(pid, int) and status.get("running") and pid != os.getpid():
+        pids.append(pid)
+    pids.extend(_scan_gateway_ui_process_pids())
+    return sorted(set(pids))
+
+
+def active_gateway_ui_pid() -> int | None:
+    """Return the PID of a live Gateway UI, if one is already running."""
+    pids = active_gateway_ui_pids()
+    return pids[0] if pids else None
+
+
+def write_gateway_ui_state(*, pid: int, host: str, port: int) -> None:
+    save_gateway_ui_state(
+        {
+            "pid": pid,
+            "host": host,
+            "port": port,
+            "last_started_at": _now_iso(),
+        }
+    )
+
+
+def clear_gateway_ui_state(pid: int | None = None) -> None:
+    if not ui_state_path().exists():
+        return
+    if pid is not None:
+        try:
+            state = load_gateway_ui_state()
+            existing_pid = int(state.get("pid")) if state.get("pid") is not None else None
+        except (TypeError, ValueError):
+            existing_pid = None
+        if existing_pid not in {None, pid}:
+            return
+    ui_state_path().unlink()
 
 
 def active_gateway_pids() -> list[int]:
@@ -324,6 +2222,9 @@ def record_gateway_activity(
             {
                 "agent_name": entry.get("name"),
                 "agent_id": entry.get("agent_id"),
+                "asset_id": _asset_id_for_entry(entry) or None,
+                "install_id": entry.get("install_id"),
+                "runtime_instance_id": entry.get("runtime_instance_id"),
                 "runtime_type": entry.get("runtime_type"),
                 "transport": entry.get("transport", "gateway"),
                 "credential_source": entry.get("credential_source", "gateway"),
@@ -409,6 +2310,12 @@ def sanitize_exec_env(prompt: str, entry: dict[str, Any]) -> dict[str, str]:
     env["AX_GATEWAY_AGENT_NAME"] = str(entry.get("name") or "")
     env["AX_GATEWAY_RUNTIME_TYPE"] = str(entry.get("runtime_type") or "")
     env["AX_MENTION_CONTENT"] = prompt
+    ollama_model = str(entry.get("ollama_model") or "").strip()
+    if ollama_model:
+        env["OLLAMA_MODEL"] = ollama_model
+    hermes_repo_path = str(entry.get("hermes_repo_path") or "").strip()
+    if hermes_repo_path:
+        env["HERMES_REPO_PATH"] = hermes_repo_path
     return env
 
 
@@ -547,6 +2454,7 @@ class ManagedAgentRuntime:
         self._stream_response = None
         self._state: dict[str, Any] = {
             "effective_state": "stopped",
+            "runtime_instance_id": None,
             "backlog_depth": 0,
             "dropped_count": 0,
             "processed_count": 0,
@@ -627,7 +2535,7 @@ class ManagedAgentRuntime:
 
     def snapshot(self) -> dict[str, Any]:
         with self._state_lock:
-            return annotate_runtime_health(dict(self._state))
+            return dict(self._state)
 
     def start(self) -> None:
         if self._listener_thread and self._listener_thread.is_alive():
@@ -637,8 +2545,11 @@ class ManagedAgentRuntime:
         self._reply_anchor_ids = set()
         self._seen_ids = set()
         self._completed_seen_ids = set()
+        runtime_instance_id = str(uuid.uuid4())
+        self.entry["runtime_instance_id"] = runtime_instance_id
         self._update_state(
             effective_state="starting",
+            runtime_instance_id=runtime_instance_id,
             backlog_depth=0,
             current_status=None,
             current_activity=None,
@@ -664,7 +2575,7 @@ class ManagedAgentRuntime:
         if self._worker_thread is not None:
             self._worker_thread.start()
         self._listener_thread.start()
-        record_gateway_activity("runtime_started", entry=self.entry)
+        record_gateway_activity("runtime_started", entry=self.entry, runtime_instance_id=runtime_instance_id)
         self._log("started")
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -690,8 +2601,10 @@ class ManagedAgentRuntime:
         self._stream_client = None
         self._send_client = None
         self._stream_response = None
+        self.entry["runtime_instance_id"] = None
         self._update_state(
             effective_state="stopped",
+            runtime_instance_id=None,
             backlog_depth=0,
             current_status=None,
             current_activity=None,
@@ -1243,8 +3156,41 @@ class GatewayDaemon:
     def _reconcile_runtime(self, entry: dict[str, Any]) -> None:
         name = str(entry.get("name") or "")
         desired_state = str(entry.get("desired_state") or "stopped").lower()
+        attestation_state = _normalized_optional_controlled(entry.get("attestation_state"), _CONTROLLED_ATTESTATION_STATES)
+        approval_state = _normalized_optional_controlled(entry.get("approval_state"), _CONTROLLED_APPROVAL_STATES)
+        identity_status = _normalized_optional_controlled(entry.get("identity_status"), _CONTROLLED_IDENTITY_STATUSES)
+        environment_status = _normalized_optional_controlled(entry.get("environment_status"), _CONTROLLED_ENVIRONMENT_STATUSES)
+        space_status = _normalized_optional_controlled(entry.get("space_status"), _CONTROLLED_SPACE_STATUSES)
         runtime = self._runtimes.get(name)
-        if desired_state == "running":
+        hermes_status = hermes_setup_status(entry)
+        if not hermes_status.get("ready", True):
+            if runtime is not None:
+                runtime.stop()
+                self._runtimes.pop(name, None)
+            entry.update(
+                {
+                    "effective_state": "error",
+                    "runtime_instance_id": None,
+                    "last_error": str(hermes_status.get("detail") or hermes_status.get("summary") or "Hermes setup is incomplete."),
+                    "current_status": None,
+                    "current_activity": str(hermes_status.get("summary") or "Hermes setup is incomplete."),
+                    "current_tool": None,
+                    "current_tool_call_id": None,
+                    "backlog_depth": 0,
+                }
+            )
+            return
+        if hermes_status.get("resolved_path"):
+            entry["hermes_repo_path"] = str(hermes_status["resolved_path"])
+        allowed_to_run = (
+            desired_state == "running"
+            and attestation_state in {None, "verified"}
+            and approval_state not in {"pending", "rejected"}
+            and identity_status in {None, "verified"}
+            and environment_status not in {"environment_mismatch", "environment_blocked"}
+            and space_status not in {"active_not_allowed", "no_active_space"}
+        )
+        if allowed_to_run:
             if runtime is None:
                 runtime = ManagedAgentRuntime(entry, client_factory=self.client_factory, logger=self.logger)
                 self._runtimes[name] = runtime
@@ -1258,6 +3204,7 @@ class GatewayDaemon:
                 self._runtimes.pop(name, None)
 
     def _reconcile_registry(self, registry: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+        _ensure_registry_lists(registry)
         agents = registry.setdefault("agents", [])
         agent_names = {str(entry.get("name") or "") for entry in agents}
         for name, runtime in list(self._runtimes.items()):
@@ -1270,10 +3217,85 @@ class GatewayDaemon:
             entry.setdefault("credential_source", "gateway")
             entry.setdefault("runtime_type", "echo")
             entry.setdefault("desired_state", "stopped")
+            if not str(entry.get("install_id") or "").strip():
+                entry["install_id"] = str(uuid.uuid4())
+
+            asset_id = _asset_id_for_entry(entry)
+            existing_binding = find_binding(registry, install_id=str(entry.get("install_id") or "").strip()) if asset_id else None
+            if not existing_binding and asset_id and not _bindings_for_asset(registry, asset_id):
+                ensure_local_asset_binding(
+                    registry,
+                    entry,
+                    created_via=str(entry.get("created_via") or "legacy_registry"),
+                    auto_approve=True,
+                )
+            ensure_gateway_identity_binding(
+                registry,
+                entry,
+                session=session,
+                created_via=str(entry.get("created_via") or "legacy_registry"),
+            )
+            entry.update(evaluate_identity_space_binding(registry, entry))
+
+            previous_attestation = (
+                str(entry.get("attestation_state") or ""),
+                str(entry.get("approval_state") or ""),
+                str(entry.get("approval_id") or ""),
+                str(entry.get("drift_reason") or ""),
+            )
+            attestation = evaluate_runtime_attestation(registry, entry)
+            entry.update(attestation)
+            current_attestation = (
+                str(entry.get("attestation_state") or ""),
+                str(entry.get("approval_state") or ""),
+                str(entry.get("approval_id") or ""),
+                str(entry.get("drift_reason") or ""),
+            )
+            if current_attestation != previous_attestation:
+                state = str(entry.get("attestation_state") or "")
+                if state == "verified":
+                    record_gateway_activity(
+                        "runtime_attested",
+                        entry=entry,
+                        install_id=entry.get("install_id"),
+                        attestation_state=state,
+                    )
+                elif state == "drifted":
+                    record_gateway_activity(
+                        "attestation_drift_detected",
+                        entry=entry,
+                        install_id=entry.get("install_id"),
+                        attestation_state=state,
+                        approval_id=entry.get("approval_id"),
+                        drift_reason=entry.get("drift_reason"),
+                    )
+                elif state in {"unknown", "blocked"}:
+                    record_gateway_activity(
+                        "invocation_blocked",
+                        entry=entry,
+                        install_id=entry.get("install_id"),
+                        attestation_state=state,
+                        approval_id=entry.get("approval_id"),
+                        reason=entry.get("confidence_reason"),
+                    )
             self._reconcile_runtime(entry)
             runtime = self._runtimes.get(str(entry.get("name") or ""))
-            snapshot = runtime.snapshot() if runtime is not None else annotate_runtime_health({"effective_state": "stopped"})
+            snapshot = (
+                runtime.snapshot()
+                if runtime is not None
+                else {
+                    "effective_state": entry.get("effective_state") or "stopped",
+                    "runtime_instance_id": None,
+                    "last_error": entry.get("last_error"),
+                    "current_status": entry.get("current_status"),
+                    "current_activity": entry.get("current_activity"),
+                    "current_tool": entry.get("current_tool"),
+                    "current_tool_call_id": entry.get("current_tool_call_id"),
+                    "backlog_depth": int(entry.get("backlog_depth") or 0),
+                }
+            )
             entry.update(snapshot)
+            entry.update(annotate_runtime_health(entry, registry=registry))
 
         gateway = registry.setdefault("gateway", {})
         gateway.update(
@@ -1337,6 +3359,7 @@ class GatewayDaemon:
                 runtime = self._runtimes.get(name)
                 if runtime is not None:
                     entry.update(runtime.snapshot())
+                entry.update(annotate_runtime_health(entry, registry=final_registry))
             save_gateway_registry(final_registry)
             record_gateway_activity("gateway_stopped")
             clear_gateway_pid(os.getpid())

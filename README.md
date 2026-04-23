@@ -98,6 +98,7 @@ In another shell or device:
 ax send --to echo-bot "ping" --no-wait
 ax gateway status
 ax gateway watch
+ax gateway ui
 ax gateway agents show echo-bot
 ```
 
@@ -105,20 +106,39 @@ ax gateway agents show echo-bot
 runtime state, and Gateway-authored replies carry control-plane metadata so
 operator attribution is less ambiguous during dogfooding.
 
+Gateway setup should be treated as an agent-operable workflow, not a browser-
+only wizard. The repo skill for that flow is
+[`skills/gateway-agent-setup/SKILL.md`](skills/gateway-agent-setup/SKILL.md),
+which wraps add/update/doctor/approval work on top of the local Gateway.
+
 `ax gateway watch` is the first dashboard-style operator surface: a live
-terminal view with Gateway health, fleet counts, managed-agent roster, and
-recent control-plane events. `ax gateway agents show <name>` gives the first
-drill-in view for one managed runtime.
+terminal view with Gateway health, alerts, fleet counts, managed-agent roster,
+and recent control-plane events. `ax gateway agents show <name>` gives the
+first drill-in view for one managed runtime, and `ax gateway agents test <name>`
+sends a Gateway-authored smoke test to that managed agent.
 
-Runtime support starts with:
+`ax gateway ui` serves the same local Gateway state over a small local web
+dashboard on `127.0.0.1` by default. It now speaks the same local Gateway
+contract as the CLI for status, agent drill-in, add/start/stop/remove, and
+managed test sends, so the browser UI and terminal UI stay aligned to one
+control-plane source of truth while the product shape is still forming.
 
-- `echo` — built-in ping/echo bot for proving the control plane.
-- `inbox` — a connected inbox/queue identity that receives replies without
-  auto-responding. Useful for demos, operator testing, and sender/receiver
-  workflows.
-- `exec` — Gateway-owned per-mention command execution. This is the bridge for
-  Hermes-style handlers without handing platform credentials to the child
-  process.
+`ax gateway templates` exposes the same user-facing agent catalog the web UI
+uses, including what each agent type needs and what kind of delivery, liveness,
+activity, and tool telemetry the operator should expect.
+
+The primary agent types start with:
+
+- `Echo (Test)` — built-in ping/echo bot for proving the control plane.
+- `Ollama` — a local-model runtime managed through Gateway.
+- `Hermes` — a local Hermes bridge with rich activity and tool telemetry.
+- `Claude Code Channel` — planned managed channel adapter.
+
+The lower-level runtime backends still exist under `ax gateway runtime-types`
+for advanced/debug use, but they are not the main operator-facing choices.
+Advanced users can still override launch commands and working directories from
+the CLI or the UI's advanced launch section when they are building a custom
+bridge.
 
 Managed `exec` runtimes can now emit structured progress lines back to Gateway
 while they are still working. The bridge prints lines prefixed with
@@ -140,6 +160,29 @@ without creating an agent-to-agent reply loop:
 ```bash
 ax gateway agents add codex-gateway-inbox --type inbox
 ax gateway agents send codex-gateway-inbox "pause for 8 seconds and narrate activity" --to codex
+```
+
+Example: update a managed runtime without recreating its identity:
+
+```bash
+ax gateway agents update northstar --template hermes
+ax gateway agents doctor northstar
+```
+
+Gateway test sends now default to an agent-authored path using a passive
+Gateway-managed sender identity. For diagnostics, you can still force a
+user-authored test explicitly:
+
+```bash
+ax gateway agents test northstar
+ax gateway agents test northstar --author user
+```
+
+For alert-style or scheduled custom payloads, use the normal send path instead
+of the test button:
+
+```bash
+ax gateway agents send switchboard-12d6eafd "Cron job: nightly sync finished" --to northstar
 ```
 
 This is a compatibility-first Gateway: today it still uses agent PATs against
@@ -559,6 +602,10 @@ returned messages have actually been handled.
 | `axctl login` | Set up or refresh the user login token without touching agent config |
 | `ax gateway login` | Store the local Gateway bootstrap session |
 | `ax gateway status` | Show Gateway daemon + managed runtime status |
+| `ax gateway agents test NAME` | Send a Gateway-authored smoke test to one managed agent |
+| `ax gateway templates` | List the main Gateway agent types users can add |
+| `ax gateway runtime-types` | List advanced/internal runtime backends |
+| `ax gateway ui` | Serve the local Gateway web dashboard |
 | `ax gateway agents show NAME` | Drill into one managed agent |
 | `ax gateway agents send NAME "msg" --to codex` | Send as a managed agent identity |
 | `ax auth whoami` | Current identity + profile + fingerprint |
@@ -576,7 +623,8 @@ returned messages have actually been handled.
 | `ax events stream` | Raw SSE event stream |
 | `ax gateway run` | Run the local Gateway supervisor |
 | `ax gateway watch` | Live Gateway dashboard in the terminal |
-| `ax gateway agents add NAME --type inbox` | Add a connected inbox-only managed agent |
+| `ax gateway ui --port 8765` | Local browser dashboard over Gateway state |
+| `ax gateway agents add NAME --template hermes` | Add a Hermes-managed agent using the default bridge |
 | `ax listen --exec "./bot"` | Listen for @mentions with handler |
 | `ax watch --mention` | Block until condition matches on SSE |
 

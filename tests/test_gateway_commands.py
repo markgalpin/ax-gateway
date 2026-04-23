@@ -1,10 +1,14 @@
 import json
+import socket
 import sys
+import threading
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
+import pytest
 from typer.testing import CliRunner
 
 from ax_cli import gateway as gateway_core
@@ -38,6 +42,23 @@ class _FakeLoginClient:
 class _FakeUserClient:
     def update_agent(self, *args, **kwargs):
         return {"ok": True}
+
+    def send_message(self, space_id, content, *, agent_id=None, parent_id=None, metadata=None):
+        return {
+            "message": {
+                "id": "gateway-test-1",
+                "space_id": space_id,
+                "content": content,
+                "agent_id": agent_id,
+                "parent_id": parent_id,
+                "metadata": metadata,
+            }
+        }
+
+
+def _fake_create_agent_in_space(*args, **kwargs):
+    name = kwargs.get("name", "agent")
+    return {"id": f"agent-{name}", "name": name}
 
 
 class _FakeSseResponse:
@@ -229,6 +250,194 @@ def test_scan_gateway_process_pids_ignores_current_parent_wrapper(monkeypatch):
     assert gateway_core._scan_gateway_process_pids() == [5514]
 
 
+def test_gateway_start_launches_background_daemon_and_ui(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "madtank",
+        }
+    )
+
+    state = {"daemon_pid": None, "ui_pid": None}
+    spawned: list[tuple[list[str], str]] = []
+
+    class _FakeProcess:
+        def __init__(self, pid: int):
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+    def fake_spawn(command, *, log_path):
+        spawned.append((command, str(log_path)))
+        if "run" in command:
+            state["daemon_pid"] = 5514
+            return _FakeProcess(5514)
+        state["ui_pid"] = 5515
+        return _FakeProcess(5515)
+
+    monkeypatch.setattr(gateway_cmd, "_spawn_gateway_background_process", fake_spawn)
+    monkeypatch.setattr(gateway_cmd, "_wait_for_daemon_ready", lambda process, timeout=3.0: True)
+    monkeypatch.setattr(gateway_cmd, "_wait_for_ui_ready", lambda process, host, port, timeout=3.0: True)
+    monkeypatch.setattr(gateway_cmd, "active_gateway_pid", lambda: state["daemon_pid"])
+    monkeypatch.setattr(gateway_cmd, "active_gateway_ui_pid", lambda: state["ui_pid"])
+    monkeypatch.setattr(
+        gateway_cmd,
+        "ui_status",
+        lambda: {
+            "running": True,
+            "pid": state["ui_pid"],
+            "host": "127.0.0.1",
+            "port": 8765,
+            "url": "http://127.0.0.1:8765",
+            "log_path": str(gateway_core.ui_log_path()),
+        },
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(gateway_cmd.webbrowser, "open_new_tab", lambda url: opened.append(url))
+
+    result = runner.invoke(app, ["gateway", "start", "--no-open"])
+
+    assert result.exit_code == 0, result.output
+    assert "daemon    = started" in result.output
+    assert "ui        = started" in result.output
+    assert len(spawned) == 2
+    assert "gateway" in spawned[0][0] and "run" in spawned[0][0]
+    assert spawned[0][0][-2:] == ["--poll-interval", "1.0"]
+    assert "gateway" in spawned[1][0] and "ui" in spawned[1][0]
+    assert opened == []
+
+
+def test_gateway_cli_argv_prefers_current_ax_script(monkeypatch, tmp_path):
+    current_ax = tmp_path / "bin" / "ax"
+    current_ax.parent.mkdir(parents=True)
+    current_ax.write_text("#!/bin/sh\n")
+    current_ax.chmod(0o755)
+
+    monkeypatch.setattr(gateway_cmd.sys, "argv", [str(current_ax), "gateway", "start"])
+    monkeypatch.setattr(gateway_cmd.sys, "executable", "/opt/homebrew/bin/python3")
+    monkeypatch.setattr(gateway_cmd.shutil, "which", lambda name: f"/opt/homebrew/bin/{name}")
+
+    argv = gateway_cmd._gateway_cli_argv("gateway", "run")
+
+    assert argv == [str(current_ax.resolve()), "gateway", "run"]
+
+
+def test_gateway_start_without_login_starts_ui_only(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+
+    state = {"ui_pid": None}
+    spawned: list[list[str]] = []
+
+    class _FakeProcess:
+        def __init__(self, pid: int):
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+    def fake_spawn(command, *, log_path):
+        spawned.append(command)
+        state["ui_pid"] = 6615
+        return _FakeProcess(6615)
+
+    monkeypatch.setattr(gateway_cmd, "_spawn_gateway_background_process", fake_spawn)
+    monkeypatch.setattr(gateway_cmd, "_wait_for_ui_ready", lambda process, host, port, timeout=3.0: True)
+    monkeypatch.setattr(gateway_cmd, "active_gateway_pid", lambda: None)
+    monkeypatch.setattr(gateway_cmd, "active_gateway_ui_pid", lambda: state["ui_pid"])
+    monkeypatch.setattr(
+        gateway_cmd,
+        "ui_status",
+        lambda: {
+            "running": True,
+            "pid": state["ui_pid"],
+            "host": "127.0.0.1",
+            "port": 8765,
+            "url": "http://127.0.0.1:8765",
+            "log_path": str(gateway_core.ui_log_path()),
+        },
+    )
+
+    result = runner.invoke(app, ["gateway", "start", "--no-open"])
+
+    assert result.exit_code == 0, result.output
+    assert "Gateway is not logged in yet" in result.output
+    assert len(spawned) == 1
+    assert "gateway" in spawned[0] and "ui" in spawned[0]
+
+
+def test_gateway_stop_terminates_daemon_and_ui(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gateway_cmd, "active_gateway_pids", lambda: [7714])
+    monkeypatch.setattr(gateway_cmd, "active_gateway_ui_pids", lambda: [7715])
+    monkeypatch.setattr(
+        gateway_cmd,
+        "_terminate_pids",
+        lambda pids, timeout=3.0: (list(pids), [pids[0]] if pids and pids[0] == 7714 else []),
+    )
+
+    result = runner.invoke(app, ["gateway", "stop"])
+
+    assert result.exit_code == 0, result.output
+    assert "daemon = [7714]" in result.output
+    assert "ui     = [7715]" in result.output
+    assert "Forced kill:" in result.output
+
+
+def test_gateway_start_rolls_back_daemon_when_ui_start_fails(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "madtank",
+        }
+    )
+
+    state = {"daemon_pid": None, "ui_pid": None}
+
+    class _FakeProcess:
+        def __init__(self, pid: int):
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+    def fake_spawn(command, *, log_path):
+        if "run" in command:
+            state["daemon_pid"] = 8814
+            return _FakeProcess(8814)
+        state["ui_pid"] = 8815
+        return _FakeProcess(8815)
+
+    terminated: list[list[int]] = []
+    cleared: list[int | None] = []
+
+    monkeypatch.setattr(gateway_cmd, "_spawn_gateway_background_process", fake_spawn)
+    monkeypatch.setattr(gateway_cmd, "_wait_for_daemon_ready", lambda process, timeout=3.0: True)
+    monkeypatch.setattr(gateway_cmd, "_wait_for_ui_ready", lambda process, host, port, timeout=3.0: False)
+    monkeypatch.setattr(gateway_cmd, "active_gateway_pid", lambda: state["daemon_pid"])
+    monkeypatch.setattr(gateway_cmd, "active_gateway_ui_pid", lambda: state["ui_pid"])
+    monkeypatch.setattr(gateway_cmd, "_tail_log_lines", lambda path, lines=12: "address already in use")
+    monkeypatch.setattr(gateway_cmd, "_terminate_pids", lambda pids, timeout=3.0: (terminated.append(list(pids)) or (list(pids), [])))
+    monkeypatch.setattr(gateway_core, "clear_gateway_pid", lambda pid=None: cleared.append(pid))
+
+    result = runner.invoke(app, ["gateway", "start", "--no-open"])
+
+    assert result.exit_code == 1, result.output
+    assert "Failed to start Gateway UI." in result.output
+    assert terminated == [[8814]]
+    assert cleared == [None]
+
+
 def test_gateway_agents_add_mints_token_and_writes_registry(monkeypatch, tmp_path):
     config_dir = tmp_path / "config"
     monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
@@ -261,12 +470,284 @@ def test_gateway_agents_add_mints_token_and_writes_registry(monkeypatch, tmp_pat
     assert payload["transport"] == "gateway"
     registry = gateway_core.load_gateway_registry()
     assert registry["agents"][0]["name"] == "echo-bot"
+    assert registry["bindings"][0]["asset_id"] == "agent-1"
+    assert registry["bindings"][0]["approved_state"] == "approved"
+    assert registry["agents"][0]["install_id"] == registry["bindings"][0]["install_id"]
     token_file = Path(registry["agents"][0]["token_file"])
     assert token_file.exists()
     assert token_file.read_text().strip() == "axp_a_agent.secret"
     recent = gateway_core.load_recent_gateway_activity()
     assert recent[-1]["event"] == "managed_agent_added"
     assert recent[-1]["agent_name"] == "echo-bot"
+
+
+def test_gateway_daemon_reconcile_normalizes_legacy_inbox_metadata(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    registry = gateway_core.load_gateway_registry()
+    entry = {
+        "name": "dev_channel_alpha",
+        "agent_id": "agent-dev-channel-1",
+        "space_id": "space-1",
+        "base_url": "https://paxai.app",
+        "runtime_type": "inbox",
+        "desired_state": "stopped",
+        "placement": "hosted",
+        "activation": "persistent",
+        "reply_mode": "interactive",
+        "telemetry_level": "basic",
+        "asset_class": "interactive_agent",
+        "intake_model": "live_listener",
+        "trigger_sources": ["direct_message"],
+        "return_paths": ["inline_reply"],
+        "tags": ["local", "custom-bridge"],
+        "capabilities": ["reply"],
+        "created_via": "legacy_registry",
+    }
+    gateway_core.ensure_local_asset_binding(registry, entry, created_via="legacy_registry", auto_approve=True)
+    registry["agents"] = [entry]
+
+    daemon = gateway_core.GatewayDaemon(client_factory=lambda **kwargs: _SharedRuntimeClient({}))
+    reconciled = daemon._reconcile_registry(registry, {"token": "axp_u_test.token"})
+    agent = reconciled["agents"][0]
+
+    assert agent["placement"] == "mailbox"
+    assert agent["activation"] == "queue_worker"
+    assert agent["reply_mode"] == "summary_only"
+    assert agent["mode"] == "INBOX"
+    assert agent["reply"] == "SUMMARY"
+    assert agent["asset_class"] == "background_worker"
+    assert agent["intake_model"] == "queue_accept"
+    assert agent["worker_model"] == "queue_drain"
+    assert agent["return_paths"] == ["summary_post"]
+    assert agent["asset_type_label"] == "Inbox Worker"
+    assert agent["output_label"] == "Summary"
+
+
+def test_annotate_runtime_health_respects_explicit_user_overrides():
+    snapshot = {
+        "name": "custom-inbox-ish",
+        "agent_id": "agent-custom-1",
+        "runtime_type": "inbox",
+        "placement": "hosted",
+        "activation": "persistent",
+        "reply_mode": "interactive",
+        "asset_class": "interactive_agent",
+        "intake_model": "live_listener",
+        "trigger_sources": ["direct_message"],
+        "return_paths": ["inline_reply"],
+        "user_overrides": {
+            "operator": {
+                "placement": "hosted",
+                "activation": "persistent",
+                "reply_mode": "interactive",
+            },
+            "asset": {
+                "asset_class": "interactive_agent",
+                "intake_model": "live_listener",
+                "trigger_sources": ["direct_message"],
+                "return_paths": ["inline_reply"],
+            },
+        },
+        "effective_state": "stopped",
+    }
+
+    annotated = gateway_core.annotate_runtime_health(snapshot)
+
+    assert annotated["placement"] == "hosted"
+    assert annotated["activation"] == "persistent"
+    assert annotated["reply_mode"] == "interactive"
+    assert annotated["mode"] == "LIVE"
+    assert annotated["reply"] == "REPLY"
+    assert annotated["asset_class"] == "interactive_agent"
+    assert annotated["intake_model"] == "live_listener"
+    assert annotated["return_paths"] == ["inline_reply"]
+    assert annotated["asset_type_label"] == "Live Listener"
+
+
+def test_evaluate_runtime_attestation_detects_binding_drift_and_creates_approval(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    registry = gateway_core.load_gateway_registry()
+    entry = {
+        "name": "docs-worker",
+        "agent_id": "agent-docs-1",
+        "runtime_type": "exec",
+        "exec_command": "python3 worker.py",
+        "workdir": str(tmp_path / "repo-a"),
+        "created_via": "cli",
+    }
+    gateway_core.ensure_local_asset_binding(registry, entry, created_via="cli", auto_approve=True)
+
+    drifted = dict(entry)
+    drifted["workdir"] = str(tmp_path / "repo-b")
+
+    attestation = gateway_core.evaluate_runtime_attestation(registry, drifted)
+    snapshot = gateway_core.annotate_runtime_health({**drifted, **attestation, "effective_state": "stopped"})
+
+    assert attestation["attestation_state"] == "drifted"
+    assert attestation["approval_state"] == "pending"
+    assert attestation["approval_id"]
+    assert registry["approvals"][0]["approval_kind"] == "binding_drift"
+    assert snapshot["presence"] == "BLOCKED"
+    assert snapshot["confidence"] == "BLOCKED"
+    assert snapshot["confidence_reason"] == "binding_drift"
+
+
+def test_evaluate_runtime_attestation_blocks_asset_mismatch(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    registry = gateway_core.load_gateway_registry()
+    entry = {
+        "name": "codex",
+        "agent_id": "agent-codex-1",
+        "runtime_type": "exec",
+        "exec_command": "python3 codex_bridge.py",
+        "workdir": str(tmp_path / "repo"),
+        "install_id": "install-1",
+        "created_via": "cli",
+    }
+    gateway_core.ensure_local_asset_binding(registry, entry, created_via="cli", auto_approve=True)
+
+    mismatched = dict(entry)
+    mismatched["agent_id"] = "agent-other-2"
+
+    attestation = gateway_core.evaluate_runtime_attestation(registry, mismatched)
+    snapshot = gateway_core.annotate_runtime_health({**mismatched, **attestation, "effective_state": "stopped"})
+
+    assert attestation["attestation_state"] == "blocked"
+    assert attestation["confidence_reason"] == "asset_mismatch"
+    assert snapshot["presence"] == "BLOCKED"
+    assert snapshot["confidence"] == "BLOCKED"
+
+
+def test_gateway_daemon_reconcile_blocks_drifted_runtime(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    registry = gateway_core.load_gateway_registry()
+    entry = {
+        "name": "drift-bot",
+        "agent_id": "agent-drift-1",
+        "space_id": "space-1",
+        "base_url": "https://paxai.app",
+        "runtime_type": "exec",
+        "exec_command": "python3 drift.py",
+        "workdir": str(tmp_path / "repo-a"),
+        "token_file": str(tmp_path / "token"),
+        "desired_state": "running",
+        "created_via": "cli",
+    }
+    Path(entry["token_file"]).write_text("axp_a_agent.secret")
+    gateway_core.ensure_local_asset_binding(registry, entry, created_via="cli", auto_approve=True)
+    entry["workdir"] = str(tmp_path / "repo-b")
+    registry["agents"] = [entry]
+
+    daemon = gateway_core.GatewayDaemon(client_factory=lambda **kwargs: _SharedRuntimeClient({}))
+    reconciled = daemon._reconcile_registry(registry, {"token": "axp_u_test.token"})
+    agent = reconciled["agents"][0]
+
+    assert agent["attestation_state"] == "drifted"
+    assert agent["approval_state"] == "pending"
+    assert agent["presence"] == "BLOCKED"
+    assert "drift-bot" not in daemon._runtimes
+
+
+def test_gateway_daemon_reconcile_blocks_hermes_without_repo(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    workdir = tmp_path / "workspace" / "ax-cli"
+    workdir.mkdir(parents=True)
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    monkeypatch.delenv("HERMES_REPO_PATH", raising=False)
+    monkeypatch.setattr(gateway_core.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+
+    registry = gateway_core.load_gateway_registry()
+    entry = {
+        "name": "hermes-2",
+        "agent_id": "agent-hermes-2",
+        "space_id": "space-1",
+        "base_url": "https://paxai.app",
+        "template_id": "hermes",
+        "runtime_type": "exec",
+        "exec_command": "python3 examples/hermes_sentinel/hermes_bridge.py",
+        "workdir": str(workdir),
+        "token_file": str(tmp_path / "token"),
+        "desired_state": "running",
+        "created_via": "cli",
+    }
+    Path(entry["token_file"]).write_text("axp_a_agent.secret")
+    gateway_core.ensure_local_asset_binding(registry, entry, created_via="cli", auto_approve=True)
+    registry["agents"] = [entry]
+
+    daemon = gateway_core.GatewayDaemon(client_factory=lambda **kwargs: _SharedRuntimeClient({}))
+    reconciled = daemon._reconcile_registry(registry, {"token": "axp_u_test.token", "base_url": "https://paxai.app"})
+    agent = reconciled["agents"][0]
+
+    assert daemon._runtimes == {}
+    assert agent["effective_state"] == "error"
+    assert agent["presence"] == "ERROR"
+    assert agent["confidence"] == "BLOCKED"
+    assert agent["confidence_reason"] == "setup_blocked"
+    assert "Hermes checkout not found" in str(agent["last_error"])
+    assert "Hermes checkout not found" in str(agent["confidence_detail"])
+
+
+def test_gateway_approvals_approve_updates_binding(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    registry = gateway_core.load_gateway_registry()
+    entry = {
+        "name": "approve-bot",
+        "agent_id": "agent-approve-1",
+        "runtime_type": "exec",
+        "exec_command": "python3 worker.py",
+        "workdir": str(tmp_path / "repo-a"),
+        "created_via": "cli",
+    }
+    gateway_core.ensure_local_asset_binding(registry, entry, created_via="cli", auto_approve=True)
+    drifted = dict(entry)
+    drifted["workdir"] = str(tmp_path / "repo-b")
+    attestation = gateway_core.evaluate_runtime_attestation(registry, drifted)
+    gateway_core.save_gateway_registry(registry)
+
+    result = runner.invoke(app, ["gateway", "approvals", "approve", attestation["approval_id"], "--scope", "gateway", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["approval"]["status"] == "approved"
+    assert payload["approval"]["decision_scope"] == "gateway"
+    stored = gateway_core.load_gateway_registry()
+    binding = gateway_core.find_binding(stored, install_id=entry["install_id"])
+    assert binding is not None
+    assert binding["path"] == str(Path(drifted["workdir"]).expanduser())
+    assert binding["approval_scope"] == "gateway"
+
+
+def test_gateway_approvals_deny_marks_request_rejected(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    registry = gateway_core.load_gateway_registry()
+    entry = {
+        "name": "deny-bot",
+        "agent_id": "agent-deny-1",
+        "runtime_type": "exec",
+        "exec_command": "python3 worker.py",
+        "workdir": str(tmp_path / "repo-a"),
+        "created_via": "cli",
+    }
+    gateway_core.ensure_local_asset_binding(registry, entry, created_via="cli", auto_approve=True)
+    drifted = dict(entry)
+    drifted["workdir"] = str(tmp_path / "repo-b")
+    attestation = gateway_core.evaluate_runtime_attestation(registry, drifted)
+    gateway_core.save_gateway_registry(registry)
+
+    result = runner.invoke(app, ["gateway", "approvals", "deny", attestation["approval_id"], "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["approval"]["status"] == "rejected"
+    stored = gateway_core.load_gateway_registry()
+    approval = next(item for item in stored["approvals"] if item["approval_id"] == attestation["approval_id"])
+    assert approval["status"] == "rejected"
 
 
 def test_sanitize_exec_env_strips_ax_credentials(monkeypatch):
@@ -477,6 +958,371 @@ def test_annotate_runtime_health_marks_stale_after_missed_heartbeat():
     assert snapshot["last_seen_age_seconds"] >= gateway_core.RUNTIME_STALE_AFTER_SECONDS
 
 
+def test_annotate_runtime_health_derives_identity_space_snapshot(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "space_name": "ax-cli-dev",
+            "username": "codex",
+        }
+    )
+    token_file = tmp_path / "identity.token"
+    token_file.write_text("axp_a_agent.secret")
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "identity-bot",
+            "agent_id": "agent-1",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "echo",
+            "credential_source": "gateway",
+            "token_file": str(token_file),
+            "desired_state": "running",
+            "effective_state": "running",
+            "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            "install_id": "inst-identity-1",
+        }
+    ]
+    gateway_core.ensure_gateway_identity_binding(registry, registry["agents"][0], session=gateway_core.load_gateway_session())
+
+    snapshot = gateway_core.annotate_runtime_health(registry["agents"][0], registry=registry)
+
+    assert snapshot["acting_agent_name"] == "identity-bot"
+    assert snapshot["environment_label"] == "prod"
+    assert snapshot["environment_status"] == "environment_allowed"
+    assert snapshot["active_space_id"] == "space-1"
+    assert snapshot["active_space_source"] == "gateway_binding"
+    assert snapshot["space_status"] == "active_allowed"
+    assert snapshot["identity_status"] == "verified"
+    assert snapshot["confidence"] == "HIGH"
+
+
+def test_annotate_runtime_health_blocks_environment_mismatch(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    token_file = tmp_path / "identity.token"
+    token_file.write_text("axp_a_agent.secret")
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "identity-bot",
+            "agent_id": "agent-1",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "echo",
+            "credential_source": "gateway",
+            "token_file": str(token_file),
+            "desired_state": "running",
+            "effective_state": "running",
+            "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            "install_id": "inst-identity-1",
+        }
+    ]
+    gateway_core.ensure_gateway_identity_binding(registry, registry["agents"][0])
+
+    snapshot = gateway_core.annotate_runtime_health(
+        {**registry["agents"][0], "base_url": "https://dev.paxai.app"},
+        registry=registry,
+    )
+
+    assert snapshot["environment_status"] == "environment_mismatch"
+    assert snapshot["presence"] == "BLOCKED"
+    assert snapshot["confidence"] == "BLOCKED"
+    assert snapshot["confidence_reason"] == "environment_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("input_snapshot", "expected"),
+    [
+        (
+            {
+                "template_id": "claude_code_channel",
+                "placement": "attached",
+                "activation": "attach_only",
+                "reply_mode": "interactive",
+                "effective_state": "stale",
+            },
+            {
+                "mode": "LIVE",
+                "presence": "STALE",
+                "reply": "REPLY",
+                "confidence": "LOW",
+                "reachability": "attach_required",
+            },
+        ),
+        (
+            {
+                "placement": "hosted",
+                "activation": "persistent",
+                "reply_mode": "interactive",
+                "effective_state": "stopped",
+            },
+            {
+                "mode": "LIVE",
+                "presence": "OFFLINE",
+                "reply": "REPLY",
+                "confidence": "LOW",
+                "reachability": "unavailable",
+            },
+        ),
+        (
+            {
+                "runtime_type": "inbox",
+                "placement": "mailbox",
+                "activation": "queue_worker",
+                "reply_mode": "summary_only",
+                "effective_state": "running",
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                "backlog_depth": 0,
+            },
+            {
+                "mode": "INBOX",
+                "presence": "IDLE",
+                "reply": "SUMMARY",
+                "confidence": "HIGH",
+                "reachability": "queue_available",
+            },
+        ),
+        (
+            {
+                "runtime_type": "inbox",
+                "placement": "mailbox",
+                "activation": "queue_worker",
+                "reply_mode": "summary_only",
+                "effective_state": "running",
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                "backlog_depth": 3,
+                "last_doctor_result": {
+                    "status": "failed",
+                    "summary": "Queue writable but worker smoke test failed.",
+                    "checks": [{"name": "test_claim", "status": "failed"}],
+                },
+            },
+            {
+                "mode": "INBOX",
+                "presence": "QUEUED",
+                "reply": "SUMMARY",
+                "confidence": "LOW",
+                "reachability": "queue_available",
+            },
+        ),
+        (
+            {
+                "template_id": "ollama",
+                "placement": "hosted",
+                "activation": "on_demand",
+                "reply_mode": "interactive",
+                "effective_state": "stopped",
+            },
+            {
+                "mode": "ON-DEMAND",
+                "presence": "IDLE",
+                "reply": "REPLY",
+                "confidence": "MEDIUM",
+                "reachability": "launch_available",
+            },
+        ),
+        (
+            {
+                "template_id": "hermes",
+                "effective_state": "error",
+                "reply_mode": "interactive",
+                "last_error": "missing repo",
+            },
+            {
+                "mode": "LIVE",
+                "presence": "ERROR",
+                "reply": "REPLY",
+                "confidence": "BLOCKED",
+                "reachability": "unavailable",
+            },
+        ),
+    ],
+)
+def test_annotate_runtime_health_derives_gateway_operator_model(input_snapshot, expected):
+    snapshot = gateway_core.annotate_runtime_health(input_snapshot)
+
+    assert snapshot["mode"] == expected["mode"]
+    assert snapshot["presence"] == expected["presence"]
+    assert snapshot["reply"] == expected["reply"]
+    assert snapshot["confidence"] == expected["confidence"]
+    assert snapshot["reachability"] == expected["reachability"]
+
+
+def test_annotate_runtime_health_prefers_doctor_summary_for_setup_error_detail():
+    snapshot = gateway_core.annotate_runtime_health(
+        {
+            "template_id": "hermes",
+            "effective_state": "error",
+            "last_reply_preview": "(stderr: ERROR: hermes-agent repo not found at /Users/jacob/hermes-agent. Set HERMES_REPO_PATH or clone hermes-agent.)",
+            "last_doctor_result": {
+                "status": "failed",
+                "summary": "Hermes checkout not found at /Users/jacob/hermes-agent.",
+                "checks": [{"name": "hermes_repo", "status": "failed"}],
+            },
+        }
+    )
+
+    assert snapshot["confidence"] == "BLOCKED"
+    assert snapshot["confidence_reason"] == "setup_blocked"
+    assert snapshot["confidence_detail"] == "Hermes checkout not found at /Users/jacob/hermes-agent."
+
+
+def test_hermes_setup_status_prefers_sibling_checkout(monkeypatch, tmp_path):
+    workdir = tmp_path / "workspace" / "ax-cli"
+    sibling = tmp_path / "workspace" / "hermes-agent"
+    workdir.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    monkeypatch.delenv("HERMES_REPO_PATH", raising=False)
+    monkeypatch.setattr(gateway_core.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+
+    status = gateway_core.hermes_setup_status({"template_id": "hermes", "workdir": str(workdir)})
+
+    assert status["ready"] is True
+    assert status["resolved_path"] == str(sibling)
+
+
+def test_sanitize_exec_env_sets_resolved_hermes_repo_path():
+    env = gateway_core.sanitize_exec_env(
+        "Gateway test OK.",
+        {
+            "agent_id": "agent-hermes-2",
+            "name": "hermes-2",
+            "runtime_type": "exec",
+            "hermes_repo_path": "/tmp/hermes-agent",
+        },
+    )
+
+    assert env["HERMES_REPO_PATH"] == "/tmp/hermes-agent"
+
+
+def test_sanitize_exec_env_sets_ollama_model_override():
+    env = gateway_core.sanitize_exec_env(
+        "Gateway test OK.",
+        {
+            "agent_id": "agent-ember-1",
+            "name": "ember",
+            "runtime_type": "exec",
+            "ollama_model": "gemma4:latest",
+        },
+    )
+
+    assert env["OLLAMA_MODEL"] == "gemma4:latest"
+
+
+def test_ollama_setup_status_recommends_recent_local_chat_model(monkeypatch):
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "models": [
+                    {
+                        "name": "nomic-embed-text:latest",
+                        "modified_at": "2026-01-06T21:04:28.576252397-08:00",
+                        "details": {"family": "nomic-bert", "families": ["nomic-bert"], "parameter_size": "137M"},
+                    },
+                    {
+                        "name": "nemotron-3-nano:latest",
+                        "modified_at": "2025-12-16T14:03:52.946489046-08:00",
+                        "details": {"family": "nemotron_h_moe", "families": ["nemotron_h_moe"], "parameter_size": "31.6B"},
+                    },
+                    {
+                        "name": "gemma4:latest",
+                        "modified_at": "2026-04-02T19:28:17.519867961-07:00",
+                        "details": {"family": "gemma4", "families": ["gemma4"], "parameter_size": "8.0B"},
+                    },
+                    {
+                        "name": "gpt-oss:120b-cloud",
+                        "modified_at": "2025-11-11T16:50:56.418111483-08:00",
+                        "remote_host": "https://ollama.com:443",
+                        "details": {"family": "gptoss", "families": ["gptoss"], "parameter_size": "116.8B"},
+                    },
+                ]
+            }
+
+    monkeypatch.setattr(gateway_core.httpx, "get", lambda *args, **kwargs: _FakeResponse())
+
+    status = gateway_core.ollama_setup_status()
+
+    assert status["server_reachable"] is True
+    assert status["recommended_model"] == "gemma4:latest"
+    assert status["available_models"] == [
+        "nomic-embed-text:latest",
+        "nemotron-3-nano:latest",
+        "gemma4:latest",
+        "gpt-oss:120b-cloud",
+    ]
+    assert status["local_models"] == [
+        "nomic-embed-text:latest",
+        "nemotron-3-nano:latest",
+        "gemma4:latest",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("input_snapshot", "expected"),
+    [
+        (
+            {
+                "template_id": "hermes",
+                "effective_state": "running",
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            },
+            {
+                "asset_class": "interactive_agent",
+                "intake_model": "live_listener",
+                "asset_type_label": "Live Listener",
+                "output_label": "Reply",
+                "telemetry_shape": "rich",
+            },
+        ),
+        (
+            {
+                "template_id": "ollama",
+                "effective_state": "stopped",
+            },
+            {
+                "asset_class": "interactive_agent",
+                "intake_model": "launch_on_send",
+                "asset_type_label": "On-Demand Agent",
+                "output_label": "Reply",
+                "telemetry_shape": "basic",
+            },
+        ),
+        (
+            {
+                "runtime_type": "inbox",
+                "template_id": "inbox",
+                "effective_state": "running",
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            },
+            {
+                "asset_class": "background_worker",
+                "intake_model": "queue_accept",
+                "asset_type_label": "Inbox Worker",
+                "output_label": "Summary",
+                "telemetry_shape": "basic",
+                "worker_model": "queue_drain",
+            },
+        ),
+    ],
+)
+def test_annotate_runtime_health_derives_asset_taxonomy_fields(input_snapshot, expected):
+    snapshot = gateway_core.annotate_runtime_health(input_snapshot)
+
+    for key, value in expected.items():
+        assert snapshot[key] == value
+    assert isinstance(snapshot["asset_descriptor"], dict)
+    assert snapshot["asset_descriptor"]["asset_class"] == expected["asset_class"]
+
+
 def test_listener_timeout_enters_reconnecting_state(tmp_path, monkeypatch):
     config_dir = tmp_path / "config"
     config_dir.mkdir()
@@ -569,6 +1415,408 @@ def test_gateway_watch_once_renders_dashboard(monkeypatch, tmp_path):
     assert "Recent Activity" in result.output
 
 
+def test_render_gateway_ui_page_contains_local_dashboard_shell():
+    page = gateway_cmd._render_gateway_ui_page(refresh_ms=2000)
+
+    assert "Gateway Control Plane" in page
+    assert "Agent Operated" in page
+    assert "/api/status" in page
+    assert "/api/templates" in page
+    assert "/api/agents/&lt;name&gt;" in page
+    assert "refreshMs = 2000" in page
+    assert "Gateway Agent Setup" in page
+    assert "gateway-agent-setup" in page
+    assert "Agent Type" in page
+    assert "Output" in page
+    assert "Advanced launch settings" in page
+    assert "Alerts" in page
+
+
+def test_gateway_templates_command_json():
+    result = runner.invoke(app, ["gateway", "templates", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    ids = [item["id"] for item in payload["templates"]]
+    assert ids[:4] == ["echo_test", "ollama", "hermes", "claude_code_channel"]
+    assert "inbox" not in ids
+    assert payload["count"] == 4
+    ollama = next(item for item in payload["templates"] if item["id"] == "ollama")
+    assert ollama["runtime_type"] == "exec"
+    assert ollama["launchable"] is True
+    assert ollama["asset_type_label"] == "On-Demand Agent"
+    assert ollama["output_label"] == "Reply"
+    assert ollama["setup_skill"] == "gateway-agent-setup"
+    assert ollama["setup_skill_path"].endswith("skills/gateway-agent-setup/SKILL.md")
+
+
+def test_gateway_templates_command_json_includes_ollama_catalog(monkeypatch):
+    monkeypatch.setattr(
+        gateway_cmd,
+        "ollama_setup_status",
+        lambda preferred_model=None: {
+            "server_reachable": True,
+            "recommended_model": "gemma4:latest",
+            "available_models": ["gemma4:latest", "nemotron-3-nano:latest"],
+            "local_models": ["gemma4:latest", "nemotron-3-nano:latest"],
+            "summary": "Ollama is reachable. Recommended model: gemma4:latest.",
+        },
+    )
+
+    result = runner.invoke(app, ["gateway", "templates", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    ollama = next(item for item in payload["templates"] if item["id"] == "ollama")
+    assert ollama["defaults"]["ollama_model"] == "gemma4:latest"
+    assert ollama["ollama_recommended_model"] == "gemma4:latest"
+    assert ollama["ollama_available_models"] == ["gemma4:latest", "nemotron-3-nano:latest"]
+
+
+def test_gateway_runtime_types_command_json():
+    result = runner.invoke(app, ["gateway", "runtime-types", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    ids = [item["id"] for item in payload["runtime_types"]]
+    assert ids == ["echo", "exec", "inbox"]
+    exec_type = next(item for item in payload["runtime_types"] if item["id"] == "exec")
+    assert exec_type["signals"]["activity"]
+    assert exec_type["examples"]
+
+
+def test_gateway_ui_handler_serves_status_and_agent_detail(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(gateway_core, "_scan_gateway_process_pids", lambda: [])
+    monkeypatch.setattr(gateway_core, "_scan_gateway_ui_process_pids", lambda: [])
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://dev.paxai.app",
+            "space_id": "space-1",
+            "username": "codex",
+        }
+    )
+    registry = gateway_core.load_gateway_registry()
+    registry["gateway"].update(
+        {
+            "gateway_id": "gw-ui-12345678",
+            "desired_state": "running",
+            "effective_state": "running",
+            "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    registry["agents"] = [
+        {
+            "name": "echo-bot",
+            "agent_id": "agent-1",
+            "space_id": "space-1",
+            "runtime_type": "echo",
+            "desired_state": "running",
+            "effective_state": "running",
+            "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            "last_reply_preview": "Echo: ping",
+            "token_file": "/tmp/echo-token",
+            "transport": "gateway",
+            "credential_source": "gateway",
+        }
+    ]
+    gateway_core.save_gateway_registry(registry)
+    gateway_core.record_gateway_activity("reply_sent", entry=registry["agents"][0], reply_preview="Echo: ping")
+
+    handler = gateway_cmd._build_gateway_ui_handler(activity_limit=5, refresh_ms=1500)
+    with closing(socket.socket()) as probe:
+        probe.bind(("127.0.0.1", 0))
+        host, port = probe.getsockname()
+    server = gateway_cmd._GatewayUiServer((host, port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with httpx.Client(base_url=f"http://{host}:{port}", timeout=2.0) as client:
+            status = client.get("/api/status")
+            assert status.status_code == 200
+            status_payload = status.json()
+            assert status_payload["gateway"]["gateway_id"] == "gw-ui-12345678"
+            assert status_payload["agents"][0]["name"] == "echo-bot"
+            assert status_payload["agents"][0]["mode"] == "LIVE"
+            assert status_payload["agents"][0]["presence"] == "IDLE"
+            assert status_payload["agents"][0]["reply"] == "REPLY"
+            assert status_payload["agents"][0]["confidence"] == "HIGH"
+            assert status_payload["summary"]["alert_count"] >= 1
+            assert status_payload["alerts"][0]["title"] == "Gateway daemon is stopped"
+
+            runtime_types = client.get("/api/runtime-types")
+            assert runtime_types.status_code == 200
+            runtime_payload = runtime_types.json()
+            assert runtime_payload["count"] == 3
+            assert runtime_payload["runtime_types"][1]["id"] == "exec"
+
+            templates = client.get("/api/templates")
+            assert templates.status_code == 200
+            template_payload = templates.json()
+            assert template_payload["templates"][0]["id"] == "echo_test"
+            assert template_payload["templates"][3]["launchable"] is False
+            assert template_payload["count"] == 4
+
+            detail = client.get("/api/agents/echo-bot")
+            assert detail.status_code == 200
+            detail_payload = detail.json()
+            assert detail_payload["agent"]["name"] == "echo-bot"
+            assert detail_payload["recent_activity"][0]["event"] == "reply_sent"
+
+            page = client.get("/")
+            assert page.status_code == 200
+            assert "Gateway Control Plane" in page.text
+            assert "refreshMs = 1500" in page.text
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_gateway_ui_handler_supports_agent_mutations(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://dev.paxai.app",
+            "space_id": "space-1",
+            "username": "codex",
+        }
+    )
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: _FakeUserClient())
+    monkeypatch.setattr(gateway_cmd, "_find_agent_in_space", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_cmd, "_create_agent_in_space", _fake_create_agent_in_space)
+    monkeypatch.setattr(gateway_cmd, "_polish_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_cmd, "_mint_agent_pat", lambda *args, **kwargs: ("axp_a_agent.secret", "mgmt"))
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    handler = gateway_cmd._build_gateway_ui_handler(activity_limit=5, refresh_ms=1500)
+    with closing(socket.socket()) as probe:
+        probe.bind(("127.0.0.1", 0))
+        host, port = probe.getsockname()
+    server = gateway_cmd._GatewayUiServer((host, port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with httpx.Client(base_url=f"http://{host}:{port}", timeout=2.0) as client:
+            created = client.post(
+                "/api/agents",
+                json={
+                    "name": "ui-bot",
+                    "template_id": "echo_test",
+                },
+            )
+            assert created.status_code == 201
+            assert created.json()["name"] == "ui-bot"
+            assert created.json()["template_label"] == "Echo (Test)"
+
+            updated = client.put(
+                "/api/agents/ui-bot",
+                json={
+                    "template_id": "ollama",
+                    "workdir": str(tmp_path),
+                    "exec_command": "python3 examples/gateway_ollama/ollama_bridge.py",
+                },
+            )
+            assert updated.status_code == 200
+            updated_payload = updated.json()
+            assert updated_payload["template_id"] == "ollama"
+            assert updated_payload["workdir"] == str(tmp_path)
+
+            stopped = client.post("/api/agents/ui-bot/stop", json={})
+            assert stopped.status_code == 200
+            assert stopped.json()["desired_state"] == "stopped"
+
+            started = client.post("/api/agents/ui-bot/start", json={})
+            assert started.status_code == 200
+            assert started.json()["desired_state"] == "running"
+
+            sent = client.post(
+                "/api/agents/ui-bot/send",
+                json={"content": "hello there", "to": "codex"},
+            )
+            assert sent.status_code == 201
+            sent_payload = sent.json()
+            assert sent_payload["agent"] == "ui-bot"
+            assert sent_payload["content"] == "@codex hello there"
+
+            tested = client.post("/api/agents/ui-bot/test", json={})
+            assert tested.status_code == 201
+            tested_payload = tested.json()
+            assert tested_payload["target_agent"] == "ui-bot"
+            assert tested_payload["author"] == "agent"
+            assert tested_payload["sender_agent"].startswith("switchboard-")
+            assert tested_payload["content"] == "@ui-bot Reply with exactly: Gateway test OK. Then mention which local model answered."
+
+            doctored = client.post("/api/agents/ui-bot/doctor", json={})
+            assert doctored.status_code == 201
+            doctor_payload = doctored.json()
+            assert doctor_payload["name"] == "ui-bot"
+            assert doctor_payload["status"] in {"passed", "warning", "failed"}
+
+            removed = client.delete("/api/agents/ui-bot")
+            assert removed.status_code == 200
+            assert removed.json()["name"] == "ui-bot"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_gateway_agents_update_changes_template_and_workdir(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "codex",
+        }
+    )
+    token_file = tmp_path / "echo.token"
+    token_file.write_text("axp_a_agent.secret")
+    registry = gateway_core.load_gateway_registry()
+    entry = {
+        "name": "northstar",
+        "agent_id": "agent-1",
+        "space_id": "space-1",
+        "base_url": "https://paxai.app",
+        "runtime_type": "echo",
+        "template_id": "echo_test",
+        "template_label": "Echo (Test)",
+        "desired_state": "running",
+        "effective_state": "running",
+        "token_file": str(token_file),
+        "transport": "gateway",
+        "credential_source": "gateway",
+        "created_via": "cli",
+    }
+    registry["agents"] = [entry]
+    gateway_core.ensure_local_asset_binding(registry, entry, created_via="cli", auto_approve=True)
+    gateway_core.ensure_gateway_identity_binding(registry, entry, session=gateway_core.load_gateway_session())
+    gateway_core.save_gateway_registry(registry)
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: _FakeUserClient())
+
+    result = runner.invoke(
+        app,
+        [
+            "gateway",
+            "agents",
+            "update",
+            "northstar",
+            "--template",
+            "ollama",
+            "--workdir",
+            str(tmp_path),
+            "--exec",
+            "python3 examples/gateway_ollama/ollama_bridge.py",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["template_id"] == "ollama"
+    assert payload["runtime_type"] == "exec"
+    assert payload["workdir"] == str(tmp_path)
+    stored = gateway_core.load_gateway_registry()["agents"][0]
+    assert stored["template_id"] == "ollama"
+    assert stored["workdir"] == str(tmp_path)
+
+
+def test_gateway_agents_add_ollama_persists_model_override(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "codex",
+        }
+    )
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: _FakeUserClient())
+    monkeypatch.setattr(gateway_cmd, "_find_agent_in_space", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_cmd, "_create_agent_in_space", _fake_create_agent_in_space)
+    monkeypatch.setattr(gateway_cmd, "_polish_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_cmd, "_mint_agent_pat", lambda *args, **kwargs: ("axp_a_agent.secret", "mgmt"))
+
+    result = runner.invoke(
+        app,
+        [
+            "gateway",
+            "agents",
+            "add",
+            "ember",
+            "--template",
+            "ollama",
+            "--ollama-model",
+            "gemma4:latest",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["template_id"] == "ollama"
+    assert payload["ollama_model"] == "gemma4:latest"
+    stored = gateway_core.load_gateway_registry()["agents"][0]
+    assert stored["ollama_model"] == "gemma4:latest"
+
+
+def test_gateway_agents_add_ollama_uses_recommended_model_when_unspecified(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "codex",
+        }
+    )
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: _FakeUserClient())
+    monkeypatch.setattr(gateway_cmd, "_find_agent_in_space", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_cmd, "_create_agent_in_space", _fake_create_agent_in_space)
+    monkeypatch.setattr(gateway_cmd, "_polish_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_cmd, "_mint_agent_pat", lambda *args, **kwargs: ("axp_a_agent.secret", "mgmt"))
+    monkeypatch.setattr(
+        gateway_cmd,
+        "ollama_setup_status",
+        lambda preferred_model=None: {
+            "recommended_model": "gemma4:latest",
+            "server_reachable": True,
+            "available_models": ["gemma4:latest"],
+            "local_models": ["gemma4:latest"],
+            "summary": "Ollama is reachable. Recommended model: gemma4:latest.",
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "gateway",
+            "agents",
+            "add",
+            "ember-default",
+            "--template",
+            "ollama",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["template_id"] == "ollama"
+    assert payload["ollama_model"] == "gemma4:latest"
+    stored = gateway_core.load_gateway_registry()["agents"][0]
+    assert stored["ollama_model"] == "gemma4:latest"
+
+
 def test_gateway_agents_show_json_filters_activity(monkeypatch, tmp_path):
     config_dir = tmp_path / "config"
     monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
@@ -657,3 +1905,237 @@ def test_gateway_agents_send_uses_managed_identity(monkeypatch, tmp_path):
     assert payload["message"]["metadata"]["gateway"]["sent_via"] == "gateway_cli"
     recent = gateway_core.load_recent_gateway_activity()
     assert recent[-1]["event"] == "manual_message_sent"
+
+
+def test_gateway_agents_send_blocks_identity_mismatch(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "codex",
+        }
+    )
+    token_file = tmp_path / "sender.token"
+    token_file.write_text("axp_a_agent.secret")
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "sender-bot",
+            "agent_id": "agent-1",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "inbox",
+            "desired_state": "running",
+            "effective_state": "running",
+            "token_file": str(token_file),
+            "transport": "gateway",
+            "credential_source": "gateway",
+            "install_id": "inst-sender-1",
+        }
+    ]
+    gateway_core.ensure_gateway_identity_binding(registry, registry["agents"][0], session=gateway_core.load_gateway_session())
+    registry["identity_bindings"][0]["acting_identity"]["agent_name"] = "night_owl"
+    gateway_core.save_gateway_registry(registry)
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    result = runner.invoke(app, ["gateway", "agents", "send", "sender-bot", "hello there", "--to", "codex", "--json"])
+
+    assert result.exit_code == 1, result.output
+    assert "identity_mismatch" in result.output.lower() or "mismatched acting identity" in result.output.lower()
+
+
+def test_gateway_agents_test_sends_gateway_authored_probe(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "codex",
+        }
+    )
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "echo-bot",
+            "agent_id": "agent-1",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "echo",
+            "template_id": "echo_test",
+            "desired_state": "running",
+            "effective_state": "running",
+            "transport": "gateway",
+            "credential_source": "gateway",
+        }
+    ]
+    gateway_core.save_gateway_registry(registry)
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: _FakeUserClient())
+    monkeypatch.setattr(gateway_cmd, "_find_agent_in_space", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_cmd, "_create_agent_in_space", _fake_create_agent_in_space)
+    monkeypatch.setattr(gateway_cmd, "_polish_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_cmd, "_mint_agent_pat", lambda *args, **kwargs: ("axp_a_agent.secret", "mgmt"))
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    result = runner.invoke(app, ["gateway", "agents", "test", "echo-bot", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["target_agent"] == "echo-bot"
+    assert payload["author"] == "agent"
+    assert payload["sender_agent"] == "switchboard-space1"
+    assert payload["recommended_prompt"] == "gateway test ping"
+    assert payload["content"] == "@echo-bot gateway test ping"
+    assert payload["message"]["metadata"]["gateway"]["sent_via"] == "gateway_test"
+    assert payload["message"]["metadata"]["gateway"]["test_author"] == "agent"
+    recent = gateway_core.load_recent_gateway_activity()
+    assert recent[-1]["event"] == "gateway_test_sent"
+
+
+def test_gateway_agents_test_can_send_as_user(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "codex",
+        }
+    )
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "echo-bot",
+            "agent_id": "agent-1",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "echo",
+            "template_id": "echo_test",
+            "desired_state": "running",
+            "effective_state": "running",
+            "transport": "gateway",
+            "credential_source": "gateway",
+        }
+    ]
+    gateway_core.save_gateway_registry(registry)
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: _FakeUserClient())
+
+    result = runner.invoke(app, ["gateway", "agents", "test", "echo-bot", "--author", "user", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["author"] == "user"
+    assert payload["sender_agent"] is None
+    assert payload["message"]["metadata"]["gateway"]["test_author"] == "user"
+
+
+def test_gateway_agents_doctor_persists_structured_result(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "codex",
+        }
+    )
+    token_file = tmp_path / "inbox.token"
+    token_file.write_text("axp_a_agent.secret")
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "docs-worker",
+            "agent_id": "agent-1",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "inbox",
+            "template_id": "inbox",
+            "desired_state": "running",
+            "effective_state": "stopped",
+            "token_file": str(token_file),
+            "transport": "gateway",
+            "credential_source": "gateway",
+        }
+    ]
+    gateway_core.save_gateway_registry(registry)
+
+    result = runner.invoke(app, ["gateway", "agents", "doctor", "docs-worker", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "warning"
+    check_names = [item["name"] for item in payload["checks"]]
+    assert "gateway_auth" in check_names
+    assert "queue_writable" in check_names
+    assert "worker_attached" in check_names
+    assert isinstance(payload["agent"]["last_doctor_result"], dict)
+    assert payload["agent"]["last_doctor_result"]["status"] == "warning"
+    assert payload["agent"]["last_doctor_result"]["checks"]
+    assert payload["agent"]["last_successful_doctor_at"]
+
+    stored = gateway_core.load_gateway_registry()["agents"][0]
+    assert stored["last_doctor_result"]["status"] == "warning"
+    assert stored["last_successful_doctor_at"]
+
+
+def test_gateway_status_payload_surfaces_alerts(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "codex",
+        }
+    )
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "stale-bot",
+            "agent_id": "agent-1",
+            "space_id": "space-1",
+            "runtime_type": "exec",
+            "desired_state": "running",
+            "effective_state": "running",
+            "last_seen_at": (datetime.now(timezone.utc) - timedelta(seconds=gateway_core.RUNTIME_STALE_AFTER_SECONDS + 5)).isoformat(),
+            "backlog_depth": 2,
+            "last_error": None,
+            "token_file": "/tmp/stale-token",
+        },
+        {
+            "name": "broken-bot",
+            "agent_id": "agent-2",
+            "space_id": "space-1",
+            "runtime_type": "exec",
+            "desired_state": "running",
+            "effective_state": "error",
+            "last_error": "bridge crashed",
+            "token_file": "/tmp/broken-token",
+        },
+        {
+            "name": "setup-bot",
+            "agent_id": "agent-3",
+            "space_id": "space-1",
+            "runtime_type": "exec",
+            "desired_state": "running",
+            "effective_state": "running",
+            "last_reply_preview": "(stderr: ERROR: hermes-agent repo not found at /Users/jacob/hermes-agent.)",
+            "token_file": "/tmp/setup-token",
+        },
+    ]
+    gateway_core.save_gateway_registry(registry)
+
+    payload = gateway_cmd._status_payload(activity_limit=5)
+
+    assert payload["summary"]["alert_count"] >= 2
+    titles = [item["title"] for item in payload["alerts"]]
+    assert any("@stale-bot looks stale" == title for title in titles)
+    assert any("@broken-bot hit an error" == title for title in titles)
+    assert any("@setup-bot has a runtime setup error" == title for title in titles)
