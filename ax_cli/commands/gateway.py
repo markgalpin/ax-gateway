@@ -203,6 +203,18 @@ def _validate_runtime_registration(runtime_type: str, exec_cmd: str | None) -> N
         raise ValueError("This runtime does not accept --exec.")
 
 
+def _normalize_timeout_seconds(timeout_seconds: int | None) -> int | None:
+    if timeout_seconds is None:
+        return None
+    try:
+        normalized = int(timeout_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Timeout must be a whole number of seconds.") from exc
+    if normalized < 1:
+        raise ValueError("Timeout must be at least 1 second.")
+    return normalized
+
+
 def _register_managed_agent(
     *,
     name: str,
@@ -215,6 +227,7 @@ def _register_managed_agent(
     audience: str = "both",
     description: str | None = None,
     model: str | None = None,
+    timeout_seconds: int | None = None,
     start: bool = True,
 ) -> dict:
     name = name.strip()
@@ -241,6 +254,7 @@ def _register_managed_agent(
     if template_effective_id == "ollama" and not normalized_ollama_model:
         normalized_ollama_model = str(ollama_setup_status().get("recommended_model") or "").strip() or None
     _validate_runtime_registration(runtime_type, exec_cmd)
+    timeout_effective = _normalize_timeout_seconds(timeout_seconds)
 
     session = _load_gateway_session_or_exit()
     selected_space = space_id or session.get("space_id")
@@ -289,6 +303,7 @@ def _register_managed_agent(
             "exec_command": exec_cmd,
             "workdir": workdir,
             "ollama_model": normalized_ollama_model,
+            "timeout_seconds": timeout_effective,
             "token_file": str(token_file),
             "desired_state": "running" if start else "stopped",
             "effective_state": "stopped",
@@ -334,6 +349,7 @@ def _update_managed_agent(
     ollama_model: str | object = _UNSET,
     description: str | None = None,
     model: str | None = None,
+    timeout_seconds: int | object = _UNSET,
     desired_state: str | None = None,
 ) -> dict:
     name = name.strip()
@@ -399,6 +415,8 @@ def _update_managed_agent(
         if normalized_desired not in {"running", "stopped"}:
             raise ValueError("Desired state must be running or stopped.")
         entry["desired_state"] = normalized_desired
+    if timeout_seconds is not _UNSET:
+        entry["timeout_seconds"] = _normalize_timeout_seconds(timeout_seconds)  # type: ignore[arg-type]
 
     session = _load_gateway_session_or_exit()
     if description or model:
@@ -444,6 +462,7 @@ def _update_managed_agent(
         workdir=workdir_effective,
         exec_command=exec_effective,
         desired_state=entry.get("desired_state"),
+        timeout_seconds=entry.get("timeout_seconds"),
     )
     return annotate_runtime_health(entry, registry=registry)
 
@@ -3043,6 +3062,7 @@ def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
                         audience=str(body.get("audience") or "both"),
                         description=str(body.get("description") or "").strip() or None,
                         model=str(body.get("model") or "").strip() or None,
+                        timeout_seconds=body.get("timeout_seconds", body.get("timeout")),
                         start=bool(body.get("start", True)),
                     )
                     _write_json_response(self, payload, status=HTTPStatus.CREATED)
@@ -3111,6 +3131,9 @@ def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
                         ollama_model=str(body.get("ollama_model") or "") if "ollama_model" in body else _UNSET,
                         description=str(body.get("description") or "").strip() or None,
                         model=str(body.get("model") or "").strip() or None,
+                        timeout_seconds=body.get("timeout_seconds", body.get("timeout"))
+                        if "timeout_seconds" in body or "timeout" in body
+                        else _UNSET,
                         desired_state=str(body.get("desired_state") or "").strip() or None,
                     )
                     _write_json_response(self, payload)
@@ -3215,9 +3238,15 @@ def _render_agent_detail(entry: dict, *, activity: list[dict]) -> Group:
     overview.add_row(
         "Phase", str(entry.get("current_status") or "-"), "Activity", str(entry.get("current_activity") or "-")
     )
-    overview.add_row("Tool", str(entry.get("current_tool") or "-"), "Adapter", str(entry.get("runtime_type") or "-"))
     overview.add_row(
-        "Cred Source", str(entry.get("credential_source") or "-"), "Space", str(entry.get("space_id") or "-")
+        "Tool",
+        str(entry.get("current_tool") or "-"),
+        "Timeout",
+        f"{entry.get('timeout_seconds')}s" if entry.get("timeout_seconds") else "-",
+    )
+    overview.add_row("Adapter", str(entry.get("runtime_type") or "-"), "Space", str(entry.get("space_id") or "-"))
+    overview.add_row(
+        "Cred Source", str(entry.get("credential_source") or "-"), "Token", str(entry.get("token_file") or "-")
     )
     overview.add_row(
         "Agent ID", str(entry.get("agent_id") or "-"), "Last Reply", str(entry.get("last_reply_preview") or "-")
@@ -3905,6 +3934,9 @@ def add_agent(
     audience: str = typer.Option("both", "--audience", help="Minted PAT audience"),
     description: str = typer.Option(None, "--description", help="Create/update description"),
     model: str = typer.Option(None, "--model", help="Create/update model"),
+    timeout_seconds: int = typer.Option(
+        None, "--timeout", "--timeout-seconds", help="Max seconds a runtime may process one message"
+    ),
     start: bool = typer.Option(True, "--start/--no-start", help="Desired running state after registration"),
     as_json: bool = JSON_OPTION,
 ):
@@ -3922,6 +3954,7 @@ def add_agent(
             audience=audience,
             description=description,
             model=model,
+            timeout_seconds=timeout_seconds,
             start=start,
         )
     except (ValueError, LookupError) as exc:
@@ -3937,6 +3970,8 @@ def add_agent(
         if entry.get("asset_type_label"):
             err_console.print(f"  asset = {entry['asset_type_label']}")
         err_console.print(f"  desired_state = {entry['desired_state']}")
+        if entry.get("timeout_seconds"):
+            err_console.print(f"  timeout = {entry.get('timeout_seconds')}s")
         err_console.print(f"  token_file = {entry['token_file']}")
 
 
@@ -3954,6 +3989,9 @@ def update_agent(
     ollama_model: str = typer.Option(None, "--ollama-model", help="Ollama model override for the Ollama template"),
     description: str = typer.Option(None, "--description", help="Update platform agent description"),
     model: str = typer.Option(None, "--model", help="Update platform agent model"),
+    timeout_seconds: int = typer.Option(
+        None, "--timeout", "--timeout-seconds", help="Max seconds a runtime may process one message"
+    ),
     desired_state: str = typer.Option(None, "--desired-state", help="running | stopped"),
     as_json: bool = JSON_OPTION,
 ):
@@ -3968,6 +4006,7 @@ def update_agent(
             ollama_model=ollama_model if ollama_model is not None else _UNSET,
             description=description,
             model=model,
+            timeout_seconds=timeout_seconds if timeout_seconds is not None else _UNSET,
             desired_state=desired_state,
         )
     except (LookupError, ValueError) as exc:
@@ -3980,6 +4019,8 @@ def update_agent(
     err_console.print(f"[green]Managed agent updated:[/green] @{name}")
     err_console.print(f"  type = {entry.get('template_label') or entry.get('runtime_type')}")
     err_console.print(f"  desired_state = {entry.get('desired_state')}")
+    if entry.get("timeout_seconds"):
+        err_console.print(f"  timeout = {entry.get('timeout_seconds')}s")
 
 
 @agents_app.command("list")
