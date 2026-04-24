@@ -483,17 +483,19 @@ def test_gateway_agents_add_mints_token_and_writes_registry(monkeypatch, tmp_pat
     monkeypatch.setattr(gateway_cmd, "_polish_metadata", lambda *args, **kwargs: None)
     monkeypatch.setattr(gateway_cmd, "_mint_agent_pat", lambda *args, **kwargs: ("axp_a_agent.secret", "mgmt"))
 
-    result = runner.invoke(app, ["gateway", "agents", "add", "echo-bot", "--type", "echo", "--json"])
+    result = runner.invoke(app, ["gateway", "agents", "add", "echo-bot", "--type", "echo", "--timeout", "42", "--json"])
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["name"] == "echo-bot"
     assert payload["runtime_type"] == "echo"
+    assert payload["timeout_seconds"] == 42
     assert payload["desired_state"] == "running"
     assert payload["credential_source"] == "gateway"
     assert payload["transport"] == "gateway"
     registry = gateway_core.load_gateway_registry()
     assert registry["agents"][0]["name"] == "echo-bot"
+    assert registry["agents"][0]["timeout_seconds"] == 42
     assert registry["bindings"][0]["asset_id"] == "agent-1"
     assert registry["bindings"][0]["approved_state"] == "approved"
     assert registry["agents"][0]["install_id"] == registry["bindings"][0]["install_id"]
@@ -967,6 +969,65 @@ print("done", flush=True)
     assert "message_claimed" in events
     assert "tool_started" in events
     assert "tool_finished" in events
+
+
+def test_managed_exec_runtime_marks_message_timed_out(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    token_file = tmp_path / "token"
+    token_file.write_text("axp_a_agent.secret")
+    script = tmp_path / "slow_bridge.py"
+    script.write_text(
+        """
+import time
+
+time.sleep(5)
+print("too late", flush=True)
+""".strip()
+    )
+    payload = {
+        "id": "msg-1",
+        "content": "@exec-bot run slow job",
+        "author": {"id": "user-1", "name": "madtank", "type": "user"},
+        "mentions": ["exec-bot"],
+    }
+    shared = _SharedRuntimeClient(payload)
+
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "exec-bot",
+            "agent_id": "agent-1",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "exec",
+            "exec_command": f"{sys.executable} {script}",
+            "timeout_seconds": 1,
+            "token_file": str(token_file),
+        },
+        client_factory=lambda **kwargs: shared,
+    )
+
+    runtime.start()
+    deadline = time.time() + 4.0
+    while time.time() < deadline and not any(row.get("reason") == "runtime_timeout" for row in shared.processing):
+        time.sleep(0.05)
+    snapshot = runtime.snapshot()
+    runtime.stop()
+
+    assert not shared.sent
+    assert [row["status"] for row in shared.processing] == ["started", "processing", "error"]
+    timeout_status = shared.processing[-1]
+    assert timeout_status["activity"] == "Timed out after 1s"
+    assert timeout_status["reason"] == "runtime_timeout"
+    assert timeout_status["detail"] == {"timeout_seconds": 1, "runtime_type": "exec"}
+    assert "timed out after 1s" in timeout_status["error_message"]
+    assert snapshot["current_status"] == "error"
+    assert snapshot["current_activity"] == "Timed out after 1s"
+    recent = gateway_core.load_recent_gateway_activity()
+    events = [row["event"] for row in recent]
+    assert "runtime_timeout" in events
+    assert "reply_sent" not in events
 
 
 def test_managed_sentinel_cli_runtime_resumes_agent_session(tmp_path, monkeypatch):
@@ -2038,6 +2099,8 @@ def test_gateway_agents_update_changes_template_and_workdir(monkeypatch, tmp_pat
             str(tmp_path),
             "--exec",
             "python3 examples/gateway_ollama/ollama_bridge.py",
+            "--timeout",
+            "120",
             "--json",
         ],
     )
@@ -2047,9 +2110,11 @@ def test_gateway_agents_update_changes_template_and_workdir(monkeypatch, tmp_pat
     assert payload["template_id"] == "ollama"
     assert payload["runtime_type"] == "exec"
     assert payload["workdir"] == str(tmp_path)
+    assert payload["timeout_seconds"] == 120
     stored = gateway_core.load_gateway_registry()["agents"][0]
     assert stored["template_id"] == "ollama"
     assert stored["workdir"] == str(tmp_path)
+    assert stored["timeout_seconds"] == 120
     registry_after = gateway_core.load_gateway_registry()
     binding = registry_after["bindings"][0]
     assert binding["launch_spec"]["runtime_type"] == "exec"

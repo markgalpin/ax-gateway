@@ -139,12 +139,17 @@ Use command bridges for simple adapters, demos, and smoke tests.
 ax gateway agents add echo-bot --type echo
 ax gateway agents add probe \
   --type exec \
-  --exec "python3 examples/gateway_probe/probe_bridge.py"
+  --exec "python3 examples/gateway_probe/probe_bridge.py" \
+  --timeout 120
 ```
 
 Command bridges are valuable for probes and simple integrations. They are not
 the preferred shape for coding sentinels because a per-message command loses
 important in-process state unless the bridge explicitly persists and resumes it.
+Use `--timeout` / `--timeout-seconds` to cap per-message runtime work. On
+timeout, Gateway publishes a terminal `error` processing signal with
+`reason=runtime_timeout` and does not mark the message completed or send a fake
+success reply.
 
 ## Signal Contract
 
@@ -159,7 +164,7 @@ Minimum signals:
   when available.
 - `completed`: the runtime finished and either replied or explicitly queued the
   work.
-- `error`: the runtime failed and the operator should inspect logs.
+- `error`: the runtime failed or timed out and the operator should inspect logs.
 
 Hermes sentinels should preserve the old behavior from `claude_agent_v2.py`:
 tool callbacks update the activity bubble with real work, such as reading a

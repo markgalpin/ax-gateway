@@ -46,6 +46,7 @@ SEEN_IDS_MAX = 500
 DEFAULT_QUEUE_SIZE = 50
 DEFAULT_ACTIVITY_LIMIT = 10
 DEFAULT_HANDLER_TIMEOUT_SECONDS = 900
+MIN_HANDLER_TIMEOUT_SECONDS = 1
 SSE_IDLE_TIMEOUT_SECONDS = 45.0
 RUNTIME_STALE_AFTER_SECONDS = 75.0
 GATEWAY_EVENT_PREFIX = "AX_GATEWAY_EVENT "
@@ -63,6 +64,18 @@ ENV_DENYLIST = {
     "AX_USER_ENV",
     "AX_USER_TOKEN",
 }
+
+
+class GatewayRuntimeTimeoutError(TimeoutError):
+    """Raised when a managed runtime exceeds its per-message timeout."""
+
+    def __init__(self, timeout_seconds: int, *, runtime_type: str | None = None) -> None:
+        self.timeout_seconds = timeout_seconds
+        self.runtime_type = runtime_type
+        label = f" {runtime_type}" if runtime_type else ""
+        super().__init__(f"Gateway{label} runtime timed out after {timeout_seconds}s.")
+
+
 _ACTIVITY_LOCK = threading.Lock()
 _GATEWAY_PROCESS_RE = re.compile(
     r"(?:uv\s+run\s+ax\s+gateway\s+run|(?:^|\s).+?/ax(?:ctl)?\s+gateway\s+run(?:\s|$)|-m\s+ax_cli\.main\s+gateway\s+run(?:\s|$))"
@@ -2749,6 +2762,18 @@ def _hash_tool_arguments(arguments: dict[str, Any] | None) -> str | None:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def runtime_timeout_seconds(entry: dict[str, Any]) -> int:
+    """Resolve a safe per-message runtime timeout for Gateway-managed agents."""
+    raw_value = entry.get("timeout_seconds")
+    if raw_value is None:
+        raw_value = entry.get("timeout")
+    try:
+        timeout = int(raw_value) if raw_value is not None else DEFAULT_HANDLER_TIMEOUT_SECONDS
+    except (TypeError, ValueError):
+        timeout = DEFAULT_HANDLER_TIMEOUT_SECONDS
+    return max(MIN_HANDLER_TIMEOUT_SECONDS, timeout)
+
+
 def _run_exec_handler(
     command: str,
     prompt: str,
@@ -2756,6 +2781,7 @@ def _run_exec_handler(
     *,
     message_id: str | None = None,
     space_id: str | None = None,
+    timeout_seconds: int | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     argv = [*shlex.split(command), prompt]
@@ -2805,9 +2831,10 @@ def _run_exec_handler(
     stdout_thread.start()
     stderr_thread.start()
 
+    timeout_seconds = max(MIN_HANDLER_TIMEOUT_SECONDS, int(timeout_seconds or runtime_timeout_seconds(entry)))
     timed_out = False
     try:
-        process.wait(timeout=DEFAULT_HANDLER_TIMEOUT_SECONDS)
+        process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
         process.kill()
@@ -2820,7 +2847,7 @@ def _run_exec_handler(
             process.stderr.close()
 
     if timed_out:
-        return f"(handler timed out after {DEFAULT_HANDLER_TIMEOUT_SECONDS}s)"
+        raise GatewayRuntimeTimeoutError(timeout_seconds, runtime_type="exec")
 
     output = "".join(stdout_lines).strip()
     stderr = "".join(stderr_lines).strip()
@@ -3782,9 +3809,7 @@ class ManagedAgentRuntime:
         new_session_id: str | None = None
         last_activity_time = time.time()
         exit_reason = "done"
-        timeout_seconds = int(
-            self.entry.get("timeout_seconds") or self.entry.get("timeout") or DEFAULT_HANDLER_TIMEOUT_SECONDS
-        )
+        timeout_seconds = runtime_timeout_seconds(self.entry)
         finished = threading.Event()
 
         def _consume_stderr() -> None:
@@ -3896,7 +3921,7 @@ class ManagedAgentRuntime:
         final = accumulated_text.strip()
         stderr = "".join(stderr_lines).strip()
         if exit_reason == "timeout":
-            return final or f"Timed out after {timeout_seconds}s with no output."
+            raise GatewayRuntimeTimeoutError(timeout_seconds, runtime_type=runtime_name)
         if exit_reason == "crashed":
             if final:
                 return final
@@ -3973,6 +3998,7 @@ class ManagedAgentRuntime:
                 self.entry,
                 message_id=message_id or None,
                 space_id=self.space_id,
+                timeout_seconds=runtime_timeout_seconds(self.entry),
                 on_event=lambda event: self._handle_exec_event(event, message_id=message_id),
             )
         raise ValueError(f"Unsupported runtime_type: {runtime_type}")
@@ -4072,6 +4098,33 @@ class ManagedAgentRuntime:
                     last_work_completed_at=_now_iso(),
                     backlog_depth=self._queue.qsize(),
                 )
+            except GatewayRuntimeTimeoutError as exc:
+                activity = f"Timed out after {exc.timeout_seconds}s"
+                self._update_state(
+                    current_status="error",
+                    current_activity=activity,
+                    current_tool=None,
+                    current_tool_call_id=None,
+                    last_error=str(exc)[:400],
+                    backlog_depth=self._queue.qsize(),
+                )
+                if message_id:
+                    self._publish_processing_status(
+                        message_id,
+                        "error",
+                        activity=activity,
+                        reason="runtime_timeout",
+                        error_message=str(exc)[:400],
+                        detail={"timeout_seconds": exc.timeout_seconds, "runtime_type": exc.runtime_type},
+                    )
+                record_gateway_activity(
+                    "runtime_timeout",
+                    entry=self.entry,
+                    message_id=message_id or None,
+                    timeout_seconds=exc.timeout_seconds,
+                    runtime_type=exc.runtime_type,
+                )
+                self._log(f"worker timeout: {exc}")
             except Exception as exc:
                 self._update_state(
                     current_status="error",
