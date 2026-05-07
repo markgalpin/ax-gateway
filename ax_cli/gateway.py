@@ -5813,6 +5813,22 @@ class GatewayDaemon:
             if not str(entry.get("install_id") or "").strip():
                 entry["install_id"] = str(uuid.uuid4())
 
+            # Hidden + archived entries are out-of-roster: stop any runtime
+            # we may have started for them and skip the heavy per-agent work
+            # (identity binding refresh, attestation eval, runtime reconcile).
+            # They stay in the registry for the UI but the daemon won't talk
+            # to paxai.app on their behalf — that's the difference between
+            # "hidden" and "active". Unhide / restore reverts lifecycle_phase
+            # to "active" and the next tick processes them normally.
+            phase = str(entry.get("lifecycle_phase") or "active").strip().lower()
+            if phase in {"hidden", "archived"}:
+                name = str(entry.get("name") or "")
+                runtime = self._runtimes.get(name)
+                if runtime is not None:
+                    runtime.stop()
+                    self._runtimes.pop(name, None)
+                continue
+
             asset_id = _asset_id_for_entry(entry)
             existing_binding = (
                 find_binding(registry, install_id=str(entry.get("install_id") or "").strip()) if asset_id else None
@@ -5962,10 +5978,12 @@ class GatewayDaemon:
             if phase not in _LIFECYCLE_PHASES:
                 phase = "active"
 
-            # Archived is sticky — explicit archive already signaled upstream,
-            # don't double-signal. Hide/unhide are operator-only and the sweep
-            # never touches lifecycle_phase, so no transition logic here.
-            if phase == "archived":
+            # Out-of-roster phases (archived, hidden) get no upstream traffic
+            # from the sweep. Archive already signaled upstream once; hidden
+            # is operator-driven "remove from runtime" and shouldn't keep
+            # heartbeating to paxai.app while the operator has taken the
+            # agent out of the active set.
+            if phase in {"archived", "hidden"}:
                 continue
 
             # Upstream signal on liveness delta. Sticky liveness rate-limits.

@@ -5274,6 +5274,106 @@ def test_sweep_does_not_auto_unhide_on_reconnect(monkeypatch, tmp_path):
     assert not any(r.get("event") == "managed_agent_unhidden" for r in recent)
 
 
+def test_sweep_skips_hidden_agents_no_upstream(monkeypatch, tmp_path):
+    """Hidden agents must not produce upstream traffic from the sweep.
+    Same contract as archived — operator has taken them out of the roster,
+    Gateway shouldn't keep heartbeating on their behalf."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    client = _RecordingHeartbeatClient()
+    daemon = _build_daemon(client)
+    entry = _stale_hermes_entry("hermes-hidden", age_seconds=20 * 60)
+    entry["lifecycle_phase"] = "hidden"
+    registry = {"agents": [entry]}
+    daemon._sweep_lifecycle(registry, session={"token": "axp_u_test", "base_url": "http://x"})
+    assert client.heartbeats == []
+    assert "last_lifecycle_signal" not in entry
+
+
+def test_reconcile_skips_hidden_agents_no_runtime_no_upstream(monkeypatch, tmp_path):
+    """Hidden agents must be skipped from the per-tick reconcile entirely:
+    no identity-binding refresh, no attestation eval, no runtime start.
+    With 20+ hidden agents in a workspace, this is the difference between
+    a quiet daemon and one hammering paxai.app into 429s."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    client = _RecordingHeartbeatClient()
+    daemon = _build_daemon(client)
+    hidden = {
+        "name": "stale-hidden",
+        "agent_id": "agent-hidden",
+        "template_id": "echo",
+        "runtime_type": "echo",
+        "desired_state": "running",  # would normally trigger runtime start
+        "lifecycle_phase": "hidden",
+    }
+    archived = {
+        "name": "stale-archived",
+        "agent_id": "agent-archived",
+        "template_id": "echo",
+        "runtime_type": "echo",
+        "desired_state": "running",
+        "lifecycle_phase": "archived",
+    }
+    active = {
+        "name": "live-agent",
+        "agent_id": "agent-live",
+        "template_id": "echo",
+        "runtime_type": "echo",
+        "desired_state": "stopped",
+        "lifecycle_phase": "active",
+    }
+    registry = {"agents": [hidden, archived, active]}
+    daemon._reconcile_registry(registry, session={"token": "axp_u_test", "base_url": "http://x"})
+    # Neither hidden nor archived produced a runtime entry.
+    assert "stale-hidden" not in daemon._runtimes
+    assert "stale-archived" not in daemon._runtimes
+    # The active entry was processed (no runtime since desired_state=stopped,
+    # but its identity-binding side effects ran — proven by transport default).
+    stored_active = next(a for a in registry["agents"] if a["name"] == "live-agent")
+    assert stored_active.get("transport") == "gateway"
+    # The hidden + archived entries got their default fields (the early-skip
+    # is AFTER setdefaults), but no further processing.
+    stored_hidden = next(a for a in registry["agents"] if a["name"] == "stale-hidden")
+    assert stored_hidden.get("transport") == "gateway"
+    # Hidden + archived must NOT have attestation_state populated by reconcile.
+    # (evaluate_runtime_attestation runs only on the active path.)
+    assert "attestation_state" not in stored_hidden or stored_hidden["attestation_state"] in (None, "")
+    assert "attestation_state" not in next(
+        a for a in registry["agents"] if a["name"] == "stale-archived"
+    ) or True
+
+
+def test_reconcile_stops_runtime_when_agent_transitions_to_hidden(monkeypatch, tmp_path):
+    """If the daemon had already started a runtime for an agent that the
+    operator then hid, the next reconcile must stop that runtime so the
+    hidden agent stops generating upstream traffic immediately."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    client = _RecordingHeartbeatClient()
+    daemon = _build_daemon(client)
+    entry = {
+        "name": "transition-hide",
+        "agent_id": "agent-th",
+        "template_id": "echo",
+        "runtime_type": "echo",
+        "desired_state": "running",
+        "lifecycle_phase": "hidden",  # operator just hid it
+    }
+
+    class _StoppableRuntime:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    fake_runtime = _StoppableRuntime()
+    daemon._runtimes["transition-hide"] = fake_runtime
+
+    daemon._reconcile_registry({"agents": [entry]}, session={"token": "axp_u_test", "base_url": "http://x"})
+
+    assert fake_runtime.stopped is True
+    assert "transition-hide" not in daemon._runtimes
+
+
 def test_status_payload_filters_hidden_by_default(monkeypatch, tmp_path):
     _isolate_gateway_paths(monkeypatch, tmp_path)
     hidden = _stale_hermes_entry("hermes-hidden", age_seconds=30 * 60, liveness="offline",

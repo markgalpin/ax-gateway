@@ -691,7 +691,12 @@
 
     function knownSpaces() {
       const map = new Map();
-      if (state.sessionSpaceId) {
+      // Only seed authoritative candidates when we actually have a name. A
+      // null sessionSpaceName paired with authoritative=true would lock the
+      // UUID in as the displayed label and block the spaces-list refresh
+      // from overwriting it (regression hit when a brand-new space hasn't
+      // been hydrated into session yet).
+      if (state.sessionSpaceId && state.sessionSpaceName) {
         addSpaceCandidate(map, state.sessionSpaceId, state.sessionSpaceName, { authoritative: true });
       }
       for (const space of state.spaces || []) {
@@ -699,7 +704,7 @@
       }
       for (const agent of state.agents || []) {
         const agentSpaceId = String(agent.space_id || agent.default_space_id || agent.active_space_id || "").trim();
-        if (agentSpaceId === state.sessionSpaceId) {
+        if (agentSpaceId === state.sessionSpaceId && state.sessionSpaceName) {
           addSpaceCandidate(map, agentSpaceId, state.sessionSpaceName, { authoritative: true });
         } else {
           addSpaceCandidate(map, agentSpaceId, agent.space_name || agent.default_space_name || agent.active_space_name);
