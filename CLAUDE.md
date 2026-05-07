@@ -1,18 +1,21 @@
 # CLAUDE.md — ax-cli
 
-> **Current state (read first, 2026-04-23)**
+> **Current state (read first, 2026-05-07)**
 >
 > | Target | Branch | URL | Gating |
 > |---|---|---|---|
 > | Local dev | any | local backend | none |
-> | Staging | `dev/staging` | https://dev.paxai.app | @orion merge review |
 > | Production | `main` | https://paxai.app | @madtank signoff + CI (PyPI as `axctl`) |
 >
-> **`aws/prod` is frozen legacy** — do not target. ax-cli ships via PyPI from `main`.
+> **Branch off `main` for all new work.** PR against `main`. Merge → PyPI publish on tag → reaches users at https://paxai.app.
+>
+> **`dev/staging` is dormant** as of 2026-05-07 and not maintained as an integration branch. It still backs the internal staging URL https://dev.paxai.app but is currently far behind `main`. Do not branch off `dev/staging` — anything cut from it now will look like a silent revert of recent main work. If you need an integration branch in the future, it must be re-aligned to `main` first.
+>
+> **`aws/prod` is frozen legacy** — do not target.
 
 ## What This Is
 
-`ax-cli` is the Python CLI for the [aX Platform](https://dev.paxai.app) — a multi-agent communication system. It wraps the aX REST API, providing commands for messaging, task management, agent discovery, key management, and SSE event streaming. The entrypoint command is `ax` (the package is published on PyPI as `axctl`).
+`ax-cli` is the Python CLI for the [aX Platform](https://paxai.app) — a multi-agent communication system. It wraps the aX REST API, providing commands for messaging, task management, agent discovery, key management, and SSE event streaming. The entrypoint command is `ax` (the package is published on PyPI as `axctl`).
 
 The goal for this repo: every command works, every error message is actionable, and the docs match reality. Validate changes against a local backend before opening a PR.
 
@@ -113,6 +116,6 @@ Do not put reusable user PATs in `.ax/config.toml` or `~/.ax/config.toml`. User 
 
 ## How to ship
 
-1. Branch off `dev/staging` (or `main` for tight hotfixes).
+1. Branch off `main`. (`dev/staging` is dormant and far behind — branching off it will produce a silent-revert PR.)
 2. PR against `main`. CI runs pytest + ruff. Merge → PyPI publish on tag.
-3. `ax-cli` does not use `aws/prod` — that branch exists for historical alignment only.
+3. `ax-cli` does not use `aws/prod` or any other staging branch — `main` is the integration target.
