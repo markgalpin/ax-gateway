@@ -54,7 +54,11 @@ MIN_HANDLER_TIMEOUT_SECONDS = 1
 SSE_IDLE_TIMEOUT_SECONDS = 45.0
 RUNTIME_STALE_AFTER_SECONDS = 75.0
 RUNTIME_HIDDEN_AFTER_SECONDS = 15 * 60.0  # default: hide stale agents after 15 min
-_LIFECYCLE_PHASES = {"active", "hidden"}
+SETUP_ERROR_BACKOFF_SECONDS = 30.0  # silence retry storm after a runtime setup error
+# active = visible, normal operation
+# hidden = system auto-hid because of staleness; auto-restores on reconnect
+# archived = user explicitly disabled; sticky (no auto-restore); requires explicit `agents restore`
+_LIFECYCLE_PHASES = {"active", "hidden", "archived"}
 LOCAL_SESSION_TTL_SECONDS = 24 * 60 * 60
 GATEWAY_EVENT_PREFIX = "AX_GATEWAY_EVENT "
 DEFAULT_OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
@@ -2960,6 +2964,68 @@ def save_gateway_session(data: dict[str, Any]) -> Path:
     return session_path()
 
 
+_LOAD_SNAPSHOT_KEY = "_load_snapshot"
+
+# Fields the operator (CLI / UI server) writes authoritatively. The daemon's
+# reconcile loop should NEVER clobber these mid-flight: if a field's value
+# on disk differs from what was present at this caller's load, another
+# writer changed it and we must take disk's value, not memory's stale view.
+_OPERATOR_AUTHORITATIVE_FIELDS = (
+    "desired_state",
+    "lifecycle_phase",
+    "archived_at",
+    "archived_reason",
+    "desired_state_before_archive",
+    "hidden_at",
+    "hidden_reason",
+    "desired_state_before_hide",
+)
+
+
+_SPACE_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def looks_like_space_uuid(value: Any) -> bool:
+    return isinstance(value, str) and bool(_SPACE_UUID_RE.match(value.strip()))
+
+
+def reconcile_corrupt_space_ids(registry: dict[str, Any]) -> int:
+    """Heal agent rows where ``space_id`` holds a name/slug instead of a UUID.
+
+    Recovers the correct UUID from sibling fields (``active_space_id``,
+    ``default_space_id``, ``allowed_spaces[].space_id``). Idempotent — rows
+    whose ``space_id`` is already UUID-shaped or empty are left alone.
+    Returns the count of repaired rows.
+    """
+    repaired = 0
+    for entry in registry.get("agents", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        sid = entry.get("space_id")
+        if not isinstance(sid, str) or not sid.strip() or looks_like_space_uuid(sid):
+            continue
+        candidate = ""
+        for key in ("active_space_id", "default_space_id"):
+            v = entry.get(key)
+            if looks_like_space_uuid(v):
+                candidate = str(v).strip()
+                break
+        if not candidate:
+            allowed = entry.get("allowed_spaces") or []
+            if isinstance(allowed, list):
+                for row in allowed:
+                    if isinstance(row, dict) and looks_like_space_uuid(row.get("space_id")):
+                        candidate = str(row["space_id"]).strip()
+                        break
+        if candidate:
+            entry["space_id"] = candidate
+            repaired += 1
+    return repaired
+
+
 def load_gateway_registry() -> dict[str, Any]:
     registry = _read_json(registry_path(), default=_default_registry())
     registry.setdefault("version", 1)
@@ -2976,10 +3042,140 @@ def load_gateway_registry() -> dict[str, Any]:
     gateway.setdefault("pid", None)
     gateway.setdefault("last_started_at", None)
     gateway.setdefault("last_reconcile_at", None)
+    reconcile_corrupt_space_ids(registry)
+    # Stamp a load-time snapshot so save_gateway_registry can distinguish:
+    #   - "caller removed this row" vs "another writer added this row"
+    #     (row existence diff)
+    #   - "caller updated this field" vs "another writer updated this
+    #     field" (field-level diff for operator-authoritative fields like
+    #     desired_state — if our load-time value matches memory but disk
+    #     differs, another writer changed it; respect disk's view)
+    snapshot: dict[str, dict[str, Any]] = {}
+    for entry in registry["agents"]:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "")
+        if not name:
+            continue
+        snapshot[name] = {field: entry.get(field) for field in _OPERATOR_AUTHORITATIVE_FIELDS}
+    registry[_LOAD_SNAPSHOT_KEY] = snapshot
     return registry
 
 
-def save_gateway_registry(registry: dict[str, Any]) -> Path:
+def save_gateway_registry(registry: dict[str, Any], *, merge_archive: bool = True) -> Path:
+    """Persist the registry to disk.
+
+    Performs three race-safety merges before writing:
+
+    1. **Row preservation** (always on): re-reads disk and appends any
+       agent rows that exist on disk but not in memory *and* were not in
+       the caller's load-time snapshot. Recovers writes from a second
+       writer (e.g. the UI server's POST /api/agents add) that landed
+       between this caller's load and save.
+
+    2. **Operator-authoritative field preservation** (always on): for
+       each field in _OPERATOR_AUTHORITATIVE_FIELDS (desired_state,
+       lifecycle_phase, archive/hide flags), if the value on disk
+       differs from this caller's load-time snapshot, another writer
+       changed it; take disk's value. This is what makes
+       `ax gateway agents stop` actually stick: the daemon's stale
+       `desired_state=running` view does not clobber the CLI's freshly
+       written `desired_state=stopped`.
+
+    3. **Archive-field merge** (gated on merge_archive=True, the
+       default): legacy bidirectional archive merge from PR #147.
+       Subsumed by (2) for normal flows; preserved for the explicit
+       archived↔active transition path so atomic CLI ops can opt out
+       via merge_archive=False to avoid seesawing with their own writes.
+    """
+    # Pop the load snapshot so it never leaks to disk.
+    snapshot_raw = registry.pop(_LOAD_SNAPSHOT_KEY, None)
+    snapshot: dict[str, dict[str, Any]]
+    if isinstance(snapshot_raw, dict):
+        snapshot = snapshot_raw
+    elif isinstance(snapshot_raw, list):
+        # Backwards-compat with names-only snapshot from earlier load.
+        snapshot = {name: {} for name in snapshot_raw}
+    else:
+        snapshot = {}
+    loaded_names = set(snapshot.keys())
+
+    try:
+        on_disk = _read_json(registry_path(), default=None)
+    except Exception:  # noqa: BLE001
+        on_disk = None
+
+    if isinstance(on_disk, dict):
+        disk_agents = on_disk.get("agents") or []
+        in_memory_names = {
+            str(a.get("name") or "") for a in registry.get("agents") or [] if isinstance(a, dict) and a.get("name")
+        }
+
+        # (1) Preserve rows added by another writer after this caller loaded.
+        for disk_entry in disk_agents:
+            if not isinstance(disk_entry, dict):
+                continue
+            name = str(disk_entry.get("name") or "")
+            if not name:
+                continue
+            if name in in_memory_names:
+                continue  # already in memory; either updating or untouched
+            if name in loaded_names:
+                continue  # caller removed it (was in our snapshot, not in memory)
+            registry.setdefault("agents", []).append(disk_entry)
+
+        # (2) Operator-authoritative field preservation.
+        # If a field's disk value differs from our load-time snapshot,
+        # another writer changed it; take disk's value over ours.
+        disk_by_name = {str(a.get("name") or ""): a for a in disk_agents if isinstance(a, dict) and a.get("name")}
+        for entry in registry.get("agents") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            disk_entry = disk_by_name.get(name)
+            if not isinstance(disk_entry, dict):
+                continue
+            loaded_fields = snapshot.get(name, {})
+            for field in _OPERATOR_AUTHORITATIVE_FIELDS:
+                disk_value = disk_entry.get(field)
+                loaded_value = loaded_fields.get(field)
+                if disk_value != loaded_value:
+                    # Another writer changed this field after our load.
+                    # Preserve their write — overwrite our memory's view.
+                    if field in disk_entry:
+                        entry[field] = disk_value
+                    else:
+                        entry.pop(field, None)
+
+        # (3) Existing archive-field merge (kept for the merge_archive=False
+        # opt-out semantics; (2) covers the common case).
+        if merge_archive:
+            disk_by_name = {str(a.get("name") or ""): a for a in disk_agents if isinstance(a, dict) and a.get("name")}
+            for entry in registry.get("agents") or []:
+                if not isinstance(entry, dict):
+                    continue
+                disk_entry = disk_by_name.get(str(entry.get("name") or ""))
+                if not isinstance(disk_entry, dict):
+                    continue
+                # CLI is authoritative for the archived ↔ active transition.
+                # Take disk's archive fields whenever the disk OR the in-memory
+                # copy has archive state — covers both directions of the race
+                # (CLI archive into the daemon's active view, *and* CLI restore
+                # into the daemon's still-archived view).
+                disk_phase = str(disk_entry.get("lifecycle_phase") or "")
+                mem_phase = str(entry.get("lifecycle_phase") or "")
+                if disk_phase == "archived" or (mem_phase == "archived" and disk_phase != "archived"):
+                    for field in (
+                        "lifecycle_phase",
+                        "archived_at",
+                        "archived_reason",
+                        "desired_state_before_archive",
+                        "desired_state",
+                    ):
+                        if field in disk_entry:
+                            entry[field] = disk_entry[field]
+                        else:
+                            entry.pop(field, None)
     _write_json(registry_path(), registry)
     return registry_path()
 
@@ -4180,6 +4376,18 @@ class ManagedAgentRuntime:
             return
         if self._listener_thread and self._listener_thread.is_alive():
             return
+        # Setup-error backoff: if this runtime hit a setup error within the
+        # backoff window (missing token file, missing script, etc.), do not
+        # retry every reconcile tick. Retrying every 1s does not help — the
+        # operator must fix the precondition first — and each attempt fires
+        # a runtime_error activity event and can pressure upstream rate
+        # limits. Operator-driven `agents start <name>` clears the field
+        # via the explicit desired_state transition.
+        last_runtime_error_at = self.entry.get("last_runtime_error_at")
+        if last_runtime_error_at:
+            age = _age_seconds(last_runtime_error_at)
+            if age is not None and age < SETUP_ERROR_BACKOFF_SECONDS:
+                return
         self.stop_event.clear()
         self._queue = queue.Queue(maxsize=int(self.entry.get("queue_size") or DEFAULT_QUEUE_SIZE))
         self._reply_anchor_ids = set()
@@ -4275,8 +4483,13 @@ class ManagedAgentRuntime:
         if not script.exists():
             error = f"Hermes sentinel script not found: {script}"
             self._update_state(
-                effective_state="error", current_status="error", current_activity=error, last_error=error
+                effective_state="error",
+                current_status="error",
+                current_activity=error,
+                last_error=error,
+                last_runtime_error_at=_now_iso(),
             )
+            self.entry["last_runtime_error_at"] = self._state.get("last_runtime_error_at")
             record_gateway_activity("runtime_error", entry=self.entry, error=error)
             return
         try:
@@ -4284,8 +4497,13 @@ class ManagedAgentRuntime:
         except ValueError as exc:
             error = str(exc)
             self._update_state(
-                effective_state="error", current_status="error", current_activity=error, last_error=error
+                effective_state="error",
+                current_status="error",
+                current_activity=error,
+                last_error=error,
+                last_runtime_error_at=_now_iso(),
             )
+            self.entry["last_runtime_error_at"] = self._state.get("last_runtime_error_at")
             record_gateway_activity("runtime_error", entry=self.entry, error=error)
             return
 
@@ -4324,8 +4542,13 @@ class ManagedAgentRuntime:
         except Exception as exc:
             error = f"Failed to start Hermes sentinel: {str(exc)[:360]}"
             self._update_state(
-                effective_state="error", current_status="error", current_activity=error, last_error=error
+                effective_state="error",
+                current_status="error",
+                current_activity=error,
+                last_error=error,
+                last_runtime_error_at=_now_iso(),
             )
+            self.entry["last_runtime_error_at"] = self._state.get("last_runtime_error_at")
             record_gateway_activity("runtime_error", entry=self.entry, error=error)
             return
 
@@ -4337,10 +4560,12 @@ class ManagedAgentRuntime:
             current_tool=None,
             current_tool_call_id=None,
             last_error=None,
+            last_runtime_error_at=None,
             last_connected_at=_now_iso(),
             last_seen_at=_now_iso(),
             reconnect_backoff_seconds=0,
         )
+        self.entry["last_runtime_error_at"] = None
         record_gateway_activity(
             "runtime_started",
             entry=self.entry,
@@ -5710,18 +5935,22 @@ class GatewayDaemon:
         *,
         session: dict[str, Any] | None,
     ) -> None:
-        """Per-tick sweep: hide stale agents, signal liveness transitions upstream.
+        """Per-tick sweep: signal liveness transitions upstream.
+
+        Hide and restore are operator-driven only. The sweep observes liveness
+        and signals deltas upstream; it never mutates ``lifecycle_phase``. Use
+        ``ax gateway agents hide`` / ``unhide`` (or the Cleanup UI) to change
+        lifecycle phase.
 
         - Skips system agents (switchboards, service accounts).
-        - Promotes active+stale entries past the hide threshold to lifecycle_phase=hidden.
-        - Auto-restores hidden entries that have come back online.
+        - Skips archived entries entirely (no upstream signaling either —
+          archive already signaled).
         - On any liveness delta vs last_lifecycle_signal.phase, calls
           send_heartbeat upstream best-effort. 404 counts as success.
         """
         agents = registry.get("agents") or []
         if not agents:
             return
-        threshold = _hide_after_stale_seconds(registry)
         client = self._sweep_client(session)
         for entry in agents:
             if not isinstance(entry, dict):
@@ -5729,35 +5958,15 @@ class GatewayDaemon:
             if _is_system_agent(entry):
                 continue
             liveness = str(entry.get("liveness") or "").strip().lower()
-            age_raw = entry.get("last_seen_age_seconds")
-            try:
-                age = float(age_raw) if age_raw is not None else None
-            except (TypeError, ValueError):
-                age = None
             phase = str(entry.get("lifecycle_phase") or "active").strip().lower()
             if phase not in _LIFECYCLE_PHASES:
                 phase = "active"
 
-            # Hide transition: active → hidden once stale past threshold.
-            if (
-                phase == "active"
-                and liveness in {"stale", "offline", "setup_error"}
-                and age is not None
-                and age >= threshold
-            ):
-                entry["lifecycle_phase"] = "hidden"
-                entry["hidden_at"] = _now_iso()
-                entry["hidden_reason"] = liveness
-                record_gateway_activity("managed_agent_hidden", entry=entry, reason=liveness)
-                phase = "hidden"
-
-            # Auto-restore: hidden → active when reconnected and fresh.
-            elif phase == "hidden" and liveness == "connected" and (age is None or age <= RUNTIME_STALE_AFTER_SECONDS):
-                entry["lifecycle_phase"] = "active"
-                entry.pop("hidden_at", None)
-                entry.pop("hidden_reason", None)
-                record_gateway_activity("managed_agent_unhidden", entry=entry)
-                phase = "active"
+            # Archived is sticky — explicit archive already signaled upstream,
+            # don't double-signal. Hide/unhide are operator-only and the sweep
+            # never touches lifecycle_phase, so no transition logic here.
+            if phase == "archived":
+                continue
 
             # Upstream signal on liveness delta. Sticky liveness rate-limits.
             if liveness in {"connected", "stale", "offline", "setup_error"}:

@@ -5203,36 +5203,21 @@ def _isolate_gateway_paths(monkeypatch, tmp_path):
     monkeypatch.setenv("AX_GATEWAY_DIR", str(tmp_path / "gw"))
 
 
-def test_sweep_hides_stale_agent_after_threshold(monkeypatch, tmp_path):
+def test_sweep_does_not_auto_hide_stale_agent(monkeypatch, tmp_path):
+    """Sweep must never mutate lifecycle_phase. Hide is operator-driven only."""
     _isolate_gateway_paths(monkeypatch, tmp_path)
-    monkeypatch.delenv("AX_GATEWAY_HIDE_AFTER_STALE_SECONDS", raising=False)
     client = _RecordingHeartbeatClient()
     daemon = _build_daemon(client)
     entry = _stale_hermes_entry("hermes-old", age_seconds=20 * 60)
     registry = {"agents": [entry]}
     daemon._sweep_lifecycle(registry, session={"token": "axp_u_test", "base_url": "http://x"})
-    assert entry["lifecycle_phase"] == "hidden"
-    assert "hidden_at" in entry
-    assert entry["hidden_reason"] == "stale"
+    assert entry.get("lifecycle_phase", "active") == "active"
+    assert "hidden_at" not in entry
+    assert "hidden_reason" not in entry
     recent = gateway_core.load_recent_gateway_activity()
-    assert any(r.get("event") == "managed_agent_hidden" for r in recent)
-
-
-def test_sweep_idempotent_for_already_hidden(monkeypatch, tmp_path):
-    _isolate_gateway_paths(monkeypatch, tmp_path)
-    client = _RecordingHeartbeatClient()
-    daemon = _build_daemon(client)
-    entry = _stale_hermes_entry("hermes-old", age_seconds=20 * 60)
-    registry = {"agents": [entry]}
-    session = {"token": "axp_u_test", "base_url": "http://x"}
-    daemon._sweep_lifecycle(registry, session=session)
-    daemon._sweep_lifecycle(registry, session=session)
-    hidden_events = [
-        r for r in gateway_core.load_recent_gateway_activity()
-        if r.get("event") == "managed_agent_hidden"
-    ]
-    assert len(hidden_events) == 1
-    assert len(client.heartbeats) == 1
+    assert not any(r.get("event") == "managed_agent_hidden" for r in recent)
+    # Upstream liveness signal still goes out — that's the sweep's only job.
+    assert client.heartbeats and client.heartbeats[0]["status"] == "stale"
 
 
 def test_sweep_skips_switchboard(monkeypatch, tmp_path):
@@ -5271,21 +5256,22 @@ def test_sweep_skips_service_account(monkeypatch, tmp_path):
     assert client.heartbeats == []
 
 
-def test_sweep_unhides_on_reconnect(monkeypatch, tmp_path):
+def test_sweep_does_not_auto_unhide_on_reconnect(monkeypatch, tmp_path):
+    """A user-hidden agent that reconnects stays hidden — operator intent
+    sticks across liveness changes. Only ``unhide`` (CLI / UI) restores it."""
     _isolate_gateway_paths(monkeypatch, tmp_path)
     client = _RecordingHeartbeatClient()
     daemon = _build_daemon(client)
     entry = _stale_hermes_entry("hermes-back", age_seconds=2.0, liveness="connected")
     entry["lifecycle_phase"] = "hidden"
     entry["hidden_at"] = gateway_core._now_iso()
-    entry["hidden_reason"] = "stale"
+    entry["hidden_reason"] = "operator_cleanup"
     registry = {"agents": [entry]}
     daemon._sweep_lifecycle(registry, session={"token": "axp_u_test"})
-    assert entry["lifecycle_phase"] == "active"
-    assert "hidden_at" not in entry
-    assert "hidden_reason" not in entry
+    assert entry["lifecycle_phase"] == "hidden"
+    assert entry["hidden_reason"] == "operator_cleanup"
     recent = gateway_core.load_recent_gateway_activity()
-    assert any(r.get("event") == "managed_agent_unhidden" for r in recent)
+    assert not any(r.get("event") == "managed_agent_unhidden" for r in recent)
 
 
 def test_status_payload_filters_hidden_by_default(monkeypatch, tmp_path):
@@ -5337,6 +5323,215 @@ def test_status_payload_include_hidden_returns_all(monkeypatch, tmp_path):
     assert payload["summary"]["hidden_agents"] == 1
 
 
+def test_operator_cleanup_hides_selected_agents(monkeypatch, tmp_path):
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    registry = {
+        "agents": [
+            {
+                "name": "stale-one",
+                "agent_id": "agent-stale-one",
+                "template_id": "claude_code_channel",
+                "runtime_type": "claude_code_channel",
+                "desired_state": "running",
+                "effective_state": "error",
+            },
+            {
+                "name": "stale-two",
+                "agent_id": "agent-stale-two",
+                "template_id": "pass_through",
+                "runtime_type": "inbox",
+                "desired_state": "running",
+                "effective_state": "stale",
+            },
+            {
+                "name": "keeper",
+                "agent_id": "agent-keeper",
+                "template_id": "echo",
+                "runtime_type": "echo",
+                "desired_state": "running",
+                "effective_state": "running",
+            },
+        ]
+    }
+    gateway_core.save_gateway_registry(registry)
+
+    payload = gateway_cmd._hide_managed_agents(
+        ["stale-one", "stale-two"],
+        reason="operator_cleanup",
+    )
+
+    assert payload["count"] == 2
+    assert payload["missing"] == []
+    stored = {agent["name"]: agent for agent in gateway_core.load_gateway_registry()["agents"]}
+    assert stored["stale-one"]["lifecycle_phase"] == "hidden"
+    assert stored["stale-one"]["desired_state"] == "stopped"
+    assert stored["stale-one"]["hidden_reason"] == "operator_cleanup"
+    assert stored["stale-two"]["lifecycle_phase"] == "hidden"
+    assert stored["keeper"].get("lifecycle_phase", "active") == "active"
+
+    visible_payload = gateway_cmd._status_payload(activity_limit=0)
+    visible_names = [agent["name"] for agent in visible_payload["agents"]]
+    assert visible_names == ["keeper"]
+    assert visible_payload["summary"]["hidden_agents"] == 2
+    recent = gateway_core.load_recent_gateway_activity()
+    assert [event["event"] for event in recent].count("managed_agent_hidden") == 2
+
+
+def test_recover_managed_agents_from_evidence_restores_lost_row(monkeypatch, tmp_path):
+    """Pre-race-fix damage recovery: when a managed_agent_added activity
+    event exists locally but the registry row is missing (silent race
+    clobber), _recover_managed_agents_from_evidence reconstructs a
+    minimal row using only verified evidence — never fabricating
+    credentials.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    # Pre-condition: registry empty, but token file + managed_agent_added
+    # event exist locally — exactly the cc-backend / widget_smith state.
+    gateway_core.save_gateway_registry({"agents": []})
+
+    token_dir = gateway_core.agent_dir("ghost-agent")
+    token_dir.mkdir(parents=True, exist_ok=True)
+    (token_dir / "token").write_text("axp_a_ghost.evidence", encoding="utf-8")
+
+    gateway_core.record_gateway_activity(
+        "managed_agent_added",
+        agent_name="ghost-agent",
+        agent_id="agent-ghost-id",
+        asset_id="agent-ghost-id",
+        install_id="install-ghost",
+        gateway_id="gateway-host",
+        runtime_type="claude_code_channel",
+        transport="gateway",
+        space_id="49afd277-78d2-4a32-9858-3594cda684af",
+        token_file=str(token_dir / "token"),
+        credential_source="gateway",
+    )
+
+    payload = gateway_cmd._recover_managed_agents_from_evidence(["ghost-agent", "missing-no-evidence"])
+
+    assert payload["count"] == 1
+    assert payload["already_present"] == []
+    assert payload["no_evidence"] == ["missing-no-evidence"]
+
+    stored = gateway_core.load_gateway_registry()
+    row = next((a for a in stored["agents"] if a.get("name") == "ghost-agent"), None)
+    assert row is not None, "recovered row missing from registry"
+    assert row["agent_id"] == "agent-ghost-id"
+    assert row["install_id"] == "install-ghost"
+    assert row["runtime_type"] == "claude_code_channel"
+    assert row["template_id"] == "claude_code_channel"
+    assert row["space_id"] == "49afd277-78d2-4a32-9858-3594cda684af"
+    assert row["token_file"] == str(token_dir / "token")
+    assert row["lifecycle_phase"] == "active"
+    assert row["desired_state"] == "stopped"  # safe default — operator restarts deliberately
+    assert row["drift_reason"] == "registry_row_recovered_from_evidence"
+
+    # managed_agent_recovered activity event was recorded.
+    recent = gateway_core.load_recent_gateway_activity()
+    events = [e for e in recent if e.get("event") == "managed_agent_recovered"]
+    assert len(events) == 1
+    assert events[0].get("agent_name") == "ghost-agent"
+
+
+def test_recover_managed_agents_refuses_when_token_missing(monkeypatch, tmp_path):
+    """Recovery requires BOTH the activity event AND the token file.
+    Missing token → no recovery (we don't fabricate credentials).
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    gateway_core.save_gateway_registry({"agents": []})
+
+    # Activity event exists but no token file.
+    gateway_core.record_gateway_activity(
+        "managed_agent_added",
+        agent_name="no-token-agent",
+        agent_id="agent-id",
+        asset_id="agent-id",
+        install_id="install-id",
+        gateway_id="gateway-host",
+        runtime_type="echo",
+        transport="gateway",
+        space_id="space-1",
+        token_file="/tmp/nonexistent-recovery-token-path",
+        credential_source="gateway",
+    )
+
+    payload = gateway_cmd._recover_managed_agents_from_evidence(["no-token-agent"])
+    assert payload["count"] == 0
+    assert payload["no_evidence"] == ["no-token-agent"]
+
+
+def test_recover_managed_agents_skips_already_present_rows(monkeypatch, tmp_path):
+    """Idempotent: if a row already exists, recovery is a no-op for it."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    gateway_core.save_gateway_registry(
+        {"agents": [{"name": "already-there", "agent_id": "existing", "template_id": "echo"}]}
+    )
+
+    payload = gateway_cmd._recover_managed_agents_from_evidence(["already-there"])
+    assert payload["count"] == 0
+    assert payload["already_present"] == ["already-there"]
+    assert payload["no_evidence"] == []
+
+
+def test_operator_cleanup_restore_unhides_selected_agents(monkeypatch, tmp_path):
+    """Symmetric to hide: _restore_hidden_managed_agents clears the hidden
+    bookkeeping, restores desired_state from the captured before-hide value,
+    re-emits the row in default /api/status, and records a
+    managed_agent_unhidden activity event per restored row.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    registry = {
+        "agents": [
+            {
+                "name": "previously-hidden",
+                "agent_id": "agent-prev-hidden",
+                "template_id": "claude_code_channel",
+                "runtime_type": "claude_code_channel",
+                "lifecycle_phase": "hidden",
+                "desired_state": "stopped",
+                "desired_state_before_hide": "running",
+                "hidden_at": gateway_core._now_iso(),
+                "hidden_reason": "operator_cleanup",
+            },
+            {
+                "name": "active-keeper",
+                "agent_id": "agent-keeper",
+                "template_id": "echo",
+                "runtime_type": "echo",
+                "desired_state": "running",
+            },
+        ]
+    }
+    gateway_core.save_gateway_registry(registry)
+
+    # Restore one row plus name a non-existent and a non-hidden row to verify
+    # missing/not_hidden partitions.
+    payload = gateway_cmd._restore_hidden_managed_agents(
+        ["previously-hidden", "ghost", "active-keeper"]
+    )
+
+    assert payload["count"] == 1
+    assert payload["missing"] == ["ghost"]
+    assert payload["not_hidden"] == ["active-keeper"]
+
+    stored = {agent["name"]: agent for agent in gateway_core.load_gateway_registry()["agents"]}
+    restored = stored["previously-hidden"]
+    assert restored["lifecycle_phase"] == "active"
+    assert restored["desired_state"] == "running"  # restored from desired_state_before_hide
+    assert "desired_state_before_hide" not in restored
+    assert "hidden_at" not in restored
+    assert "hidden_reason" not in restored
+
+    # Restored row reappears in default /api/status agents list.
+    visible_payload = gateway_cmd._status_payload(activity_limit=0)
+    visible_names = sorted(agent["name"] for agent in visible_payload["agents"])
+    assert "previously-hidden" in visible_names
+    assert visible_payload["summary"]["hidden_agents"] == 0
+
+    recent = gateway_core.load_recent_gateway_activity()
+    assert [event["event"] for event in recent].count("managed_agent_unhidden") == 1
+
+
 def test_lifecycle_signal_sent_on_connected_to_stale(monkeypatch, tmp_path):
     _isolate_gateway_paths(monkeypatch, tmp_path)
     client = _RecordingHeartbeatClient()
@@ -5374,9 +5569,10 @@ def test_lifecycle_signal_404_tolerant(monkeypatch, tmp_path):
     entry = _stale_hermes_entry("hermes-ghost", age_seconds=20 * 60)
     registry = {"agents": [entry]}
     daemon._sweep_lifecycle(registry, session={"token": "axp_u_test", "base_url": "http://x"})
-    # Hide still applied locally even though upstream said 404.
-    assert entry["lifecycle_phase"] == "hidden"
-    # Sticky last_lifecycle_signal updated → no infinite retry next tick.
+    # Sweep doesn't mutate lifecycle_phase regardless of upstream response.
+    assert entry.get("lifecycle_phase", "active") == "active"
+    # 404 counts as "platform doesn't know about this agent" — sticky signal
+    # still updated so we don't retry forever.
     assert entry["last_lifecycle_signal"]["phase"] == "stale"
 
 
@@ -5444,8 +5640,9 @@ def test_legacy_entry_without_lifecycle_phase_loads_as_active(monkeypatch, tmp_p
     }
     registry = {"agents": [entry]}
     daemon._sweep_lifecycle(registry, session={"token": "axp_u_test"})
-    # Legacy entry got swept normally (treated as implicit active → hidden).
-    assert entry["lifecycle_phase"] == "hidden"
+    # Legacy entry stays active — sweep no longer auto-hides. The default
+    # ``active`` phase is implied for entries with no lifecycle_phase field.
+    assert entry.get("lifecycle_phase", "active") == "active"
 
 
 def test_send_local_session_message_extracts_mentions_when_client_omits_them():
@@ -5479,3 +5676,784 @@ def test_send_local_session_message_extracts_mentions_when_client_omits_them():
     assert metadata["mentions"] == ["night_owl"]
     assert metadata["routing_intent"] == "reply_with_mentions"
     assert metadata["purpose"] == "test"
+
+
+def test_archive_managed_agent_sets_phase_and_stops_runtime(monkeypatch, tmp_path):
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    entry = {
+        "name": "probe-doomed",
+        "agent_id": "agent-doomed",
+        "template_id": "hermes",
+        "runtime_type": "hermes_sentinel",
+        "desired_state": "running",
+        "effective_state": "running",
+        "liveness": "connected",
+        "last_seen_age_seconds": 5.0,
+    }
+    gateway_core.save_gateway_registry({"agents": [entry]})
+    client = _RecordingHeartbeatClient()
+    result = gateway_cmd._archive_managed_agent(
+        "probe-doomed", reason="cleanup", client_factory=lambda: client
+    )
+    assert result["lifecycle_phase"] == "archived"
+    registry = gateway_core.load_gateway_registry()
+    stored = next(a for a in registry["agents"] if a["name"] == "probe-doomed")
+    assert stored["lifecycle_phase"] == "archived"
+    assert stored["archived_reason"] == "cleanup"
+    assert stored["desired_state"] == "stopped"
+    assert stored["desired_state_before_archive"] == "running"
+    assert "archived_at" in stored
+    # Upstream signal sent best-effort.
+    assert any(h["status"] == "archived" for h in client.heartbeats)
+    # Audit event recorded.
+    recent = gateway_core.load_recent_gateway_activity()
+    assert any(r.get("event") == "managed_agent_archived" for r in recent)
+
+
+def test_archive_managed_agent_idempotent(monkeypatch, tmp_path):
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    entry = {
+        "name": "probe-already",
+        "agent_id": "agent-already",
+        "template_id": "hermes",
+        "runtime_type": "hermes_sentinel",
+        "lifecycle_phase": "archived",
+        "archived_at": gateway_core._now_iso(),
+        "archived_reason": "first call",
+        "desired_state": "stopped",
+        "desired_state_before_archive": "running",
+    }
+    gateway_core.save_gateway_registry({"agents": [entry]})
+    client = _RecordingHeartbeatClient()
+    gateway_cmd._archive_managed_agent(
+        "probe-already", reason="second call", client_factory=lambda: client
+    )
+    stored = next(
+        a for a in gateway_core.load_gateway_registry()["agents"] if a["name"] == "probe-already"
+    )
+    # Reason not overwritten on a no-op archive — first archived_reason preserved.
+    assert stored["archived_reason"] == "first call"
+    assert client.heartbeats == []
+
+
+def test_archive_then_restore_returns_to_prior_desired_state(monkeypatch, tmp_path):
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    entry = {
+        "name": "probe-roundtrip",
+        "agent_id": "agent-rt",
+        "template_id": "hermes",
+        "runtime_type": "hermes_sentinel",
+        "desired_state": "running",
+        "effective_state": "running",
+        "liveness": "connected",
+        "last_seen_age_seconds": 5.0,
+    }
+    gateway_core.save_gateway_registry({"agents": [entry]})
+    client = _RecordingHeartbeatClient()
+    gateway_cmd._archive_managed_agent("probe-roundtrip", client_factory=lambda: client)
+    gateway_cmd._restore_managed_agent("probe-roundtrip", client_factory=lambda: client)
+    stored = next(
+        a for a in gateway_core.load_gateway_registry()["agents"] if a["name"] == "probe-roundtrip"
+    )
+    assert stored["lifecycle_phase"] == "active"
+    assert stored["desired_state"] == "running"
+    assert "archived_at" not in stored
+    assert "archived_reason" not in stored
+    assert "desired_state_before_archive" not in stored
+    recent = gateway_core.load_recent_gateway_activity()
+    assert any(r.get("event") == "managed_agent_restored" for r in recent)
+    # Restore signals 'connected' upstream.
+    assert any(h["status"] == "connected" for h in client.heartbeats)
+
+
+def test_restore_unarchived_agent_is_noop(monkeypatch, tmp_path):
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    entry = {
+        "name": "probe-active",
+        "agent_id": "agent-active",
+        "template_id": "hermes",
+        "runtime_type": "hermes_sentinel",
+        "lifecycle_phase": "active",
+        "desired_state": "running",
+    }
+    gateway_core.save_gateway_registry({"agents": [entry]})
+    client = _RecordingHeartbeatClient()
+    gateway_cmd._restore_managed_agent("probe-active", client_factory=lambda: client)
+    # No upstream noise on a no-op restore.
+    assert client.heartbeats == []
+
+
+def test_sweep_does_not_unhide_archived_agent(monkeypatch, tmp_path):
+    """Archived is sticky — sweep must not auto-restore even when liveness=connected."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    client = _RecordingHeartbeatClient()
+    daemon = _build_daemon(client)
+    entry = _stale_hermes_entry("probe-archived", age_seconds=2.0, liveness="connected")
+    entry["lifecycle_phase"] = "archived"
+    entry["archived_at"] = gateway_core._now_iso()
+    registry = {"agents": [entry]}
+    daemon._sweep_lifecycle(registry, session={"token": "axp_u_test"})
+    # Sticky — sweep must not flip back to active.
+    assert entry["lifecycle_phase"] == "archived"
+    # No upstream signaling for archived entries either.
+    assert client.heartbeats == []
+
+
+def test_save_registry_preserves_restore_written_during_daemon_tick(monkeypatch, tmp_path):
+    """Race regression (other direction): daemon's stale-archived view must
+    not clobber a CLI restore that landed mid-tick.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    initial = {
+        "agents": [
+            {
+                "name": "race-restore",
+                "agent_id": "agent-restore",
+                "template_id": "hermes",
+                "runtime_type": "hermes_sentinel",
+                "lifecycle_phase": "archived",
+                "archived_at": gateway_core._now_iso(),
+                "archived_reason": "earlier",
+                "desired_state": "stopped",
+                "desired_state_before_archive": "running",
+            }
+        ]
+    }
+    gateway_core.save_gateway_registry(initial, merge_archive=False)
+
+    # Daemon's stale in-memory copy: still sees the agent as archived.
+    daemon_view = gateway_core.load_gateway_registry()
+
+    # CLI restores between the daemon's load and the daemon's save.
+    gateway_cmd._restore_managed_agent("race-restore")
+
+    # Daemon now saves its (stale, still-archived) copy. Bidirectional merge
+    # should pull the disk's freshly-active state forward.
+    gateway_core.save_gateway_registry(daemon_view)
+
+    final = gateway_core.load_gateway_registry()
+    stored = next(a for a in final["agents"] if a["name"] == "race-restore")
+    assert stored["lifecycle_phase"] == "active"
+    assert "archived_at" not in stored
+    assert "archived_reason" not in stored
+
+
+def test_save_registry_preserves_other_writer_added_row(monkeypatch, tmp_path):
+    """Race regression: daemon's load → modify → save must not clobber an
+    agent row added by another writer (e.g. the UI server's
+    POST /api/agents) between the daemon's load and the daemon's save.
+
+    Reproduces the cc-backend bug from 2026-05-06: managed_agent_added
+    activity recorded, registry write succeeded, then daemon's reconcile
+    tick wrote back without the new row.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    initial = {
+        "agents": [
+            {
+                "name": "incumbent",
+                "agent_id": "agent-incumbent",
+                "template_id": "hermes",
+                "runtime_type": "hermes_sentinel",
+                "lifecycle_phase": "active",
+                "desired_state": "running",
+            }
+        ]
+    }
+    gateway_core.save_gateway_registry(initial)
+
+    # Daemon's stale in-memory copy from the start of its tick — knows only
+    # about the incumbent.
+    daemon_view = gateway_core.load_gateway_registry()
+    daemon_view["agents"][0]["effective_state"] = "running"  # daemon-side update
+
+    # Another writer (UI server, channel setup, etc.) loads, adds a new
+    # agent, and saves between the daemon's load and the daemon's save.
+    other_writer = gateway_core.load_gateway_registry()
+    other_writer["agents"].append(
+        {
+            "name": "newcomer",
+            "agent_id": "agent-newcomer",
+            "template_id": "claude_code_channel",
+            "runtime_type": "claude_code_channel",
+            "lifecycle_phase": "active",
+            "desired_state": "running",
+        }
+    )
+    gateway_core.save_gateway_registry(other_writer)
+
+    # Daemon now saves its stale copy that never saw newcomer. Row
+    # preservation should keep newcomer.
+    gateway_core.save_gateway_registry(daemon_view)
+
+    final = gateway_core.load_gateway_registry()
+    names = {a["name"] for a in final["agents"]}
+    assert names == {"incumbent", "newcomer"}, (
+        "newcomer was clobbered by daemon save — registry write race regressed"
+    )
+    # Daemon's effective_state update on the incumbent should still apply.
+    incumbent = next(a for a in final["agents"] if a["name"] == "incumbent")
+    assert incumbent["effective_state"] == "running"
+
+
+def test_save_registry_preserves_other_writer_field_update(monkeypatch, tmp_path):
+    """Race regression (field-level): the daemon's stale `desired_state=running`
+    in-memory view must not clobber the CLI's freshly written
+    `desired_state=stopped` on disk.
+
+    Reproduces the agents-stop bug from 2026-05-06: `ax gateway agents stop`
+    set desired_state=stopped, activity log recorded
+    managed_agent_desired_stopped, but the daemon's next reconcile save
+    flipped it back to running within seconds — making demo-hermes
+    impossible to actually stop.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    initial = {
+        "agents": [
+            {
+                "name": "race-stop",
+                "agent_id": "agent-race-stop",
+                "template_id": "hermes",
+                "runtime_type": "hermes_sentinel",
+                "lifecycle_phase": "active",
+                "desired_state": "running",
+                "effective_state": "running",
+            }
+        ]
+    }
+    gateway_core.save_gateway_registry(initial)
+
+    # Daemon's stale in-memory copy from the start of its tick.
+    daemon_view = gateway_core.load_gateway_registry()
+    daemon_view["agents"][0]["effective_state"] = "running"  # daemon-side telemetry update
+
+    # CLI runs `agents stop` between the daemon's load and the daemon's
+    # save: writes desired_state=stopped to disk.
+    cli_view = gateway_core.load_gateway_registry()
+    cli_view["agents"][0]["desired_state"] = "stopped"
+    gateway_core.save_gateway_registry(cli_view)
+
+    # Daemon now saves its (stale) copy. Field-level preservation should
+    # take disk's freshly-written desired_state=stopped, not memory's
+    # stale desired_state=running.
+    gateway_core.save_gateway_registry(daemon_view)
+
+    final = gateway_core.load_gateway_registry()
+    stored = next(a for a in final["agents"] if a["name"] == "race-stop")
+    assert stored["desired_state"] == "stopped", (
+        "daemon clobbered CLI's desired_state=stopped — field-level race "
+        "preservation regressed"
+    )
+    # Daemon's effective_state telemetry update should still apply.
+    assert stored["effective_state"] == "running"
+
+
+def test_save_registry_honors_caller_remove(monkeypatch, tmp_path):
+    """Row preservation must distinguish "caller removed this" from
+    "another writer added this." A row that was present at load time and
+    is missing in memory at save time means the caller removed it; we
+    must not resurrect it from disk.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    initial = {
+        "agents": [
+            {"name": "to-remove", "agent_id": "a1", "template_id": "echo"},
+            {"name": "to-keep", "agent_id": "a2", "template_id": "echo"},
+        ]
+    }
+    gateway_core.save_gateway_registry(initial)
+
+    # Caller loads, removes one row, saves. Disk still had to-remove at
+    # the moment we re-read inside save — the load snapshot tells us we
+    # had it and the caller removed it intentionally.
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [a for a in registry["agents"] if a["name"] != "to-remove"]
+    gateway_core.save_gateway_registry(registry)
+
+    final = gateway_core.load_gateway_registry()
+    names = {a["name"] for a in final["agents"]}
+    assert names == {"to-keep"}, "to-remove was resurrected — remove was lost"
+
+
+def test_save_registry_preserves_archive_written_during_daemon_tick(monkeypatch, tmp_path):
+    """Race regression: daemon load → modify → save must not clobber a CLI
+    archive that landed between the daemon's load and the daemon's save.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    # Initial state: probe is active, runtime running.
+    initial = {
+        "agents": [
+            {
+                "name": "race-probe",
+                "agent_id": "agent-race",
+                "template_id": "hermes",
+                "runtime_type": "hermes_sentinel",
+                "lifecycle_phase": "active",
+                "desired_state": "running",
+                "liveness": "connected",
+            }
+        ]
+    }
+    gateway_core.save_gateway_registry(initial)
+
+    # Daemon's stale in-memory copy from the start of its tick.
+    daemon_view = gateway_core.load_gateway_registry()
+    daemon_view["agents"][0]["effective_state"] = "running"  # daemon-side update
+
+    # CLI archives between the daemon's load and the daemon's save.
+    gateway_cmd._archive_managed_agent("race-probe")
+
+    # Daemon now saves its (stale) copy. Race-safety merge should preserve
+    # the archive fields the CLI wrote.
+    gateway_core.save_gateway_registry(daemon_view)
+
+    final = gateway_core.load_gateway_registry()
+    stored = next(a for a in final["agents"] if a["name"] == "race-probe")
+    assert stored["lifecycle_phase"] == "archived"
+    assert stored["desired_state"] == "stopped"
+    assert "archived_at" in stored
+
+
+def test_status_payload_partitions_archived_separately(monkeypatch, tmp_path):
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    archived = _stale_hermes_entry("hermes-archived", age_seconds=5.0, liveness="connected",
+                                   agent_id="agent-archived")
+    archived["lifecycle_phase"] = "archived"
+    archived["archived_at"] = gateway_core._now_iso()
+    active = {
+        "name": "hermes-live",
+        "agent_id": "agent-live",
+        "template_id": "hermes",
+        "runtime_type": "hermes_sentinel",
+        "effective_state": "running",
+        "liveness": "connected",
+        "last_seen_age_seconds": 5.0,
+        "last_seen_at": gateway_core._now_iso(),
+    }
+    gateway_core.save_gateway_registry({"agents": [archived, active]})
+
+    payload = gateway_cmd._status_payload(activity_limit=0)
+    names = [a["name"] for a in payload["agents"]]
+    assert "hermes-archived" not in names
+    assert "hermes-live" in names
+    assert payload["summary"]["archived_agents"] == 1
+    assert payload["summary"]["managed_agents"] == 1
+
+    # include_hidden=True surfaces archived alongside hidden + system.
+    payload_all = gateway_cmd._status_payload(activity_limit=0, include_hidden=True)
+    all_names = [a["name"] for a in payload_all["agents"]]
+    assert "hermes-archived" in all_names
+    assert payload_all["summary"]["archived_agents"] == 1
+
+
+def test_runtime_start_skips_when_in_setup_error_backoff(monkeypatch, tmp_path):
+    """Setup-error backoff: runtime.start() must early-return when a
+    runtime_error fired within the last SETUP_ERROR_BACKOFF_SECONDS,
+    so the daemon's per-tick reconcile (every ~1s) doesn't fire a
+    runtime_error storm and pressure upstream rate limits.
+
+    Reproduces the demo-hermes spam: missing token file + desired_state
+    running → 140 runtime_error events in 5 minutes.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    token_file = tmp_path / "token-does-not-exist"  # intentionally missing
+
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "stuck-hermes",
+            "agent_id": "agent-stuck",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "hermes_sentinel",
+            "token_file": str(token_file),
+            # Simulates the entry state after a setup error: error 1s ago,
+            # well within the 30s backoff window.
+            "last_runtime_error_at": gateway_core._now_iso(),
+        },
+        client_factory=lambda **kwargs: object(),
+    )
+
+    before = gateway_core.load_recent_gateway_activity()
+    runtime.start()
+    after = gateway_core.load_recent_gateway_activity()
+
+    # Gate must early-return without firing a fresh runtime_error event.
+    assert len(after) == len(before), (
+        "runtime.start() emitted a runtime_error event while in backoff "
+        "window — gate regressed"
+    )
+    # State must be untouched — no transition through "starting".
+    assert runtime._state.get("effective_state") != "starting"
+
+
+def test_runtime_start_proceeds_after_setup_error_backoff_expires(monkeypatch, tmp_path):
+    """Once the backoff window expires, the runtime is allowed to retry.
+    The retry will fire its own runtime_error if the precondition is
+    still broken — that fresh error stamps a new last_runtime_error_at,
+    re-arming the gate.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    token_file = tmp_path / "token-does-not-exist"  # still missing
+
+    # last_runtime_error_at older than the backoff window.
+    long_ago = (
+        datetime.now(timezone.utc) - timedelta(seconds=gateway_core.SETUP_ERROR_BACKOFF_SECONDS + 60)
+    ).isoformat()
+
+    runtime = gateway_core.ManagedAgentRuntime(
+        {
+            "name": "expired-hermes",
+            "agent_id": "agent-expired",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "hermes_sentinel",
+            "token_file": str(token_file),
+            "last_runtime_error_at": long_ago,
+        },
+        client_factory=lambda **kwargs: object(),
+    )
+
+    before = gateway_core.load_recent_gateway_activity()
+    runtime.start()
+    after = gateway_core.load_recent_gateway_activity()
+
+    new_events = [e for e in after if e not in before]
+    runtime_errors = [e for e in new_events if e.get("event") == "runtime_error"]
+    assert len(runtime_errors) == 1, (
+        f"expected exactly one runtime_error after backoff expired, got {len(runtime_errors)}"
+    )
+    # Fresh error stamps a new last_runtime_error_at, re-arming the gate
+    # against repeat retries from the next reconcile tick.
+    assert runtime.entry.get("last_runtime_error_at") is not None
+    assert runtime.entry["last_runtime_error_at"] != long_ago
+
+
+# ---------------------------------------------------------------------------
+# Upstream 429 backoff + cache (b)
+# ---------------------------------------------------------------------------
+
+
+def _make_429_error() -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://paxai.app/api/v1/agents")
+    response = httpx.Response(429, headers={"retry-after": "12"}, request=request)
+    return httpx.HTTPStatusError("429 Too Many Requests", request=request, response=response)
+
+
+def test_with_upstream_429_retry_succeeds_on_second_attempt(monkeypatch):
+    """Helper retries on 429 and returns the success result of the next call."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(gateway_cmd.time, "sleep", lambda s: sleeps.append(s))
+    calls = {"n": 0}
+
+    def call():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _make_429_error()
+        return {"agent": "ok"}
+
+    result = gateway_cmd._with_upstream_429_retry(call, max_retries=2, base_wait=1.0)
+    assert result == {"agent": "ok"}
+    assert calls["n"] == 2
+    assert sleeps == [1.0]  # one backoff before the successful retry
+
+
+def test_with_upstream_429_retry_exhausts_then_raises(monkeypatch):
+    """All attempts 429 → raises UpstreamRateLimitedError carrying the
+    parsed Retry-After hint.
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr(gateway_cmd.time, "sleep", lambda s: sleeps.append(s))
+
+    def call():
+        raise _make_429_error()
+
+    with pytest.raises(gateway_cmd.UpstreamRateLimitedError) as exc_info:
+        gateway_cmd._with_upstream_429_retry(call, max_retries=2, base_wait=1.0)
+    assert exc_info.value.retries_attempted == 2
+    assert exc_info.value.retry_after_seconds == 12  # parsed from header
+    # 2 retries × exponential = 1s + 2s.
+    assert sleeps == [1.0, 2.0]
+
+
+def test_with_upstream_429_retry_propagates_other_errors(monkeypatch):
+    """Non-429 httpx errors propagate without retry."""
+    monkeypatch.setattr(gateway_cmd.time, "sleep", lambda s: None)
+
+    request = httpx.Request("POST", "https://paxai.app/api/v1/agents")
+    server_error = httpx.HTTPStatusError(
+        "500 Internal Server Error",
+        request=request,
+        response=httpx.Response(500, request=request),
+    )
+
+    def call():
+        raise server_error
+
+    with pytest.raises(httpx.HTTPStatusError):
+        gateway_cmd._with_upstream_429_retry(call, max_retries=3, base_wait=0.1)
+
+
+def test_backend_agent_record_falls_back_to_cache_on_failure(monkeypatch, tmp_path):
+    """When list_agents raises (e.g. 429), _backend_agent_record returns
+    the agent from the local cache instead of None — so dashboard reads
+    survive transient upstream rate limits.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    # Seed the cache as if a previous successful call had populated it.
+    gateway_cmd._save_agents_cache(
+        [
+            {"name": "cached_agent", "agent_id": "agent-cached", "space_id": "space-1"},
+            {"name": "other_agent", "agent_id": "agent-other"},
+        ]
+    )
+
+    class FailingClient:
+        def list_agents(self):
+            raise _make_429_error()
+
+    found = gateway_cmd._backend_agent_record(FailingClient(), "cached_agent")
+    assert found is not None
+    assert found["agent_id"] == "agent-cached"
+
+
+def test_backend_agent_record_seeds_cache_on_successful_upstream(monkeypatch, tmp_path):
+    """Successful upstream list_agents writes to the cache so the next
+    failure has data to serve.
+    """
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    assert gateway_cmd._load_agents_cache() == []  # empty pre-condition
+
+    class StubClient:
+        def list_agents(self):
+            return {
+                "agents": [
+                    {"name": "fresh_agent", "agent_id": "agent-fresh", "space_id": "space-1"},
+                ]
+            }
+
+    found = gateway_cmd._backend_agent_record(StubClient(), "fresh_agent")
+    assert found is not None
+    assert found["agent_id"] == "agent-fresh"
+
+    cached = gateway_cmd._load_agents_cache()
+    assert any(a.get("name") == "fresh_agent" for a in cached), "upstream success should seed cache"
+
+
+# ---------------------------------------------------------------------------
+# Spaces hygiene: registry repair, /api/spaces fallback, CLI list
+# ---------------------------------------------------------------------------
+
+
+_GOOD_SPACE_UUID = "49afd277-78d2-4a32-9858-3594cda684af"
+
+
+def test_reconcile_corrupt_space_ids_recovers_uuid_from_active_space():
+    registry = {
+        "agents": [
+            {
+                "name": "taskforge_backend",
+                "space_id": "madtank's Workspace",
+                "active_space_id": _GOOD_SPACE_UUID,
+                "active_space_name": "madtank's Workspace",
+                "default_space_id": _GOOD_SPACE_UUID,
+            }
+        ]
+    }
+    repaired = gateway_core.reconcile_corrupt_space_ids(registry)
+    assert repaired == 1
+    assert registry["agents"][0]["space_id"] == _GOOD_SPACE_UUID
+
+
+def test_reconcile_corrupt_space_ids_falls_back_to_allowed_spaces():
+    registry = {
+        "agents": [
+            {
+                "name": "x",
+                "space_id": "Workspace-Name",
+                "allowed_spaces": [{"space_id": _GOOD_SPACE_UUID, "name": "ws"}],
+            }
+        ]
+    }
+    assert gateway_core.reconcile_corrupt_space_ids(registry) == 1
+    assert registry["agents"][0]["space_id"] == _GOOD_SPACE_UUID
+
+
+def test_reconcile_corrupt_space_ids_idempotent_on_clean_registry():
+    registry = {
+        "agents": [
+            {"name": "a", "space_id": _GOOD_SPACE_UUID},
+            {"name": "b", "space_id": ""},  # empty is left alone
+            {"name": "c"},  # no space_id at all is left alone
+        ]
+    }
+    assert gateway_core.reconcile_corrupt_space_ids(registry) == 0
+    assert registry["agents"][0]["space_id"] == _GOOD_SPACE_UUID
+    assert registry["agents"][1]["space_id"] == ""
+    assert "space_id" not in registry["agents"][2]
+
+
+def test_reconcile_corrupt_space_ids_skips_when_no_uuid_anywhere():
+    registry = {
+        "agents": [
+            {"name": "lost", "space_id": "Some Name", "active_space_id": "Also Not A UUID"},
+        ]
+    }
+    # Nothing recoverable — leave the bad value in place rather than fabricate.
+    assert gateway_core.reconcile_corrupt_space_ids(registry) == 0
+    assert registry["agents"][0]["space_id"] == "Some Name"
+
+
+def test_load_gateway_registry_heals_corrupt_space_id_in_place(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_dir = gateway_core.gateway_dir()
+    gateway_dir.mkdir(parents=True, exist_ok=True)
+    raw = {
+        "version": 1,
+        "agents": [
+            {
+                "name": "taskforge_backend",
+                "space_id": "madtank's Workspace",
+                "active_space_id": _GOOD_SPACE_UUID,
+                "default_space_id": _GOOD_SPACE_UUID,
+            }
+        ],
+    }
+    gateway_core.registry_path().write_text(json.dumps(raw), encoding="utf-8")
+    loaded = gateway_core.load_gateway_registry()
+    assert loaded["agents"][0]["space_id"] == _GOOD_SPACE_UUID
+
+
+def test_resolve_gateway_agent_home_space_resolves_name_to_uuid(monkeypatch):
+    captured = {}
+
+    def fake_resolve(client, *, explicit):
+        captured["explicit"] = explicit
+        return _GOOD_SPACE_UUID
+
+    monkeypatch.setattr(gateway_cmd, "resolve_space_id", fake_resolve)
+
+    resolved = gateway_cmd._resolve_gateway_agent_home_space(
+        client=object(),
+        session={},
+        registry={"agents": []},
+        explicit_space_id="madtank's Workspace",
+    )
+    assert resolved == _GOOD_SPACE_UUID
+    assert captured["explicit"] == "madtank's Workspace"
+
+
+def test_resolve_gateway_agent_home_space_passthrough_for_uuid(monkeypatch):
+    def fake_resolve(*args, **kwargs):
+        raise AssertionError("UUID input should not require a backend round-trip")
+
+    monkeypatch.setattr(gateway_cmd, "resolve_space_id", fake_resolve)
+
+    resolved = gateway_cmd._resolve_gateway_agent_home_space(
+        client=object(),
+        session={},
+        registry={"agents": []},
+        explicit_space_id=_GOOD_SPACE_UUID,
+    )
+    assert resolved == _GOOD_SPACE_UUID
+
+
+def test_spaces_payload_returns_session_active_space_when_upstream_fails(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": _GOOD_SPACE_UUID,
+            "space_name": "madtank's Workspace",
+            "username": "madtank",
+        }
+    )
+
+    def fake_client_loader():
+        class Boom:
+            def list_spaces(self):
+                raise httpx.HTTPStatusError(
+                    "429 Too Many Requests",
+                    request=httpx.Request("GET", "https://paxai.app/api/v1/spaces"),
+                    response=httpx.Response(429),
+                )
+
+        return Boom()
+
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", fake_client_loader)
+
+    payload = gateway_cmd._spaces_payload()
+    assert payload["active_space_id"] == _GOOD_SPACE_UUID
+    assert payload["active_space_name"] == "madtank's Workspace"
+    # Active space surfaces in the spaces list even with no cache so the UI
+    # always has something to render.
+    assert any(s["id"] == _GOOD_SPACE_UUID for s in payload["spaces"])
+    assert "error" in payload
+
+
+def test_spaces_payload_uses_cached_spaces_after_upstream_failure(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": _GOOD_SPACE_UUID,
+            "space_name": "madtank's Workspace",
+        }
+    )
+
+    other_space = "78950af5-4d27-441b-9296-ec46de8ba35d"
+
+    class FirstClient:
+        def list_spaces(self):
+            return {
+                "spaces": [
+                    {"id": _GOOD_SPACE_UUID, "name": "madtank's Workspace"},
+                    {"id": other_space, "name": "Other Workspace"},
+                ]
+            }
+
+    class FailingClient:
+        def list_spaces(self):
+            raise RuntimeError("upstream rate limited")
+
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: FirstClient())
+    first = gateway_cmd._spaces_payload()
+    assert {s["id"] for s in first["spaces"]} == {_GOOD_SPACE_UUID, other_space}
+
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: FailingClient())
+    second = gateway_cmd._spaces_payload()
+    assert second.get("cached") is True
+    assert {s["id"] for s in second["spaces"]} == {_GOOD_SPACE_UUID, other_space}
+
+
+def test_gateway_spaces_list_command_renders_table(monkeypatch, tmp_path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": _GOOD_SPACE_UUID,
+            "space_name": "madtank's Workspace",
+        }
+    )
+
+    class StubClient:
+        def list_spaces(self):
+            return {
+                "spaces": [
+                    {"id": _GOOD_SPACE_UUID, "name": "madtank's Workspace", "slug": "madtank"},
+                ]
+            }
+
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: StubClient())
+
+    result = runner.invoke(app, ["gateway", "spaces", "list", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["active_space_id"] == _GOOD_SPACE_UUID
+    assert payload["spaces"][0]["id"] == _GOOD_SPACE_UUID
