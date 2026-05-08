@@ -467,9 +467,7 @@ def update(
     gateway_cfg = resolve_gateway_config()
     if gateway_cfg:
         if assign_to is not None:
-            fields["assignee_id"] = _resolve_update_assignee_id_via_gateway(
-                gateway_cfg, task_id, assign_to
-            )
+            fields["assignee_id"] = _resolve_update_assignee_id_via_gateway(gateway_cfg, task_id, assign_to)
         data = _gateway_local_call(
             gateway_cfg=gateway_cfg,
             method="update_task",
@@ -518,9 +516,7 @@ def _resolve_update_assignee_id(client, task_id: str, assignee: str) -> str:
     return _resolve_assignee_id(client, candidate, space_id=task_space_id)
 
 
-def _resolve_update_assignee_id_via_gateway(
-    gateway_cfg: dict, task_id: str, assignee: str
-) -> str:
+def _resolve_update_assignee_id_via_gateway(gateway_cfg: dict, task_id: str, assignee: str) -> str:
     """Resolve --assign-to for ``ax tasks update`` when running through Gateway.
 
     Mirrors ``_resolve_update_assignee_id`` but performs the lookups via the
