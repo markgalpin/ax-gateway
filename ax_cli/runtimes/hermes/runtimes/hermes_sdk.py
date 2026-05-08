@@ -169,7 +169,7 @@ def _resolve_provider_config(model: str | None) -> dict:
         return {
             "provider": "anthropic",
             "api_mode": "anthropic_messages",
-            "base_url": os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
+            "base_url": os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
             "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
             "model": model_name,
         }
@@ -202,7 +202,7 @@ def _resolve_provider_config(model: str | None) -> dict:
             return {
                 "provider": "anthropic",
                 "api_mode": "anthropic_messages",
-                "base_url": os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
+                "base_url": os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
                 "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
                 "model": model_name,
             }
@@ -216,10 +216,26 @@ def _resolve_provider_config(model: str | None) -> dict:
 
 
 def _ensure_hermes_importable():
-    """Add hermes repo to sys.path if needed."""
+    """Put hermes repo first on sys.path so its ``tools.registry`` wins.
+
+    The gateway sets PYTHONPATH with the bundled sentinel shim *before* the
+    hermes repo (the shim provides security wrappers).  That ordering means
+    ``from tools.registry import ...`` would resolve to the shim — which has
+    no ``registry`` module.  We force the hermes repo to position 0 here so
+    Python finds the real ``tools`` package first, then evict any stale cache.
+    """
     repo_str = str(HERMES_REPO)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
+    # Force to position 0 even if already present further back on sys.path.
+    if repo_str in sys.path:
+        sys.path.remove(repo_str)
+    sys.path.insert(0, repo_str)
+    hermes_tools = HERMES_REPO / "tools"
+    if hermes_tools.is_dir() and "tools" in sys.modules:
+        loaded = getattr(sys.modules["tools"], "__file__", "") or ""
+        if not loaded.startswith(repo_str):
+            del sys.modules["tools"]
+            for key in [k for k in sys.modules if k.startswith("tools.")]:
+                del sys.modules[key]
 
 
 def _secure_hermes_tools(workdir: str):

@@ -4059,6 +4059,7 @@ def _build_hermes_sentinel_env(entry: dict[str, Any]) -> dict[str, str]:
             "HERMES_MAX_ITERATIONS": str(
                 entry.get("hermes_max_iterations") or os.environ.get("HERMES_MAX_ITERATIONS") or 60
             ),
+            "HERMES_REPO_PATH": hermes_repo,
         }
     )
     if hermes_home is not None:
