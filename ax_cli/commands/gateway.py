@@ -78,6 +78,7 @@ from ..gateway import (
     load_gateway_registry,
     load_gateway_session,
     load_recent_gateway_activity,
+    load_space_cache,
     looks_like_space_uuid,
     ollama_setup_status,
     record_gateway_activity,
@@ -85,9 +86,12 @@ from ..gateway import (
     save_agent_pending_messages,
     save_gateway_registry,
     save_gateway_session,
+    save_space_cache,
+    space_name_from_cache,
     ui_log_path,
     ui_status,
     upsert_agent_entry,
+    upsert_space_cache_entry,
     verify_local_session_token,
     write_gateway_ui_state,
 )
@@ -580,6 +584,10 @@ def _send_local_session_message(*, session_token: str, body: dict) -> dict:
     metadata = (
         merge_explicit_mentions_metadata(metadata, content, exclude=[sender_name] if sender_name else ()) or metadata
     )
+    raw_attachments = body.get("attachments")
+    attachments_payload: list[dict] | None = None
+    if isinstance(raw_attachments, list) and raw_attachments:
+        attachments_payload = [a for a in raw_attachments if isinstance(a, dict)]
     payload = client.send_message(
         space_id,
         content,
@@ -588,8 +596,14 @@ def _send_local_session_message(*, session_token: str, body: dict) -> dict:
         parent_id=parent_id or None,
         metadata=metadata,
         message_type=str(body.get("message_type") or "text"),
+        attachments=attachments_payload,
     )
-    record_gateway_activity("local_message_sent", entry=entry, message_id=(payload.get("message") or {}).get("id"))
+    record_gateway_activity(
+        "local_message_sent",
+        entry=entry,
+        message_id=(payload.get("message") or {}).get("id"),
+        attachment_count=len(attachments_payload or []),
+    )
     return {"agent": entry.get("name"), "message": payload, "session": session}
 
 
@@ -652,6 +666,12 @@ _LOCAL_PROXY_METHODS: dict[str, dict] = {
     "list_tasks": {"kwargs": ["limit", "space_id"]},
     "get_task": {"args": ["task_id"]},
     "update_task": {"args": ["task_id"], "kwargs": ["status", "priority"]},
+    # File upload proxy: agents on the Gateway-native path can attach files
+    # to messages without holding the user PAT. Daemon reads the path on
+    # behalf of the agent and uploads via the agent's managed AxClient, so
+    # the upload is correctly attributed to the agent identity. Local-only
+    # by construction (paths are relative to the operator's filesystem).
+    "upload_file": {"args": ["file_path"], "kwargs": ["space_id"]},
 }
 
 
@@ -680,6 +700,15 @@ def _proxy_local_session_call(*, session_token: str, body: dict) -> dict:
     for key in spec.get("kwargs", []):
         if key in args_in and args_in[key] is not None:
             keyword[key] = args_in[key]
+
+    if method == "upload_file":
+        workdir = str(entry.get("workdir") or "").strip()
+        if not workdir:
+            raise ValueError("upload_file requires the agent to have a workdir configured")
+        file_path = Path(positional[0]).resolve()
+        workdir_path = Path(workdir).resolve()
+        if not str(file_path).startswith(str(workdir_path) + os.sep) and file_path != workdir_path:
+            raise ValueError(f"upload_file path {file_path} is outside the agent workdir {workdir_path}")
 
     client = _load_managed_agent_client(entry)
     method_fn = getattr(client, method, None)
@@ -822,13 +851,34 @@ def _space_list_from_response(raw: object) -> list[dict]:
 
 
 def _space_name_for_id(client: AxClient, space_id: str) -> str | None:
+    """Friendly-name lookup with persistent-cache short-circuit.
+
+    Hits the local space cache first so we don't pay an upstream `list_spaces`
+    call (and risk a 429) for a name we already know. Only falls through to
+    upstream when the cache has no entry for this id, and refreshes the cache
+    on a successful fetch so future calls stay in-process.
+    """
+    cached = space_name_from_cache(space_id)
+    if cached:
+        return cached
     try:
-        for item in _space_list_from_response(client.list_spaces()):
-            if auth_cmd._candidate_space_id(item) == space_id:
-                return str(item.get("name") or item.get("slug") or space_id)
+        rows = _space_list_from_response(client.list_spaces())
     except Exception:
         return None
-    return None
+    refreshed: list[dict] = []
+    match: str | None = None
+    for item in rows:
+        sid = auth_cmd._candidate_space_id(item)
+        if not sid:
+            continue
+        name = str(item.get("name") or item.get("slug") or sid)
+        slug = str(item.get("slug") or "").strip() or None
+        refreshed.append({"id": sid, "name": name, "slug": slug})
+        if sid == space_id:
+            match = name
+    if refreshed:
+        save_space_cache(refreshed)
+    return match
 
 
 def _resolve_gateway_agent_home_space(
@@ -1540,9 +1590,48 @@ def _set_managed_agent_desired_state(name: str, desired_state: str) -> dict:
     if not entry:
         raise LookupError(f"Managed agent not found: {name}")
     entry["desired_state"] = desired_state
+    if desired_state == "stopped":
+        entry.pop("manual_attach_state", None)
+        entry.pop("manual_attached_at", None)
+        entry.pop("manual_attach_note", None)
+        entry.pop("manual_attach_source", None)
+        if str(entry.get("local_attach_state") or "").lower() == "manual_attached":
+            entry["local_attach_state"] = "stopped"
+            entry["local_attach_detail"] = "Claude Code is not running locally."
     save_gateway_registry(registry)
     event = "managed_agent_desired_running" if desired_state == "running" else "managed_agent_desired_stopped"
     record_gateway_activity(event, entry=entry)
+    return annotate_runtime_health(entry, registry=registry)
+
+
+def _mark_attached_agent_session(name: str, *, note: str | None = None) -> dict:
+    registry = load_gateway_registry()
+    entry = find_agent_entry(registry, name)
+    if not entry:
+        raise LookupError(f"Managed agent not found: {name}")
+    profile = gateway_core.infer_operator_profile(entry)
+    if profile["placement"] != "attached" or profile["activation"] != "attach_only":
+        raise ValueError(f"@{name} is not an attached-session agent.")
+    now = datetime.now(timezone.utc).isoformat()
+    entry["desired_state"] = "running"
+    entry["effective_state"] = "running"
+    entry["manual_attach_state"] = "attached"
+    entry["manual_attached_at"] = now
+    entry["manual_attach_source"] = "operator"
+    if note is not None:
+        entry["manual_attach_note"] = str(note).strip()
+    entry["current_status"] = "idle"
+    entry["current_activity"] = "Manually attached"
+    entry["local_attach_state"] = "manual_attached"
+    entry["local_attach_detail"] = "Operator marked this Claude Code session as manually attached."
+    entry["last_connected_at"] = now
+    entry["last_seen_at"] = now
+    save_gateway_registry(registry)
+    record_gateway_activity(
+        "manual_attach_confirmed",
+        entry=entry,
+        activity_message=str(note or "Operator marked attached session as active."),
+    )
     return annotate_runtime_health(entry, registry=registry)
 
 
@@ -2088,6 +2177,19 @@ def _inbox_for_managed_agent(
     if not selected_space:
         raise ValueError(f"Managed agent is missing a space id: @{name}")
     client = _load_managed_agent_client(entry)
+    # Capture the local pending queue first — it's the Gateway's view of
+    # "messages addressed to this agent that haven't been picked up yet".
+    # The drawer's "X unread messages" badge counts these. Use it to filter
+    # the upstream listing when unread_only=True so the drawer's body matches
+    # its own header (without this, upstream returns ALL messages and the
+    # drawer says "3 unread" while showing 20).
+    agent_name = str(entry.get("name") or name)
+    pending_items_for_filter = load_agent_pending_messages(agent_name)
+    pending_ids = {
+        str(item.get("message_id") or item.get("id") or "").strip()
+        for item in pending_items_for_filter
+        if str(item.get("message_id") or item.get("id") or "").strip()
+    }
     data = client.list_messages(
         limit=limit,
         channel=channel,
@@ -2097,20 +2199,51 @@ def _inbox_for_managed_agent(
         mark_read=mark_read,
     )
     messages = data if isinstance(data, list) else data.get("messages", [])
+    if unread_only:
+        if pending_ids:
+            messages = [
+                msg for msg in messages if str(msg.get("id") or msg.get("message_id") or "").strip() in pending_ids
+            ]
+        else:
+            messages = []
+    # Mirror `_local_session_inbox`: when the operator explicitly marks read,
+    # the local pending queue (which powers `backlog_depth` and the UI badge)
+    # must also be cleared. Without this, the upstream returns
+    # `marked_read_count=N` but the side app keeps showing N unread because
+    # `backlog_depth` is read straight off the queue file.
+    local_marked_read_count = 0
+    if mark_read:
+        local_marked_read_count = len(pending_items_for_filter)
+        save_agent_pending_messages(agent_name, [])
+        registry_after = load_gateway_registry()
+        stored = find_agent_entry(registry_after, agent_name)
+        if stored is not None:
+            stored["backlog_depth"] = 0
+            stored["queue_depth"] = 0
+            stored["current_status"] = None
+            stored["current_activity"] = None
+            save_gateway_registry(registry_after)
     record_gateway_activity(
         "managed_inbox_polled",
         entry=entry,
         message_count=len(messages),
         mark_read=mark_read,
         space_id=selected_space,
+        local_marked_read_count=local_marked_read_count,
     )
     return {
         "agent": entry.get("name"),
         "agent_id": entry.get("agent_id"),
         "space_id": selected_space,
         "messages": messages,
-        "unread_count": data.get("unread_count") if isinstance(data, dict) else None,
+        # When unread_only=True, the count returned reflects the pending
+        # queue intersection (what the drawer actually shows), not the
+        # upstream's idea of unread. Operators see one consistent number.
+        "unread_count": (
+            len(messages) if unread_only else (data.get("unread_count") if isinstance(data, dict) else None)
+        ),
         "marked_read_count": data.get("marked_read_count") if isinstance(data, dict) else None,
+        "local_marked_read_count": local_marked_read_count if mark_read else None,
     }
 
 
@@ -3409,28 +3542,14 @@ def _render_gateway_dashboard(payload: dict) -> Group:
     )
 
 
-def _spaces_cache_path() -> Path:
-    return gateway_dir() / "spaces.cache.json"
-
-
-def _load_spaces_cache() -> list[dict]:
-    try:
-        raw = json.loads(_spaces_cache_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    items = raw.get("spaces") if isinstance(raw, dict) else raw
-    return [item for item in (items or []) if isinstance(item, dict)]
-
-
-def _save_spaces_cache(spaces: list[dict]) -> None:
-    payload = {"spaces": spaces, "saved_at": datetime.now(timezone.utc).isoformat()}
-    try:
-        _spaces_cache_path().write_text(json.dumps(payload), encoding="utf-8")
-    except OSError:
-        pass
-
-
 def _normalize_spaces_response(items: list) -> list[dict]:
+    """Normalize an upstream `list_spaces` response into [{id, name, slug}].
+
+    If a row arrives with an empty/missing name (we've seen this happen for
+    brand-new spaces), fall back to the local cache before defaulting to the
+    UUID — avoids the "raw UUID rendered in picker" symptom for any space the
+    operator has seen at least once.
+    """
     spaces: list[dict] = []
     for item in items or []:
         if not isinstance(item, dict):
@@ -3438,10 +3557,12 @@ def _normalize_spaces_response(items: list) -> list[dict]:
         space_id = str(item.get("id") or item.get("space_id") or "").strip()
         if not space_id:
             continue
+        upstream_name = str(item.get("name") or item.get("space_name") or "").strip()
+        cached_name = space_name_from_cache(space_id) if not upstream_name else None
         spaces.append(
             {
                 "id": space_id,
-                "name": str(item.get("name") or item.get("space_name") or space_id),
+                "name": upstream_name or cached_name or space_id,
                 "slug": str(item.get("slug") or "").strip() or None,
             }
         )
@@ -3468,10 +3589,10 @@ def _spaces_payload() -> dict:
         items = raw.get("spaces", raw) if isinstance(raw, dict) else raw
         spaces = _normalize_spaces_response(items or [])
         if spaces:
-            _save_spaces_cache(spaces)
+            save_space_cache(spaces)
     except Exception as exc:  # noqa: BLE001 — upstream errors are routine here
         error = str(exc)
-        spaces = _load_spaces_cache()
+        spaces = load_space_cache()
         cached = bool(spaces)
 
     if active_space_id and not any(s["id"] == active_space_id for s in spaces):
@@ -5496,6 +5617,18 @@ def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
                     )
                     _write_json_response(self, payload, status=HTTPStatus.ACCEPTED)
                     return
+                if parsed.path.endswith("/manual-attach") and parsed.path.startswith("/api/agents/"):
+                    name = unquote(parsed.path.removeprefix("/api/agents/").removesuffix("/manual-attach")).strip()
+                    try:
+                        payload = _mark_attached_agent_session(
+                            name,
+                            note=str(body.get("note") or "").strip() or None,
+                        )
+                    except (LookupError, ValueError) as exc:
+                        _write_json_response(self, {"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    _write_json_response(self, payload)
+                    return
                 if parsed.path.endswith("/send") and parsed.path.startswith("/api/agents/"):
                     name = unquote(parsed.path.removeprefix("/api/agents/").removesuffix("/send")).strip()
                     payload = _send_from_managed_agent(
@@ -5914,11 +6047,9 @@ def use_gateway_space(
     session["space_id"] = sid
     session["space_name"] = space_name
     path = save_gateway_session(session)
-    registry = load_gateway_registry()
-    registry.setdefault("gateway", {})
-    registry["gateway"]["space_id"] = sid
-    registry["gateway"]["space_name"] = space_name
-    save_gateway_registry(registry)
+    # Persist the resolved id/name into the spaces cache so subsequent slug
+    # switches stay cache-served and stop hammering list_spaces.
+    upsert_space_cache_entry(sid, name=space_name, slug=None)
     record_gateway_activity("gateway_space_use", space_id=sid, space_name=space_name)
     result = {
         "session_path": str(path),
@@ -7721,6 +7852,25 @@ def start_agent(name: str = typer.Argument(..., help="Managed agent name")):
         err_console.print(f"[red]Managed agent not found:[/red] {name}")
         raise typer.Exit(1)
     err_console.print(f"[green]Desired state set to running:[/green] @{name}")
+
+
+@agents_app.command("mark-attached")
+def mark_attached_agent(
+    name: str = typer.Argument(..., help="Attached-session agent name"),
+    note: str = typer.Option(None, "--note", help="Optional operator note for the manual attach assertion"),
+    as_json: bool = JSON_OPTION,
+):
+    """Mark an attached-session agent as manually attached and active."""
+    try:
+        payload = _mark_attached_agent_session(name, note=note)
+    except (LookupError, ValueError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    if as_json:
+        print_json(payload)
+        return
+    err_console.print(f"[green]Marked manually attached:[/green] @{name}")
+    err_console.print("  state = active")
 
 
 def _attach_command_for_payload(payload: dict) -> str:

@@ -60,6 +60,7 @@ def _gateway_local_send(
     content: str,
     space_id: str | None,
     parent_id: str | None,
+    attachments: list[dict] | None = None,
 ) -> dict:
     gateway_url = str(gateway_cfg.get("url") or "http://127.0.0.1:8765")
     connect_payload = _gateway_local_connect(
@@ -96,6 +97,8 @@ def _gateway_local_send(
     body: dict = {"content": content, "space_id": space_id, "parent_id": parent_id}
     if metadata:
         body["metadata"] = metadata
+    if attachments:
+        body["attachments"] = attachments
     try:
         response = httpx.post(
             f"{gateway_url.rstrip('/')}/local/send",
@@ -843,18 +846,56 @@ def send(
         if act_as:
             typer.echo("Error: --act-as is not supported with Gateway-native local identity.", err=True)
             raise typer.Exit(1)
-        if files:
-            typer.echo("Error: --file is not supported with Gateway-native local identity yet.", err=True)
-            raise typer.Exit(1)
         if channel != "main":
             typer.echo("Error: custom --channel is not supported with Gateway-native local identity yet.", err=True)
             raise typer.Exit(1)
+        # --file on Gateway-native: upload through the daemon's local proxy so
+        # the upload is correctly attributed to the workdir-bound agent identity
+        # (its managed PAT), not the operator's user PAT. The proxy reads the
+        # path on the operator's filesystem — same machine as the daemon by
+        # construction, so no transport of file bytes over an external hop.
+        attachments_payload: list[dict] = []
+        for file_path in files or []:
+            local_path = Path(file_path).expanduser().resolve()
+            if not local_path.exists() or not local_path.is_file():
+                typer.echo(f"Error: file not found: {file_path}", err=True)
+                raise typer.Exit(1)
+            try:
+                upload_data = _gateway_local_call(
+                    gateway_cfg=gateway_cfg,
+                    method="upload_file",
+                    args={"file_path": str(local_path)},
+                    space_id=space_id,
+                )
+            except typer.BadParameter as exc:
+                typer.echo(f"Error: {exc}", err=True)
+                raise typer.Exit(1) from exc
+            raw_attachment = upload_data.get("attachment", upload_data) if isinstance(upload_data, dict) else {}
+            attachment_id = (
+                raw_attachment.get("id") or raw_attachment.get("attachment_id") or raw_attachment.get("file_id")
+            )
+            if not attachment_id:
+                typer.echo(f"Error: upload of {local_path.name} did not return an attachment id.", err=True)
+                raise typer.Exit(1)
+            attachments_payload.append(
+                _attachment_ref(
+                    attachment_id=str(attachment_id),
+                    content_type=str(raw_attachment.get("content_type") or "application/octet-stream"),
+                    filename=str(raw_attachment.get("filename") or local_path.name),
+                    size=int(
+                        raw_attachment.get("size") or raw_attachment.get("size_bytes") or local_path.stat().st_size
+                    ),
+                    url=str(raw_attachment.get("url") or ""),
+                    context_key=str(raw_attachment.get("context_key") or "") or None,
+                )
+            )
         pending = check_pending_replies(gateway_cfg=gateway_cfg, space_id=space_id)
         data = _gateway_local_send(
             gateway_cfg=gateway_cfg,
             content=final_content,
             space_id=space_id,
             parent_id=parent,
+            attachments=attachments_payload or None,
         )
         msg = data.get("message", data)
         msg_id = msg.get("id") or msg.get("message_id") or data.get("id")

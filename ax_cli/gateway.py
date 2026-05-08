@@ -1560,12 +1560,18 @@ def _space_cache_rows(value: object) -> list[dict[str, Any]]:
     return rows
 
 
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
 def _space_name_from_cache(allowed_spaces: list[dict[str, Any]], space_id: str | None) -> str | None:
     if not space_id:
         return None
     for item in allowed_spaces:
         if str(item.get("space_id") or "") == str(space_id):
-            return str(item.get("name") or space_id)
+            name = str(item.get("name") or "").strip()
+            if name and not _UUID_RE.match(name):
+                return name
+            return None
     return None
 
 
@@ -1581,9 +1587,17 @@ def apply_entry_current_space(
     if not normalized_space_id:
         return entry
     current_allowed = _space_cache_rows(entry.get("allowed_spaces"))
+    # Resolve the friendly name in this order:
+    #   1. caller-supplied (most authoritative)
+    #   2. agent's own allowed_spaces cache (covers same-space writes)
+    #   3. global on-disk space cache (covers space moves where the new
+    #      space hasn't been added to the agent's allowed_spaces yet)
+    #   4. legacy entry.space_name fallback — deliberately last because it
+    #      can be stale right after a move (the previous space's name).
     normalized_name = (
         str(space_name or "").strip()
         or _space_name_from_cache(current_allowed, normalized_space_id)
+        or space_name_from_cache(normalized_space_id)
         or str(entry.get("space_name") or normalized_space_id)
     )
     rows: list[dict[str, Any]] = [
@@ -1902,11 +1916,15 @@ def ensure_gateway_identity_binding(
         ).strip()
         or None
     )
-    default_space_name = _space_name_from_cache(allowed_spaces, default_space_id) or str(
-        entry.get("default_space_name") or entry.get("space_name") or default_space_id or ""
+    default_space_name = (
+        _space_name_from_cache(allowed_spaces, default_space_id)
+        or space_name_from_cache(default_space_id)
+        or str(entry.get("default_space_name") or entry.get("space_name") or default_space_id or "")
     )
-    active_space_name = _space_name_from_cache(allowed_spaces, active_space_id) or str(
-        entry.get("active_space_name") or entry.get("space_name") or active_space_id or ""
+    active_space_name = (
+        _space_name_from_cache(allowed_spaces, active_space_id)
+        or space_name_from_cache(active_space_id)
+        or str(entry.get("active_space_name") or entry.get("space_name") or active_space_id or "")
     )
     binding = {
         "identity_binding_id": str((existing or {}).get("identity_binding_id") or f"idbind_{str(uuid.uuid4())}"),
@@ -2044,6 +2062,7 @@ def evaluate_identity_space_binding(
         str(
             (binding or {}).get("default_space_name")
             or _space_name_from_cache(allowed_spaces, default_space_id)
+            or space_name_from_cache(default_space_id)
             or default_space_id
             or ""
         ).strip()
@@ -2051,6 +2070,7 @@ def evaluate_identity_space_binding(
     )
     active_space_name = (
         _space_name_from_cache(allowed_spaces, active_space_id)
+        or space_name_from_cache(active_space_id)
         or str((binding or {}).get("active_space_name") or active_space_id or "").strip()
         or None
     )
@@ -2623,14 +2643,22 @@ def annotate_runtime_health(
         local_pid_alive = str(enriched.get("desired_state") or "").lower() == "running" and _pid_is_alive(
             enriched.get("attached_session_pid")
         )
-        if local_pid_alive:
+        manual_attached = (
+            str(enriched.get("desired_state") or "").lower() == "running"
+            and str(enriched.get("manual_attach_state") or "").lower() == "attached"
+        )
+        if local_pid_alive or manual_attached:
             attached_session_alive = True
             if liveness in {"stale", "offline"}:
                 liveness = "connected"
                 connected = True
                 state = "running"
-            enriched["local_attach_state"] = "connected"
-            enriched["local_attach_detail"] = "Gateway-managed Claude Code session is running locally."
+            if manual_attached and not local_pid_alive:
+                enriched["local_attach_state"] = "manual_attached"
+                enriched["local_attach_detail"] = "Operator marked this Claude Code session as manually attached."
+            else:
+                enriched["local_attach_state"] = "connected"
+                enriched["local_attach_detail"] = "Gateway-managed Claude Code session is running locally."
         elif str(enriched.get("local_attach_state") or "").lower() == "connected":
             enriched["local_attach_state"] = "stopped"
             enriched["local_attach_detail"] = "Claude Code is not running locally."
@@ -2821,6 +2849,115 @@ def activity_log_path() -> Path:
     return gateway_dir() / "activity.jsonl"
 
 
+def space_cache_path() -> Path:
+    """Disk cache of {id, name, slug} triples for the user's visible spaces.
+
+    Single source for slug→UUID resolution and friendly-name hydration.
+    Populated by any successful upstream `list_spaces()` call. Consulted by
+    space-ref resolvers and the UI before falling back to upstream — that
+    keeps slug/name lookups out of the 429 path and lets the UI render
+    friendly names even when paxai.app rate-limits us.
+    """
+    return gateway_dir() / "spaces.cache.json"
+
+
+def load_space_cache() -> list[dict[str, Any]]:
+    path = space_cache_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    items = raw.get("spaces") if isinstance(raw, dict) else raw
+    return [item for item in (items or []) if isinstance(item, dict)]
+
+
+def save_space_cache(spaces: list[dict[str, Any]]) -> None:
+    """Atomically replace the spaces cache.
+
+    Caller passes already-normalized rows ({id, name, slug}); we mirror them
+    verbatim. Empty input is a no-op so callers don't have to null-guard.
+    """
+    if not spaces:
+        return
+    path = space_cache_path()
+    payload = {"spaces": spaces, "saved_at": datetime.now(timezone.utc).isoformat()}
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        _chmod_quiet(tmp, 0o600)
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def upsert_space_cache_entry(space_id: str, *, name: str | None = None, slug: str | None = None) -> None:
+    """Update a single entry in the spaces cache without touching the rest.
+
+    Used after a slug-resolve so a non-cached space gets persisted for future
+    slug switches without forcing a full list_spaces refresh.
+    """
+    sid = str(space_id or "").strip()
+    if not sid or not looks_like_space_uuid(sid):
+        return
+    rows = load_space_cache()
+    found = False
+    for row in rows:
+        if str(row.get("id") or row.get("space_id") or "").strip() == sid:
+            if name:
+                row["name"] = str(name)
+            if slug:
+                row["slug"] = str(slug)
+            found = True
+            break
+    if not found:
+        rows.append(
+            {
+                "id": sid,
+                "name": str(name or sid),
+                "slug": str(slug) if slug else None,
+            }
+        )
+    save_space_cache(rows)
+
+
+def lookup_space_in_cache(ref: str) -> dict[str, Any] | None:
+    """Resolve a space ref (UUID, slug, name) against the local cache.
+
+    Returns the cached row or None. Keeps slug switches out of the 429 path:
+    a slug we have ever resolved before stays resolvable from cache without
+    hitting upstream.
+    """
+    needle = str(ref or "").strip()
+    if not needle:
+        return None
+    norm = needle.lower()
+    for row in load_space_cache():
+        sid = str(row.get("id") or row.get("space_id") or "").strip()
+        if not sid:
+            continue
+        if sid == needle:
+            return row
+        slug = str(row.get("slug") or "").strip().lower()
+        name = str(row.get("name") or "").strip().lower()
+        if slug and slug == norm:
+            return row
+        if name and name == norm:
+            return row
+    return None
+
+
+def space_name_from_cache(space_id: str) -> str | None:
+    sid = str(space_id or "").strip()
+    if not sid:
+        return None
+    for row in load_space_cache():
+        if str(row.get("id") or row.get("space_id") or "").strip() == sid:
+            n = str(row.get("name") or "").strip()
+            if n:
+                return n
+    return None
+
+
 def agent_dir(name: str) -> Path:
     path = gateway_agents_dir() / name
     path.mkdir(parents=True, exist_ok=True)
@@ -2976,6 +3113,10 @@ _LOAD_SNAPSHOT_KEY = "_load_snapshot"
 # writer changed it and we must take disk's value, not memory's stale view.
 _OPERATOR_AUTHORITATIVE_FIELDS = (
     "desired_state",
+    "manual_attach_state",
+    "manual_attached_at",
+    "manual_attach_note",
+    "manual_attach_source",
     "lifecycle_phase",
     "archived_at",
     "archived_reason",
@@ -3046,6 +3187,12 @@ def load_gateway_registry() -> dict[str, Any]:
     gateway.setdefault("pid", None)
     gateway.setdefault("last_started_at", None)
     gateway.setdefault("last_reconcile_at", None)
+    # Active-space lives in session.json — strip any stale duplicate from the
+    # gateway record so callers can't accidentally read a stale value. Older
+    # registries (pre-simplification) carry these keys; this is the
+    # auto-migration path so we don't need a separate migration step.
+    gateway.pop("space_id", None)
+    gateway.pop("space_name", None)
     reconcile_corrupt_space_ids(registry)
     # Stamp a load-time snapshot so save_gateway_registry can distinguish:
     #   - "caller removed this row" vs "another writer added this row"
@@ -5843,6 +5990,18 @@ class GatewayDaemon:
                     for field in restart_fields
                     if str(runtime.entry.get(field) or "") != str(entry.get(field) or "")
                 ]
+                # If the only difference on space_id is that the runtime's
+                # cached entry held a non-UUID (legacy corruption that
+                # `reconcile_corrupt_space_ids` just repaired on load), the
+                # space hasn't actually changed — it's a clean-up. Drop
+                # `space_id` from the change set so we don't emit a phantom
+                # `runtime_rebinding` event on every registry load.
+                if "space_id" in changed_fields:
+                    prev_sid = str(runtime.entry.get("space_id") or "").strip()
+                    new_sid = str(entry.get("space_id") or "").strip()
+                    if prev_sid and not looks_like_space_uuid(prev_sid) and looks_like_space_uuid(new_sid):
+                        changed_fields = [f for f in changed_fields if f != "space_id"]
+                        runtime.entry["space_id"] = new_sid
                 if changed_fields:
                     record_gateway_activity(
                         "runtime_rebinding",
