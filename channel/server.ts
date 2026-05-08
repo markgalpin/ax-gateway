@@ -269,6 +269,31 @@ async function editMessage(
   }
 }
 
+// --- Processing status signal (best-effort) ---
+async function setProcessingStatus(
+  jwt: string,
+  messageId: string,
+  status: string,
+): Promise<void> {
+  try {
+    await fetch(`${BASE_URL}/api/v1/agents/processing-status`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+        ...(resolvedAgentId ? { "X-Agent-Id": resolvedAgentId } : {}),
+      },
+      body: JSON.stringify({
+        message_id: messageId,
+        status,
+        agent_name: AGENT_NAME,
+      }),
+    });
+  } catch {
+    // Best-effort — don't break delivery if status endpoint is down
+  }
+}
+
 // --- SSE Listener ---
 function startSSE(
   getJwt: () => Promise<string>,
@@ -693,6 +718,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       resultId = result.id;
     }
     rememberSentMessageId(resultId);
+    if (replyTo) void setProcessingStatus(jwt, replyTo, "completed");
     return {
       content: [
         {
@@ -732,6 +758,10 @@ try {
   startSSE(ensureJwt, AGENT_NAME, resolvedAgentId, async (mention) => {
     lastMessageId = mention.id;
 
+    // Listener ACK: signal receipt immediately
+    const jwt = await ensureJwt();
+    void setProcessingStatus(jwt, mention.id, "received");
+
     // Queue for reliability + get_messages polling
     mentionQueue.push({ ...mention, delivered: false });
     if (mentionQueue.length > QUEUE_MAX) mentionQueue.shift();
@@ -753,6 +783,9 @@ try {
         },
       },
     });
+
+    // Signal: delivered to runtime, agent is working
+    void setProcessingStatus(jwt, mention.id, "working");
     log(`delivered ${mention.id.slice(0, 12)} from ${mention.author}`);
   });
 } catch (err) {

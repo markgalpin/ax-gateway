@@ -942,6 +942,135 @@ def test_marker_section_replaces_in_place_on_rerun(tmp_path):
     assert "First role." not in final
 
 
+def test_channel_received_signal_fires_on_enqueue():
+    """_signal_received must emit 'received' processing status immediately."""
+
+    async def run():
+        client = FakeClient("axp_a_AgentKey.Secret")
+        bridge = CaptureBridge(client)
+        bridge.initialized.set()
+        bridge.loop = asyncio.get_running_loop()
+
+        await bridge._signal_received("incoming-456", 1)
+
+        assert len(client.processing_statuses) == 1
+        assert client.processing_statuses[0]["status"] == "received"
+        assert client.processing_statuses[0]["message_id"] == "incoming-456"
+
+    asyncio.run(run())
+
+
+def test_channel_received_respects_no_processing_status():
+    """--no-processing-status must suppress the received signal."""
+
+    async def run():
+        client = FakeClient("axp_a_AgentKey.Secret")
+        bridge = CaptureBridge(client, processing_status=False)
+        bridge.loop = asyncio.get_running_loop()
+
+        await bridge._signal_received("incoming-456", 1)
+        assert client.processing_statuses == []
+
+    asyncio.run(run())
+
+
+def test_channel_signal_sequence_received_working_completed():
+    """Full lifecycle: received fires on enqueue, working on delivery, completed on reply."""
+
+    async def run():
+        client = FakeClient("axp_a_AgentKey.Secret")
+        bridge = CaptureBridge(client)
+        bridge.initialized.set()
+        bridge.loop = asyncio.get_running_loop()
+
+        event = MentionEvent(
+            message_id="incoming-seq",
+            parent_id=None,
+            conversation_id=None,
+            author="alex",
+            prompt="check this",
+            raw_content="@peer-agent check this",
+            created_at=None,
+            space_id="space-123",
+        )
+
+        # Step 1: received on enqueue
+        await bridge._signal_received(event.message_id, 1)
+
+        # Step 2: working via emit_mentions
+        await bridge.mention_queue.put(event)
+        task = asyncio.create_task(bridge.emit_mentions())
+        await asyncio.wait_for(bridge.mention_queue.join(), timeout=1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Step 3: completed via reply
+        await bridge.handle_tool_call(
+            1,
+            {"name": "reply", "arguments": {"text": "done"}},
+        )
+
+        statuses = [s["status"] for s in client.processing_statuses]
+        assert statuses == ["received", "working", "completed"]
+
+    asyncio.run(run())
+
+
+def test_channel_queue_depth_in_gateway_touch(monkeypatch):
+    """touch_gateway calls must include actual backlog_depth from the mention queue."""
+    gateway_touches: list[dict] = []
+
+    def capture_touch(agent_name, *, event=None, **updates):
+        gateway_touches.append({"event": event, **updates})
+
+    monkeypatch.setattr(channel_mod, "_touch_gateway_channel_entry", capture_touch)
+
+    async def run():
+        client = FakeClient("axp_a_AgentKey.Secret")
+        bridge = CaptureBridge(client)
+        bridge.initialized.set()
+        bridge.loop = asyncio.get_running_loop()
+
+        event = MentionEvent(
+            message_id="incoming-depth",
+            parent_id=None,
+            conversation_id=None,
+            author="alex",
+            prompt="check depth",
+            raw_content="@peer-agent check depth",
+            created_at=None,
+            space_id="space-123",
+        )
+
+        # received signal includes queue depth
+        await bridge._signal_received(event.message_id, 3)
+
+        # emit_mentions includes queue depth
+        await bridge.mention_queue.put(event)
+        task = asyncio.create_task(bridge.emit_mentions())
+        await asyncio.wait_for(bridge.mention_queue.join(), timeout=1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        return bridge
+
+    asyncio.run(run())
+
+    received_touch = gateway_touches[0]
+    assert received_touch["event"] == "channel_message_received"
+    assert received_touch["backlog_depth"] == 3
+
+    delivered_touch = gateway_touches[1]
+    assert delivered_touch["event"] == "channel_message_delivered"
+    assert "backlog_depth" in delivered_touch
+
+
 def test_channel_env_file_sets_missing_runtime_env(monkeypatch, tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text(

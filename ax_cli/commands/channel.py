@@ -611,11 +611,26 @@ class ChannelBridge:
         def _push() -> None:
             try:
                 self.mention_queue.put_nowait(event)
-                self.log(f"enqueue: queued {event.message_id[:12]} (qsize={self.mention_queue.qsize()})")
+                qsize = self.mention_queue.qsize()
+                self.log(f"enqueue: queued {event.message_id[:12]} (qsize={qsize})")
+                asyncio.ensure_future(self._signal_received(event.message_id, qsize))
             except asyncio.QueueFull:
                 self.log(f"queue full — dropping mention {event.message_id}")
 
         self.loop.call_soon_threadsafe(_push)
+
+    async def _signal_received(self, message_id: str, queue_depth: int) -> None:
+        """Emit 'received' status as soon as the SSE event is enqueued.
+
+        Fires before emit_mentions picks up the event, closing the signal
+        gap between message arrival and agent work start.
+        """
+        await self.publish_processing_status(message_id, "received")
+        await self.touch_gateway(
+            "channel_message_received",
+            message_id=message_id,
+            backlog_depth=queue_depth,
+        )
 
     async def write_message(self, payload: dict[str, Any]) -> None:
         async with self._write_lock:
@@ -682,6 +697,7 @@ class ChannelBridge:
                     last_work_received_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     current_status="working",
                     current_activity=f"Channel message from {event.author}",
+                    backlog_depth=self.mention_queue.qsize(),
                 )
                 if len(self._pending_mentions) > SEEN_MAX:
                     self._pending_mentions = self._pending_mentions[-SEEN_MAX // 2 :]
@@ -898,6 +914,7 @@ class ChannelBridge:
                 last_reply_message_id=sent_id,
                 last_reply_preview=text[:240],
                 last_work_completed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                backlog_depth=self.mention_queue.qsize(),
             )
             await self.send_response(
                 request_id,

@@ -251,6 +251,10 @@ GATEWAY_ACTIVITY_EVENTS: dict[str, str] = {
     "tool_call_record_failed": "tool",
     # reply: agent posted a reply
     "reply_sent": "reply",
+    # channel bridge lifecycle
+    "channel_message_received": "received",
+    "channel_message_delivered": "delivered",
+    "channel_reply_sent": "reply",
     # result: terminal outcome that is not a reply
     "runtime_error": "result",
     "agent_skipped": "result",
