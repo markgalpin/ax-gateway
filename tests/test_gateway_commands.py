@@ -3850,7 +3850,10 @@ def test_gateway_agents_send_uses_managed_identity(monkeypatch, tmp_path):
     assert payload["content"] == "@codex hello there"
     assert payload["message"]["metadata"]["gateway"]["sent_via"] == "gateway_cli"
     recent = gateway_core.load_recent_gateway_activity()
-    assert recent[-1]["event"] == "manual_message_sent"
+    # The send event must appear, but is no longer guaranteed to be last —
+    # the default-on post-send inbox poll (aX task 663d9e6f) appends a
+    # `managed_inbox_polled` event after it.
+    assert any(item["event"] == "manual_message_sent" for item in recent)
 
 
 def test_gateway_agents_send_rejects_user_bootstrap_pat(monkeypatch, tmp_path):
@@ -3967,7 +3970,10 @@ def test_gateway_agents_send_acknowledges_pending_inbox_message(monkeypatch, tmp
     assert updated["processed_count"] == 1
     assert updated["last_reply_message_id"] == "msg-sent-1"
     recent = gateway_core.load_recent_gateway_activity()
-    assert recent[-1]["event"] == "manual_queue_acknowledged"
+    # Same nuance as the sister test: the queue-ack event is in the recent
+    # log but no longer trailing because the default-on post-send inbox
+    # poll appends afterwards.
+    assert any(item["event"] == "manual_queue_acknowledged" for item in recent)
 
 
 def test_gateway_agents_send_blocks_identity_mismatch(monkeypatch, tmp_path):
@@ -7104,6 +7110,101 @@ def test_apply_entry_current_space_uses_global_cache_for_unknown_new_space(monke
     assert entry["active_space_name"] == "Claude Code Workshop"
     assert entry["default_space_id"] == new_space
     assert entry["default_space_name"] == "Claude Code Workshop"
+
+
+def test_send_from_managed_agent_bundles_unread_inbox_by_default(monkeypatch, tmp_path):
+    """ax-cli-dev 663d9e6f: every send-as-agent path should bundle "what arrived
+    while you were drafting" so two agents don't talk past each other."""
+    _seed_managed_inbox_agent(tmp_path, monkeypatch)
+    # Seed a pending message so unread_only's intersection returns it.
+    gateway_core.save_agent_pending_messages(
+        "cli_god",
+        [{"message_id": "msg-1", "content": "first inbound", "queued_at": "2026-05-08T00:00:00Z"}],
+    )
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "agents", "send", "cli_god", "thanks!", "--inbox-wait", "0", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["agent"] == "cli_god"
+    assert payload["content"] == "thanks!"
+    assert "inbox" in payload, "default-on inbox bundling missing from response"
+    inbox = payload["inbox"]
+    assert inbox["agent"] == "cli_god"
+    assert inbox["unread_count"] == 1
+    assert any(m.get("id") == "msg-1" for m in inbox["messages"])
+
+
+def test_send_from_managed_agent_skips_inbox_when_disabled(monkeypatch, tmp_path):
+    """`--no-inbox` opts out of the post-send poll entirely."""
+    _seed_managed_inbox_agent(tmp_path, monkeypatch)
+    gateway_core.save_agent_pending_messages(
+        "cli_god",
+        [{"message_id": "msg-1", "content": "first inbound", "queued_at": "2026-05-08T00:00:00Z"}],
+    )
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "agents", "send", "cli_god", "skip inbox", "--no-inbox", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert "inbox" not in payload
+    assert "inbox_error" not in payload
+    # Pending queue is preserved because the post-send poll never ran.
+    assert len(gateway_core.load_agent_pending_messages("cli_god")) == 1
+
+
+def test_send_from_managed_agent_inbox_error_does_not_break_send(monkeypatch, tmp_path):
+    """If the post-send poll raises, the send result still ships and the error
+    is surfaced as inbox_error so the caller sees the partial outcome."""
+    _seed_managed_inbox_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    def boom(**_kwargs):
+        raise RuntimeError("upstream 503")
+
+    monkeypatch.setattr(gateway_cmd, "_poll_managed_agent_inbox_after_send", boom)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "agents", "send", "cli_god", "even on error", "--inbox-wait", "0", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # Send still succeeded.
+    assert payload["agent"] == "cli_god"
+    assert payload["content"] == "even on error"
+    assert payload["message"]["id"] == "msg-sent-1"
+    # Error path surfaces.
+    assert payload.get("inbox_error") == "upstream 503"
+    assert "inbox" not in payload
+
+
+def test_send_from_managed_agent_inbox_returns_empty_when_no_unread(monkeypatch, tmp_path):
+    """An empty inbox still returns the bundle structure with messages=[] and
+    unread_count=0 so callers can rely on the field shape."""
+    _seed_managed_inbox_agent(tmp_path, monkeypatch)
+    # No pending messages seeded, so unread_only intersection -> empty list.
+    monkeypatch.setattr(gateway_cmd, "AxClient", _FakeManagedSendClient)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "agents", "send", "cli_god", "quiet send", "--inbox-wait", "0", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload.get("inbox") is not None
+    assert payload["inbox"]["messages"] == []
+    assert payload["inbox"]["unread_count"] == 0
 
 
 def test_inbox_for_managed_agent_clears_pending_queue_on_mark_read(monkeypatch, tmp_path):
