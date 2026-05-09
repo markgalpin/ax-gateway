@@ -2079,6 +2079,42 @@ def _sync_passive_queue_after_manual_send(
         )
 
 
+def _poll_managed_agent_inbox_after_send(
+    *,
+    name: str,
+    space_id: str | None,
+    limit: int,
+    wait_seconds: int,
+    channel: str = "main",
+    poll_interval: float = 1.0,
+) -> dict:
+    """Bundle "what arrived while you were drafting" for a managed-agent send.
+
+    Mirrors ``_poll_local_inbox_over_http``'s wait loop, but uses the
+    in-process ``_inbox_for_managed_agent`` (Live Listener / managed-agent
+    path) instead of the local-session HTTP proxy. Closes aX task
+    ``663d9e6f``: every send-as-agent path should return inbound messages
+    that arrived during the send so two agents don't talk past each other.
+
+    ``mark_read=True`` so the same messages don't re-appear on the next
+    poll. The wait loop exits as soon as we have messages or the deadline
+    elapses.
+    """
+    deadline = time.monotonic() + max(0, int(wait_seconds))
+    while True:
+        result = _inbox_for_managed_agent(
+            name=name,
+            limit=max(1, int(limit)),
+            channel=channel,
+            space_id=space_id,
+            unread_only=True,
+            mark_read=True,
+        )
+        if result.get("messages") or wait_seconds <= 0 or time.monotonic() >= deadline:
+            return result
+        time.sleep(poll_interval)
+
+
 def _send_from_managed_agent(
     *,
     name: str,
@@ -2088,6 +2124,10 @@ def _send_from_managed_agent(
     space_id: str | None = None,
     sent_via: str = "gateway_cli",
     metadata_extra: dict[str, object] | None = None,
+    include_inbox: bool = True,
+    inbox_wait: int = 2,
+    inbox_limit: int = 10,
+    inbox_channel: str = "main",
 ) -> dict:
     if not content.strip():
         raise ValueError("Message content is required.")
@@ -2144,7 +2184,22 @@ def _send_from_managed_agent(
             reply_message_id=str(payload.get("id") or "") or None,
             reply_preview=message_content[:120] or None,
         )
-    return {"agent": entry.get("name"), "message": payload, "content": message_content}
+    response: dict = {"agent": entry.get("name"), "message": payload, "content": message_content}
+    if include_inbox:
+        try:
+            response["inbox"] = _poll_managed_agent_inbox_after_send(
+                name=str(entry.get("name") or name),
+                space_id=selected_space_id,
+                limit=inbox_limit,
+                wait_seconds=inbox_wait,
+                channel=inbox_channel,
+            )
+        except Exception as exc:
+            # Inbox bundling is a best-effort enhancement on top of the send.
+            # If it fails (transient API error, etc.) we still return the send
+            # result the operator/agent actually depends on.
+            response["inbox_error"] = str(exc)
+    return response
 
 
 def _inbox_for_managed_agent(
@@ -5636,6 +5691,9 @@ def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
                         content=str(body.get("content") or ""),
                         to=str(body.get("to") or "").strip() or None,
                         parent_id=str(body.get("parent_id") or "").strip() or None,
+                        # UI has its own inbox panel that polls separately;
+                        # don't make every UI send block on a 2s post-send poll.
+                        inbox_wait=0,
                     )
                     _write_json_response(self, payload, status=HTTPStatus.CREATED)
                     return
@@ -7764,11 +7822,34 @@ def send_as_agent(
     content: str = typer.Argument(..., help="Message content"),
     to: str = typer.Option(None, "--to", help="Prepend a mention like @codex automatically"),
     parent_id: str = typer.Option(None, "--parent-id", help="Reply inside an existing thread"),
+    include_inbox: bool = typer.Option(
+        True,
+        "--inbox/--no-inbox",
+        help="After sending, include unread messages addressed to this agent in the response. "
+        "Default ON so two agents don't talk past each other when one replies while the other is mid-draft.",
+    ),
+    inbox_wait: int = typer.Option(
+        2,
+        "--inbox-wait",
+        min=0,
+        help="Seconds to wait for inbound messages after sending. 0 only checks immediately.",
+    ),
+    inbox_limit: int = typer.Option(
+        10, "--inbox-limit", min=1, max=100, help="Max inbound messages to bundle in the response."
+    ),
     as_json: bool = JSON_OPTION,
 ):
     """Send a message as a Gateway-managed agent."""
     try:
-        result = _send_from_managed_agent(name=name, content=content, to=to, parent_id=parent_id)
+        result = _send_from_managed_agent(
+            name=name,
+            content=content,
+            to=to,
+            parent_id=parent_id,
+            include_inbox=include_inbox,
+            inbox_wait=inbox_wait,
+            inbox_limit=inbox_limit,
+        )
     except ValueError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -7780,6 +7861,21 @@ def send_as_agent(
     if isinstance(result["message"], dict) and result["message"].get("id"):
         err_console.print(f"  id = {result['message']['id']}")
     err_console.print(f"  content = {result['content']}")
+    inbox = result.get("inbox") if isinstance(result.get("inbox"), dict) else None
+    if inbox:
+        unread = inbox.get("unread_count") or 0
+        if unread:
+            err_console.print(
+                f"[yellow]Inbox while drafting:[/yellow] {unread} unread message(s) addressed to @{result['agent']}"
+            )
+            for msg in (inbox.get("messages") or [])[:5]:
+                if not isinstance(msg, dict):
+                    continue
+                sender = msg.get("agent_name") or msg.get("user_name") or msg.get("sender") or "unknown"
+                preview = str(msg.get("content") or "").strip().splitlines()[0][:120] if msg.get("content") else ""
+                err_console.print(f"  - @{sender}: {preview}")
+    elif result.get("inbox_error"):
+        err_console.print(f"[dim]Inbox poll failed: {result['inbox_error']}[/dim]")
 
 
 @agents_app.command("inbox")
