@@ -3612,13 +3612,25 @@ def _spaces_payload() -> dict:
     return payload
 
 
-def _move_managed_agent_space(name: str, new_space_id: str) -> dict:
+def _move_managed_agent_space(name: str, new_space_id: str | None, *, revert: bool = False) -> dict:
     name = name.strip()
-    new_space_id = new_space_id.strip()
     if not name:
         raise ValueError("Managed agent name is required.")
-    if not new_space_id:
-        raise ValueError("Target space is required.")
+    if revert:
+        if new_space_id and new_space_id.strip():
+            raise ValueError("Pass either --space or --revert, not both.")
+        registry_for_revert = load_gateway_registry()
+        revert_entry = find_agent_entry(registry_for_revert, name)
+        if not revert_entry:
+            raise LookupError(f"Managed agent not found: {name}")
+        previous = str(revert_entry.get("previous_space_id") or "").strip()
+        if not previous:
+            raise ValueError(f"@{name} has no recorded previous space to revert to. Use --space <id> instead.")
+        new_space_id = previous
+    else:
+        new_space_id = (new_space_id or "").strip()
+        if not new_space_id:
+            raise ValueError("Target space is required.")
     client = _load_gateway_user_client()
     new_space_id = resolve_space_id(client, explicit=new_space_id)
     registry = load_gateway_registry()
@@ -3703,10 +3715,26 @@ def _move_managed_agent_space(name: str, new_space_id: str) -> dict:
             # Resync best-effort; the placement write already succeeded.
             continue
     previous_space_id = str(entry.get("space_id") or "").strip() or None
+    previous_space_name = str(entry.get("active_space_name") or entry.get("space_name") or "").strip() or None
     if backend_allowed_spaces is not None:
         entry["allowed_spaces"] = backend_allowed_spaces
     apply_entry_current_space(entry, backend_space_id, space_name=backend_space_name)
     ensure_gateway_identity_binding(registry, entry, session=load_gateway_session())
+    # Persist the prior space so `ax gateway agents move <name> --revert` can
+    # find its way back without the operator needing to remember the UUID.
+    # Only record when the move actually changed spaces — a no-op move
+    # (already in the requested space) shouldn't blank the revert pointer.
+    if previous_space_id and previous_space_id != backend_space_id:
+        entry["previous_space_id"] = previous_space_id
+        if previous_space_name:
+            entry["previous_space_name"] = previous_space_name
+    # Mark the entry as moving for any concurrent send guard / UI panel that
+    # reads `current_status`. Cleared once the rebind wait below resolves
+    # (or the deadline elapses) so a stuck move doesn't permanently freeze
+    # sends. The send guard itself raises off `_identity_space_send_guard`
+    # via `annotate_runtime_health`; this surface is for human-readable text.
+    entry["current_status"] = "moving"
+    entry["current_activity"] = f"Moving to {backend_space_name or backend_space_id}; sends paused until reconnect."
     # Capture the rebind marker BEFORE writing the registry so the wait below
     # is guaranteed to see only post-move runtime/listener events.
     rebind_marker = datetime.now(timezone.utc).isoformat()
@@ -3747,6 +3775,19 @@ def _move_managed_agent_space(name: str, new_space_id: str) -> dict:
             if any((event.get("ts") or "") > rebind_marker and event.get("event") in ready_events for event in recent):
                 break
             time.sleep(0.2)
+    # Reconnect window has resolved (or its 5s deadline elapsed). Clear the
+    # human-readable "moving" status so subsequent sends through the
+    # send-guard read normal state. Re-read the registry first because a
+    # concurrent runtime/listener event may have already updated the entry.
+    registry_after = load_gateway_registry()
+    settled = find_agent_entry(registry_after, name)
+    if settled is not None and str(settled.get("current_status") or "") == "moving":
+        settled["current_status"] = None
+        settled["current_activity"] = None
+        save_gateway_registry(registry_after)
+        # Mirror onto the local entry so the return value reflects the cleared state.
+        entry["current_status"] = None
+        entry["current_activity"] = None
     return annotate_runtime_health(entry, registry=registry)
 
 
@@ -7715,12 +7756,29 @@ def test_agent(
 @agents_app.command("move")
 def move_agent(
     name: str = typer.Argument(..., help="Managed agent name"),
-    space_id: str = typer.Option(..., "--space", "--space-id", "-s", help="Target space slug, name, or id"),
+    space_id: str = typer.Option(None, "--space", "--space-id", "-s", help="Target space slug, name, or id"),
+    revert: bool = typer.Option(
+        False,
+        "--revert",
+        help=(
+            "Move the agent back to its previous space. "
+            "Mutually exclusive with --space; requires a prior move on this entry."
+        ),
+    ),
     as_json: bool = JSON_OPTION,
 ):
-    """Move a Gateway-managed agent to another allowed space."""
+    """Move a Gateway-managed agent to another allowed space.
+
+    Pass ``--space`` to move to a specific space, or ``--revert`` to move
+    back to the previously-recorded space without retyping its id. The
+    revert pointer is captured automatically on every successful move,
+    so the standard "move out, move back" loop works without bookkeeping.
+    """
+    if not revert and not (space_id and space_id.strip()):
+        err_console.print("[red]Provide --space or --revert.[/red]")
+        raise typer.Exit(1)
     try:
-        result = _move_managed_agent_space(name, space_id)
+        result = _move_managed_agent_space(name, space_id, revert=revert)
     except (LookupError, ValueError) as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -7733,6 +7791,9 @@ def move_agent(
     err_console.print(
         f"  space = {result.get('active_space_name') or result.get('active_space_id') or result.get('space_id')}"
     )
+    if result.get("previous_space_id"):
+        previous_label = result.get("previous_space_name") or result.get("previous_space_id")
+        err_console.print(f"  previous = {previous_label} (use --revert to move back)")
 
 
 @agents_app.command("doctor")

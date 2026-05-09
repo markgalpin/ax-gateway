@@ -3498,6 +3498,151 @@ def test_gateway_move_updates_routing_for_test_messages(monkeypatch, tmp_path):
     assert sent_messages[-1]["content"].startswith("@mover ")
 
 
+def _seed_revertable_mover(tmp_path, monkeypatch):
+    """Set up an agent in space-1 plus a fake user client that allows moves."""
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    gateway_core.save_gateway_session(
+        {
+            "token": "axp_u_test.token",
+            "base_url": "https://paxai.app",
+            "space_id": "space-1",
+            "username": "operator",
+        }
+    )
+    token_file = tmp_path / "mover.token"
+    token_file.write_text("axp_a_mover.secret")
+    allowed_spaces = [
+        {"space_id": "space-1", "name": "Old Space", "is_default": True},
+        {"space_id": "space-2", "name": "New Space", "is_default": False},
+    ]
+    registry = gateway_core.load_gateway_registry()
+    registry["agents"] = [
+        {
+            "name": "mover",
+            "agent_id": "agent-mover",
+            "space_id": "space-1",
+            "active_space_name": "Old Space",
+            "base_url": "https://paxai.app",
+            "runtime_type": "echo",
+            "template_id": "echo_test",
+            "desired_state": "running",
+            "effective_state": "running",
+            "transport": "gateway",
+            "credential_source": "gateway",
+            "allowed_spaces": allowed_spaces,
+            "token_file": str(token_file),
+        }
+    ]
+    gateway_core.ensure_gateway_identity_binding(
+        registry, registry["agents"][0], session=gateway_core.load_gateway_session()
+    )
+    gateway_core.save_gateway_registry(registry)
+
+    class _FakeMover:
+        def __init__(self):
+            self.space_id = "space-1"
+            self.calls = []
+
+        def set_agent_placement(self, identifier, *, space_id, pinned=False):
+            self.calls.append({"identifier": identifier, "space_id": space_id})
+            self.space_id = space_id
+            return {"agent_id": identifier, "space_id": space_id}
+
+        def get_agent_placement(self, identifier):
+            return {"agent_id": identifier, "name": "mover", "space_id": self.space_id}
+
+        def get_agent(self, identifier):
+            return {"agent": {"id": identifier, "name": "mover", "space_id": self.space_id}}
+
+        def list_spaces(self):
+            return {
+                "spaces": [
+                    {"id": "space-1", "name": "Old Space", "slug": "old-space"},
+                    {"id": "space-2", "name": "New Space", "slug": "new-space"},
+                ]
+            }
+
+    fake = _FakeMover()
+    monkeypatch.setattr(gateway_cmd, "_load_gateway_user_client", lambda: fake)
+    return fake
+
+
+def test_gateway_move_records_previous_space_for_revert(monkeypatch, tmp_path):
+    """A successful move persists previous_space_id so --revert can find its way back."""
+    fake = _seed_revertable_mover(tmp_path, monkeypatch)
+
+    moved = gateway_cmd._move_managed_agent_space("mover", "new-space")
+
+    assert moved["space_id"] == "space-2"
+    assert moved["previous_space_id"] == "space-1"
+    assert moved["previous_space_name"] == "Old Space"
+    stored = gateway_core.find_agent_entry(gateway_core.load_gateway_registry(), "mover")
+    assert stored["previous_space_id"] == "space-1"
+    assert stored["previous_space_name"] == "Old Space"
+    # current_status was set to "moving" mid-move and cleared once the rebind
+    # window resolved (no daemon running in the test, so the wait short-circuits).
+    assert stored.get("current_status") in (None, "")
+    assert stored.get("current_activity") in (None, "")
+    assert fake.calls[-1]["space_id"] == "space-2"
+
+
+def test_gateway_move_revert_returns_to_previous_space(monkeypatch, tmp_path):
+    """--revert uses the persisted previous_space_id without requiring --space."""
+    _seed_revertable_mover(tmp_path, monkeypatch)
+
+    gateway_cmd._move_managed_agent_space("mover", "new-space")
+    reverted = gateway_cmd._move_managed_agent_space("mover", None, revert=True)
+
+    assert reverted["space_id"] == "space-1"
+    assert reverted["active_space_name"] == "Old Space"
+    # After reverting, the previous-space pointer now points at the space we
+    # just left ("space-2") so a second --revert would go back there again.
+    assert reverted["previous_space_id"] == "space-2"
+    stored = gateway_core.find_agent_entry(gateway_core.load_gateway_registry(), "mover")
+    assert stored["space_id"] == "space-1"
+    assert stored["previous_space_id"] == "space-2"
+
+
+def test_gateway_move_revert_without_history_errors_clearly(monkeypatch, tmp_path):
+    """Reverting an agent that's never been moved fails with an actionable message."""
+    _seed_revertable_mover(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="no recorded previous space"):
+        gateway_cmd._move_managed_agent_space("mover", None, revert=True)
+
+
+def test_gateway_move_revert_and_explicit_space_are_mutually_exclusive(monkeypatch, tmp_path):
+    """Passing both --space and --revert is rejected before any backend call."""
+    _seed_revertable_mover(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="not both"):
+        gateway_cmd._move_managed_agent_space("mover", "new-space", revert=True)
+
+
+def test_gateway_move_cli_requires_one_of_space_or_revert(monkeypatch, tmp_path):
+    """The CLI command rejects an invocation with neither --space nor --revert."""
+    _seed_revertable_mover(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["gateway", "agents", "move", "mover"])
+
+    assert result.exit_code == 1
+    assert "Provide --space or --revert" in result.output
+
+
+def test_gateway_move_no_op_does_not_overwrite_previous_space(monkeypatch, tmp_path):
+    """A move-to-same-space short-circuits and must not blank the revert pointer."""
+    _seed_revertable_mover(tmp_path, monkeypatch)
+
+    # First move records space-1 as previous.
+    gateway_cmd._move_managed_agent_space("mover", "new-space")
+    # Now move to the SAME space (no-op).
+    gateway_cmd._move_managed_agent_space("mover", "new-space")
+
+    stored = gateway_core.find_agent_entry(gateway_core.load_gateway_registry(), "mover")
+    assert stored["previous_space_id"] == "space-1"
+
+
 def test_gateway_move_waits_for_listener_ready_after_runtime_start(monkeypatch, tmp_path):
     config_dir = tmp_path / "config"
     monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
