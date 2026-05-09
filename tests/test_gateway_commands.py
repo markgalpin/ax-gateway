@@ -1758,7 +1758,7 @@ def test_gateway_ui_agent_reject_marks_pending_approval_rejected(monkeypatch, tm
     class FakeHandler(handler_cls):
         def __init__(self):
             self.path = "/api/agents/reject-ui-bot/reject"
-            self.headers = {"Content-Length": "2"}
+            self.headers = {"Content-Length": "2", "Host": "127.0.0.1"}
             self.rfile = __import__("io").BytesIO(b"{}")
             self.status = None
             self.body = b""

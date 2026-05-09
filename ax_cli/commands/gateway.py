@@ -5294,12 +5294,39 @@ def _read_json_request(handler: BaseHTTPRequestHandler) -> dict:
     return payload
 
 
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1"})
+
+
+def _is_request_host_allowed(host_header: str | None) -> bool:
+    # Block DNS-rebinding: only accept Host headers that resolve to loopback.
+    # Port is left open so `ax gateway start --port` keeps working.
+    if not host_header:
+        return False
+    candidate = host_header.strip()
+    if not candidate:
+        return False
+    hostname = candidate.rsplit(":", 1)[0] if ":" in candidate else candidate
+    return hostname.lower() in _LOOPBACK_HOSTNAMES
+
+
 def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
     class GatewayUiHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:  # noqa: A003
             return
 
+        def _reject_unauthorized_host(self) -> bool:
+            if _is_request_host_allowed(self.headers.get("Host")):
+                return False
+            _write_json_response(
+                self,
+                {"error": "Forbidden: Host header is not loopback."},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return True
+
         def do_GET(self) -> None:  # noqa: N802
+            if self._reject_unauthorized_host():
+                return
             parsed = urlparse(self.path)
             if parsed.path == "/":
                 _write_html_response(self, _render_gateway_demo_page(refresh_ms=refresh_ms))
@@ -5422,6 +5449,8 @@ def _build_gateway_ui_handler(*, activity_limit: int, refresh_ms: int):
             _write_json_response(self, {"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:  # noqa: N802
+            if self._reject_unauthorized_host():
+                return
             parsed = urlparse(self.path)
             try:
                 body = _read_json_request(self)
