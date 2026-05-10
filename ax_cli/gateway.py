@@ -846,7 +846,16 @@ def _hermes_repo_candidates(entry: dict[str, Any] | None = None) -> list[Path]:
 def hermes_setup_status(entry: dict[str, Any]) -> dict[str, Any]:
     template_id = str(entry.get("template_id") or "").strip().lower()
     runtime_type = str(entry.get("runtime_type") or "").strip().lower()
-    if template_id != "hermes" and runtime_type not in {"hermes_sentinel", "hermes_plugin"}:
+    # hermes_plugin invokes `hermes gateway run` resolved via _hermes_bin
+    # (entry override / HERMES_BIN / $PATH / fallback) and loads the aX
+    # platform plugin from this repo, so it has no hermes-agent checkout
+    # dependency and must short-circuit the gate — even when template_id
+    # is "hermes" (the plugin is now the default template runtime).
+    if runtime_type == "hermes_plugin":
+        return {"ready": True, "template_id": template_id}
+    # hermes_sentinel and bare hermes-template entries still run from the
+    # in-tree sentinel and need a hermes-agent checkout resolvable below.
+    if template_id != "hermes" and runtime_type != "hermes_sentinel":
         return {"ready": True, "template_id": template_id}
 
     candidates = _hermes_repo_candidates(entry)
@@ -4426,22 +4435,74 @@ def _scaffold_hermes_plugin_home(entry: dict[str, Any]) -> Path:
     if allowed:
         env_lines.append(f"AX_ALLOWED_USERS={allowed}")
     (home / ".env").write_text("\n".join(env_lines) + "\n", encoding="utf-8")
-    # Inherit provider creds from the operator's ~/.hermes/ unless the
-    # agent already has its own. Symlink, don't copy, so rotation in one
-    # place propagates everywhere.
+    # Inherit provider creds from the operator's ~/.hermes/auth.json. This
+    # is a symlink so credential rotation propagates without re-scaffolding.
     operator_home = Path.home() / ".hermes"
-    for inherit in ("auth.json", "config.yaml"):
-        source = operator_home / inherit
-        target = home / inherit
-        if target.exists() or target.is_symlink():
-            continue
-        if not source.exists():
-            continue
+    auth_source = operator_home / "auth.json"
+    auth_target = home / "auth.json"
+    if not (auth_target.exists() or auth_target.is_symlink()) and auth_source.exists():
         try:
-            target.symlink_to(source)
+            auth_target.symlink_to(auth_source)
         except OSError:
             pass
+    # Render a per-agent config.yaml with terminal.cwd pinned to this
+    # agent's workdir. Symlinking the operator's config.yaml verbatim
+    # leaked terminal.cwd (e.g. another agent's path) through the
+    # `hermes gateway run` bridge in gateway/run.py, which writes
+    # TERMINAL_CWD from config.yaml regardless of what the per-agent
+    # .env sets — and the LLM then mis-identifies itself from the
+    # workdir name in its system prompt. The render starts from the
+    # operator's config (so model/provider/agent defaults still apply)
+    # and is regenerated on every scaffold call, which means rotating
+    # those defaults still propagates the next time the runtime starts.
+    _render_hermes_plugin_config_yaml(entry, home=home, operator_home=operator_home)
     return home
+
+
+def _render_hermes_plugin_config_yaml(entry: dict[str, Any], *, home: Path, operator_home: Path) -> None:
+    """Write ``$HERMES_HOME/config.yaml`` with ``terminal.cwd`` pinned to the
+    agent's workdir, seeded from the operator's ``~/.hermes/config.yaml``.
+
+    Writes via a temp file + atomic replace so a partial write can't leave
+    Hermes booting against a half-yaml. Any non-mapping ``terminal`` value
+    in the operator config is replaced with a fresh mapping so we never
+    silently keep a bogus structure.
+    """
+    workdir = _hermes_plugin_workdir(entry)
+    target = home / "config.yaml"
+    operator_config = operator_home / "config.yaml"
+    cfg: dict[str, Any] = {}
+    if operator_config.exists():
+        try:
+            import yaml  # local import keeps gateway import cost down for non-Hermes paths
+
+            loaded = yaml.safe_load(operator_config.read_text(encoding="utf-8"))
+        except Exception:
+            loaded = None
+        if isinstance(loaded, dict):
+            cfg = loaded
+    terminal_cfg = cfg.get("terminal")
+    if not isinstance(terminal_cfg, dict):
+        terminal_cfg = {}
+    terminal_cfg["cwd"] = str(workdir)
+    cfg["terminal"] = terminal_cfg
+    try:
+        import yaml
+
+        rendered = yaml.safe_dump(cfg, sort_keys=False)
+    except Exception:
+        # Last-resort minimal config so the agent can still come up with a
+        # correct terminal.cwd even if the operator config is unreadable.
+        rendered = f"terminal:\n  cwd: {workdir}\n"
+    # Replace any stale symlink from earlier scaffolds before writing.
+    if target.is_symlink():
+        try:
+            target.unlink()
+        except OSError:
+            pass
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(rendered, encoding="utf-8")
+    os.replace(tmp, target)
 
 
 def _build_hermes_plugin_cmd(entry: dict[str, Any]) -> list[str]:

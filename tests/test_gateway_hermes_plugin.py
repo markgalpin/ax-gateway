@@ -84,9 +84,9 @@ def test_scaffold_creates_dir_plugin_link_and_dotenv(tmp_path):
     assert entry["space_id"] in dotenv
     assert "AX_BASE_URL=https://paxai.app" in dotenv
     # The .env can mention AX_TOKEN in a comment, but must never assign it.
-    assert not any(
-        line.strip().startswith("AX_TOKEN=") for line in dotenv.splitlines()
-    ), "Identity .env must not assign AX_TOKEN"
+    assert not any(line.strip().startswith("AX_TOKEN=") for line in dotenv.splitlines()), (
+        "Identity .env must not assign AX_TOKEN"
+    )
 
 
 def test_scaffold_writes_allow_all_users_when_opted_in(tmp_path):
@@ -129,16 +129,105 @@ def test_scaffold_inherits_operator_auth_when_present(tmp_path, monkeypatch):
     operator_hermes = fake_home / ".hermes"
     operator_hermes.mkdir(parents=True)
     (operator_hermes / "auth.json").write_text("{}")
-    (operator_hermes / "config.yaml").write_text("providers: {}")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
 
     entry = _base_entry(tmp_path)
     home = gateway_core._scaffold_hermes_plugin_home(entry)
     auth = home / "auth.json"
-    cfg = home / "config.yaml"
     assert auth.is_symlink()
-    assert cfg.is_symlink()
     assert auth.resolve() == (operator_hermes / "auth.json").resolve()
+
+
+def test_scaffold_renders_config_yaml_with_pinned_terminal_cwd(tmp_path, monkeypatch):
+    """config.yaml is rendered (not symlinked) so operator's terminal.cwd
+    can't bleed through. The agent's workdir wins for terminal.cwd while
+    other operator defaults (model, providers, etc.) are still seeded.
+    """
+    yaml = pytest.importorskip("yaml")
+    fake_home = tmp_path / "operator-home"
+    operator_hermes = fake_home / ".hermes"
+    operator_hermes.mkdir(parents=True)
+    operator_config = {
+        "model": "gpt-5.5",
+        "providers": {"openai-codex": {"default_model": "gpt-5.5"}},
+        # Operator pointed terminal.cwd at a *different* agent's tree —
+        # exactly the bleed that mis-identifies agents in production.
+        "terminal": {"backend": "local", "cwd": str(tmp_path / "some-other-agent")},
+    }
+    (operator_hermes / "config.yaml").write_text(yaml.safe_dump(operator_config))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    entry = _base_entry(tmp_path)
+    home = gateway_core._scaffold_hermes_plugin_home(entry)
+    cfg_path = home / "config.yaml"
+
+    assert cfg_path.is_file() and not cfg_path.is_symlink()
+    rendered = yaml.safe_load(cfg_path.read_text())
+    # terminal.cwd must point at the agent's own workdir, never the
+    # operator's pinned path.
+    assert rendered["terminal"]["cwd"] == str(tmp_path / "wiki")
+    # Operator's other terminal fields and top-level defaults pass through.
+    assert rendered["terminal"]["backend"] == "local"
+    assert rendered["model"] == "gpt-5.5"
+    assert rendered["providers"]["openai-codex"]["default_model"] == "gpt-5.5"
+
+
+def test_scaffold_replaces_stale_config_symlink(tmp_path, monkeypatch):
+    """Upgrading from the old symlink-based scaffold must not leave a
+    stale symlink in place — otherwise the identity bleed survives.
+    """
+    yaml = pytest.importorskip("yaml")
+    fake_home = tmp_path / "operator-home"
+    operator_hermes = fake_home / ".hermes"
+    operator_hermes.mkdir(parents=True)
+    (operator_hermes / "config.yaml").write_text(yaml.safe_dump({"terminal": {"cwd": str(tmp_path / "stale")}}))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    entry = _base_entry(tmp_path)
+    home = gateway_core._hermes_plugin_home(entry)
+    home.mkdir(parents=True, exist_ok=True)
+    stale_target = home / "config.yaml"
+    stale_target.symlink_to(operator_hermes / "config.yaml")
+    assert stale_target.is_symlink()
+
+    gateway_core._scaffold_hermes_plugin_home(entry)
+    assert not stale_target.is_symlink()
+    assert stale_target.is_file()
+    rendered = yaml.safe_load(stale_target.read_text())
+    assert rendered["terminal"]["cwd"] == str(tmp_path / "wiki")
+
+
+def test_scaffold_renders_minimal_config_when_operator_has_none(tmp_path, monkeypatch):
+    yaml = pytest.importorskip("yaml")
+    fake_home = tmp_path / "operator-home"
+    (fake_home / ".hermes").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    entry = _base_entry(tmp_path)
+    home = gateway_core._scaffold_hermes_plugin_home(entry)
+    cfg_path = home / "config.yaml"
+
+    assert cfg_path.is_file() and not cfg_path.is_symlink()
+    rendered = yaml.safe_load(cfg_path.read_text())
+    assert rendered == {"terminal": {"cwd": str(tmp_path / "wiki")}}
+
+
+def test_hermes_setup_status_does_not_gate_plugin_runtime(tmp_path, monkeypatch):
+    """hermes_plugin must not be gated on the presence of a hermes-agent
+    git checkout — the binary is resolved via _hermes_bin (HERMES_BIN /
+    $PATH / fallback) and the aX plugin source ships in this repo.
+    """
+    # Make sure no candidate path exists so the legacy gate would fail.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "nope"))
+    monkeypatch.delenv("HERMES_REPO_PATH", raising=False)
+    entry = _base_entry(tmp_path)
+    status = gateway_core.hermes_setup_status(entry)
+    assert status["ready"] is True, status
+
+    # Sanity: hermes_sentinel still requires the checkout.
+    sentinel_entry = dict(entry, runtime_type="hermes_sentinel")
+    sentinel_status = gateway_core.hermes_setup_status(sentinel_entry)
+    assert sentinel_status["ready"] is False
 
 
 def test_build_cmd_uses_hermes_gateway_run(tmp_path, monkeypatch):
