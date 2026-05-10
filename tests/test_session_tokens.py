@@ -82,6 +82,20 @@ def test_revoked_session_is_rejected_even_with_valid_signature():
         gateway_core.verify_local_session_token(registry, token)
 
 
+def test_missing_registry_row_still_verifies_when_signature_and_ttl_are_valid():
+    # Signature + TTL are the trust anchors; the registry row only carries
+    # revocation state. A token with no matching row (e.g. registry rebuilt
+    # or session_id pruned) is treated as active, not rejected.
+    entry = _make_entry()
+    registry = _make_registry(entry)
+    token = gateway_core.issue_local_session(registry, entry)["session_token"]
+
+    registry["local_sessions"] = []
+
+    session = gateway_core.verify_local_session_token(registry, token)
+    assert session["agent_name"] == "test-agent"
+
+
 @pytest.mark.parametrize(
     "token",
     [
