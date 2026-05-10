@@ -56,6 +56,7 @@ DEFAULT_BASE_URL = "https://paxai.app"
 SSE_RECONNECT_BACKOFF_MAX = 60.0
 SSE_IDLE_TIMEOUT = 90.0
 JWT_REFRESH_BUFFER_SECONDS = 30
+HEARTBEAT_INTERVAL_SECONDS = 30.0
 USER_ACCESS_SCOPE = "messages tasks context agents spaces search"
 AGENT_RUNTIME_SCOPE = "tasks:read tasks:write messages:read messages:write agents:read"
 DEFAULT_AUDIENCE = "ax-api"
@@ -88,6 +89,7 @@ class AxAdapter(BasePlatformAdapter):
             raise ValueError("aX adapter requires AX_AGENT_NAME")
 
         self._sse_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._jwt: Optional[str] = None
         self._jwt_expires_at: float = 0.0
@@ -187,6 +189,7 @@ class AxAdapter(BasePlatformAdapter):
             return False
 
         self._sse_task = asyncio.create_task(self._sse_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._mark_connected()
         logger.info(
             "[%s] connected; space=%s base=%s",
@@ -196,15 +199,63 @@ class AxAdapter(BasePlatformAdapter):
         )
         return True
 
+    async def _heartbeat_loop(self) -> None:
+        """Periodically POST /api/v1/agents/heartbeat so aX UI shows the agent online.
+
+        Without this the agent record's last_seen_at never advances and the
+        sidebar dot stays gray. Idempotent best-effort — exceptions never
+        bubble out of the loop.
+        """
+        # Send one immediately at connect so the agent flips online without waiting a full interval.
+        await self._send_heartbeat("connected")
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=HEARTBEAT_INTERVAL_SECONDS,
+                )
+                return  # stop_event triggered
+            except asyncio.TimeoutError:
+                pass
+            await self._send_heartbeat("connected")
+
+    async def _send_heartbeat(self, status: str) -> None:
+        if not self.agent_id:
+            return  # heartbeat endpoint requires agent_id
+        try:
+            jwt = await self._get_jwt()
+        except Exception:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{self.base_url}/api/v1/agents/heartbeat",
+                    json={"agent_id": self.agent_id, "status": status},
+                    headers={
+                        "Authorization": f"Bearer {jwt}",
+                        "Content-Type": "application/json",
+                    },
+                )
+        except Exception:
+            pass  # heartbeat is best-effort
+
     async def disconnect(self) -> None:
         self._stop_event.set()
-        if self._sse_task:
-            self._sse_task.cancel()
+        # Mark offline before cancelling so the UI updates promptly.
+        try:
+            await self._send_heartbeat("offline")
+        except Exception:
+            pass
+        for task_attr in ("_sse_task", "_heartbeat_task"):
+            task = getattr(self, task_attr, None)
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._sse_task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
-            self._sse_task = None
+            setattr(self, task_attr, None)
         self._mark_disconnected()
         logger.info("[%s] disconnected", self.name)
 
