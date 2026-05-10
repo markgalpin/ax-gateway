@@ -21,12 +21,14 @@ Two approaches were considered:
 Use a flat allowlist (`_LOCAL_PROXY_METHODS` in `ax_cli/commands/gateway.py`,
 line 540). All agent sessions share the same allowed methods.
 
-Current allowlist: `whoami`, `list_spaces`, `list_agents`,
-`list_agents_availability`, `list_context`, `get_context`, `list_messages`,
-`get_message`, `search_messages`, `list_tasks`, `get_task`, `update_task`.
+Current allowlist includes both `use`-tier read operations (`whoami`,
+`list_spaces`, `list_agents`, `list_agents_availability`, `list_context`,
+`get_context`, `list_messages`, `get_message`, `search_messages`, `list_tasks`,
+`get_task`) and `admin`-tier write operations (`update_task`, `upload_file`).
 
-Write operations (`send_message`, `create_task`, `upload_file`) go through
-dedicated endpoints (`/local/send`, `/local/tasks`) with additional validation.
+`send_message` and `create_task` go through dedicated endpoints (`/local/send`,
+`/local/tasks`) with additional validation. `upload_file` is in the allowlist
+but sandboxed to the agent's workdir (see `commands/gateway.py:833-840`).
 
 ## Consequences
 
@@ -36,8 +38,8 @@ dedicated endpoints (`/local/send`, `/local/tasks`) with additional validation.
   a coding sentinel. An inbox agent can call `update_task` even if it should
   only read messages.
 - **Negative:** Adding a sensitive method to the allowlist grants it to all
-  agents. `upload_file` is intentionally excluded because an inbox agent with
-  unrestricted file upload is a trust boundary violation.
+  agents at that tier level. `upload_file` is admin-tiered and sandboxed to
+  the agent workdir, but any agent with admin tier can invoke it.
 
 ## Replacement Plan
 

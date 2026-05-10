@@ -1,6 +1,7 @@
 # ADR-006: `use`/`admin` Tier Model for Proxy Methods
 
-**Status:** Proposed (issue #146)
+**Status:** Partially implemented (tier annotations landed in PR #215; per-agent
+tier enforcement is proposed in issue #146)
 
 ## Context
 
@@ -13,9 +14,8 @@ Specific gaps:
 
 - An inbox agent that only needs `list_messages` and `get_message` currently
   also has access to `update_task`, `list_agents`, and `search_messages`.
-- `upload_file` is excluded from the proxy entirely because granting it to all
-  agents (including untrusted inbox agents) would be a trust boundary
-  violation. But trusted coding sentinels legitimately need file upload.
+- `upload_file` is now in the proxy allowlist with `tier: "admin"` and workdir
+  sandboxing, but without per-agent tier enforcement all agents can invoke it.
 - The operator cannot express "this agent is trusted for write operations"
   vs. "this agent only reads its inbox" without modifying the proxy source.
 
@@ -46,8 +46,9 @@ Agent registrations declare their tier (default: `use`). The proxy checks
 
 - **Positive:** Operators can grant broader access to trusted agents without
   modifying source code.
-- **Positive:** `upload_file` and `send_message` can be added to the proxy
-  for admin-tier agents without exposing them to all agents.
+- **Positive:** `upload_file` and `send_message` are already annotated with
+  `tier: "admin"`. Per-agent tier enforcement will restrict them to
+  admin-tier agents only.
 - **Positive:** The allowlist remains a single dict — easy to audit. The tier
   annotation adds one field per entry, not a separate ACL system.
 - **Negative:** Two tiers may not be enough. Future requirements may need
@@ -61,7 +62,6 @@ Agent registrations declare their tier (default: `use`). The proxy checks
 
 - Add `tier` field to agent registration entries in `registry.json`.
 - Default to `use` tier for existing agents (backward compatible).
-- Add `tier` annotation to each `_LOCAL_PROXY_METHODS` entry.
+- Tier annotations on `_LOCAL_PROXY_METHODS` entries are already in place
+  (PR #215). Remaining work: per-agent tier enforcement at proxy dispatch.
 - Proxy check: `if entry_tier < method_tier: reject`.
-- Good first issue candidate: adding the `tier` annotation to existing entries
-  is a small, well-scoped change.
