@@ -977,7 +977,7 @@ def _normalize_runtime_type(runtime_type: str) -> str:
         return str(runtime_type_definition(runtime_type)["id"])
     except KeyError as exc:
         raise ValueError(
-            "Unsupported runtime type. Use echo, exec, hermes_sentinel, sentinel_cli, claude_code_channel, or inbox."
+            "Unsupported runtime type. Use echo, exec, hermes_plugin, hermes_sentinel, sentinel_cli, claude_code_channel, or inbox."
         ) from exc
 
 
@@ -1215,6 +1215,8 @@ def _register_managed_agent(
     model: str | None = None,
     system_prompt: str | None = None,
     timeout_seconds: int | None = None,
+    allow_all_users: bool = False,
+    allowed_users: str | None = None,
     start: bool = True,
 ) -> dict:
     name = name.strip()
@@ -1334,6 +1336,10 @@ def _register_managed_agent(
     }
     if normalized_system_prompt:
         entry_payload["system_prompt"] = normalized_system_prompt
+    if allow_all_users:
+        entry_payload["allow_all_users"] = True
+    if allowed_users and str(allowed_users).strip():
+        entry_payload["allowed_users"] = str(allowed_users).strip()
     if requires_approval:
         entry_payload["install_id"] = str(uuid.uuid4())
     entry = upsert_agent_entry(registry, entry_payload)
@@ -1614,6 +1620,8 @@ def _update_managed_agent(
     model: str | None = None,
     system_prompt: str | object = _UNSET,
     timeout_seconds: int | object = _UNSET,
+    allow_all_users: bool | object = _UNSET,
+    allowed_users: str | object = _UNSET,
     desired_state: str | None = None,
 ) -> dict:
     name = name.strip()
@@ -1707,6 +1715,17 @@ def _update_managed_agent(
     entry["runtime_type"] = runtime_effective
     entry["exec_command"] = exec_effective
     entry["workdir"] = workdir_effective
+    if allow_all_users is not _UNSET:
+        if allow_all_users:
+            entry["allow_all_users"] = True
+        else:
+            entry.pop("allow_all_users", None)
+    if allowed_users is not _UNSET:
+        allowed_clean = str(allowed_users or "").strip()
+        if allowed_clean:
+            entry["allowed_users"] = allowed_clean
+        else:
+            entry.pop("allowed_users", None)
     if template_effective_id == "ollama":
         entry["ollama_model"] = ollama_model_effective
     else:
@@ -8081,7 +8100,7 @@ def add_agent(
     runtime_type: str = typer.Option(
         None,
         "--type",
-        help="Advanced/internal runtime backend: echo | exec | hermes_sentinel | sentinel_cli | claude_code_channel | inbox",
+        help="Advanced/internal runtime backend: echo | exec | hermes_plugin | hermes_sentinel | sentinel_cli | claude_code_channel | inbox",
     ),
     exec_cmd: str = typer.Option(None, "--exec", help="Advanced override for exec-based templates"),
     workdir: str = typer.Option(None, "--workdir", help="Advanced working directory override"),
@@ -8108,6 +8127,21 @@ def add_agent(
     ),
     timeout_seconds: int = typer.Option(
         None, "--timeout", "--timeout-seconds", help="Max seconds a runtime may process one message"
+    ),
+    allow_all_users: bool = typer.Option(
+        False,
+        "--allow-all-users",
+        help=(
+            "Hermes plugin runtime only: open the agent to mentions from anyone in its space. "
+            "Sets AX_ALLOW_ALL_USERS=1 + GATEWAY_ALLOW_ALL_USERS=true in the scaffolded "
+            "HERMES_HOME/.env. Default-closed; without this (or --allowed-users) the agent "
+            "denies all incoming mentions."
+        ),
+    ),
+    allowed_users: str = typer.Option(
+        None,
+        "--allowed-users",
+        help="Hermes plugin runtime only: comma-separated agent/user names allowed to mention this agent.",
     ),
     start: bool = typer.Option(True, "--start/--no-start", help="Desired running state after registration"),
     as_json: bool = JSON_OPTION,
@@ -8151,6 +8185,8 @@ def add_agent(
             model=model,
             system_prompt=resolved_prompt,
             timeout_seconds=timeout_seconds,
+            allow_all_users=allow_all_users,
+            allowed_users=allowed_users,
             start=start,
         )
     except (ValueError, LookupError) as exc:
@@ -8178,7 +8214,7 @@ def update_agent(
     runtime_type: str = typer.Option(
         None,
         "--type",
-        help="Advanced/internal runtime backend override: echo | exec | hermes_sentinel | sentinel_cli | claude_code_channel | inbox",
+        help="Advanced/internal runtime backend override: echo | exec | hermes_plugin | hermes_sentinel | sentinel_cli | claude_code_channel | inbox",
     ),
     exec_cmd: str = typer.Option(None, "--exec", help="Advanced override for exec-based templates"),
     workdir: str = typer.Option(None, "--workdir", help="Advanced working directory override"),
@@ -8197,6 +8233,23 @@ def update_agent(
     ),
     timeout_seconds: int = typer.Option(
         None, "--timeout", "--timeout-seconds", help="Max seconds a runtime may process one message"
+    ),
+    allow_all_users: bool = typer.Option(
+        None,
+        "--allow-all-users/--no-allow-all-users",
+        help=(
+            "Hermes plugin runtime only: open the agent to mentions from anyone in its space "
+            "(or close it back down). Sets AX_ALLOW_ALL_USERS / GATEWAY_ALLOW_ALL_USERS in "
+            "the scaffolded HERMES_HOME/.env on the next start."
+        ),
+    ),
+    allowed_users: str = typer.Option(
+        None,
+        "--allowed-users",
+        help=(
+            "Hermes plugin runtime only: comma-separated agent/user names allowed to mention this agent. "
+            "Pass an empty string to clear."
+        ),
     ),
     desired_state: str = typer.Option(None, "--desired-state", help="running | stopped"),
     as_json: bool = JSON_OPTION,
@@ -8225,6 +8278,8 @@ def update_agent(
             model=model,
             system_prompt=resolved_prompt,
             timeout_seconds=timeout_seconds if timeout_seconds is not None else _UNSET,
+            allow_all_users=allow_all_users if allow_all_users is not None else _UNSET,
+            allowed_users=allowed_users if allowed_users is not None else _UNSET,
             desired_state=desired_state,
         )
     except (LookupError, ValueError) as exc:
