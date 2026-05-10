@@ -57,6 +57,8 @@ SSE_RECONNECT_BACKOFF_MAX = 60.0
 SSE_IDLE_TIMEOUT = 90.0
 JWT_REFRESH_BUFFER_SECONDS = 30
 USER_ACCESS_SCOPE = "messages tasks context agents spaces search"
+AGENT_RUNTIME_SCOPE = "tasks:read tasks:write messages:read messages:write agents:read"
+DEFAULT_AUDIENCE = "ax-api"
 
 
 class AxAdapter(BasePlatformAdapter):
@@ -92,17 +94,28 @@ class AxAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------ auth
 
     async def _get_jwt(self, *, force: bool = False) -> str:
-        """Return a cached or freshly-exchanged user_access JWT.
+        """Return a cached or freshly-exchanged JWT.
 
-        PAT never touches business endpoints — only ``/auth/exchange``.
+        PAT never touches business endpoints — only ``/auth/exchange``
+        per AUTH-SPEC-001 §13. Agent PATs (``axp_a_``) exchange for
+        ``agent_access``; user PATs (``axp_u_``) for ``user_access``.
         """
         if not force and self._jwt and time.time() < (self._jwt_expires_at - JWT_REFRESH_BUFFER_SECONDS):
             return self._jwt
-        body = {
-            "requested_token_class": "user_access",
-            "audience": "both",
-            "scope": USER_ACCESS_SCOPE,
-        }
+
+        is_agent_pat = self.token.startswith("axp_a_")
+        body: Dict[str, Any] = {"audience": DEFAULT_AUDIENCE}
+        if is_agent_pat:
+            body["requested_token_class"] = "agent_access"
+            body["scope"] = AGENT_RUNTIME_SCOPE
+            if self.agent_id:
+                body["agent_id"] = self.agent_id
+            else:
+                body["agent_name"] = self.agent_name
+        else:
+            body["requested_token_class"] = "user_access"
+            body["scope"] = USER_ACCESS_SCOPE
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(
                 f"{self.base_url}/auth/exchange",
