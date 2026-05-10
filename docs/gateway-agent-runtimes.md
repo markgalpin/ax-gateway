@@ -233,15 +233,16 @@ When Gateway needs a space name for an agent, it checks three sources in order:
    switches spaces.
 2. **Global disk cache** (`~/.ax/gateway/spaces.cache.json`) — shared across all
    agents. Falls back here when the per-agent cache is empty. Populated by
-   `_fallback_allowed_spaces()`.
+   `save_space_cache()` and `upsert_space_cache_entry()` after upstream space
+   resolution calls.
 3. **Upstream `list_spaces` API call** — slowest, requires network. Used when
    both caches miss.
 
-The key function is `_space_name_from_cache(allowed_spaces, space_id)` in
-`ax_cli/gateway.py:1555`. It takes the per-agent cache and a space ID, and
-returns the human-readable name. There is no separate "global" version of this
-function — the global disk cache feeds into `_fallback_allowed_spaces()` which
-populates the per-agent cache.
+The key function is `space_name_from_cache(space_id)` in `ax_cli/gateway.py`.
+It checks the global disk cache for slug→UUID resolution and friendly-name
+hydration. `_fallback_allowed_spaces()` is a separate function that synthesizes
+per-agent space rows from entry/session fields — it does not populate the
+global disk cache.
 
 ### Common failure: UUID-as-name
 
@@ -327,12 +328,12 @@ arrives:
 1. Gateway appends it to the agent's pending queue at
    `~/.ax/gateway/agents/<name>/pending.json`
 2. The agent calls `/local/inbox` (or `ax gateway agents inbox <name>`)
-3. Gateway returns unread messages from the pending queue
-4. The agent processes messages and calls `mark_read` to clear them
+3. Gateway returns messages from the upstream API via `client.list_messages()`
+4. The agent processes messages and calls `mark_read` to clear pending state
 
-The pending queue is a local file, not an upstream API concept. It exists
-because inbox agents poll on their own schedule — messages received between
-polls need to be queued locally.
+The pending queue (`pending.json`) is a local bookkeeping file — it powers the
+Gateway UI unread badge and `mark_read` cleanup, but `/local/inbox` returns
+messages from the upstream API, not from the local queue.
 
 ### Channel agents (live streaming)
 

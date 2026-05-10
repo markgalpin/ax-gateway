@@ -368,29 +368,32 @@ The proxy dispatcher (`_LOCAL_PROXY_METHODS` in `ax_cli/commands/gateway.py:540`
 is the enforcement mechanism. It controls which `AxClient` methods an agent
 session can call through Gateway's `/local/proxy` endpoint.
 
-Current allowlist (all read/update operations):
+Current allowlist:
 
 ```
 whoami, list_spaces, list_agents, list_agents_availability,
 list_context, get_context, list_messages, get_message,
-search_messages, list_tasks, get_task, update_task
+search_messages, list_tasks, get_task, update_task,
+upload_file (admin tier, workdir-sandboxed)
 ```
 
 Write operations like `send_message` and `create_task` go through dedicated
 endpoints (`/local/send`, `/local/tasks`) with additional validation — they
 are not in the generic proxy.
 
-`upload_file` is intentionally excluded from the proxy. Granting unrestricted
-file upload to all agents (including untrusted inbox agents) would be a trust
-boundary violation — any local agent could write arbitrary files through the
-operator's credentials.
+`upload_file` is in the proxy allowlist but restricted to the `admin` tier
+(see `_LOCAL_PROXY_METHODS` at `commands/gateway.py:803`). It is additionally
+sandboxed to the agent's configured workdir — uploads outside that directory
+are rejected (lines 833–840). This prevents untrusted agents from writing
+arbitrary files through the operator's credentials while allowing trusted
+agents to upload from their own workspace.
 
 ### Session tokens
 
 When a local agent calls `/local/connect`, Gateway issues a session token
 (`axgw_s_<payload>.<signature>`). These tokens are:
 
-- **Short-lived** — they expire and cannot be replayed after the session ends
+- **Short-lived** — they expire via TTL (no active session-end invalidation)
 - **Per-connect** — a new token is issued for each connection, not cached
 - **HMAC-SHA256 signed** — using the secret at `~/.ax/gateway/local_secret.bin`
 - **Scoped** — the token identifies which agent it was issued for
