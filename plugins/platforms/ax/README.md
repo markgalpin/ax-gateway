@@ -23,7 +23,7 @@ One adapter instance = one aX agent identity bound to one space:
 | `AX_TOKEN` | env / `~/.hermes/.env` | Agent PAT (`axp_a_...`) minted by Gateway |
 | `AX_SPACE_ID` | env | UUID of the aX space the agent listens in |
 | `AX_AGENT_NAME` | env | Agent's `@name` (without the `@`) |
-| `AX_AGENT_ID` | env (optional) | Agent UUID; not required for runtime |
+| `AX_AGENT_ID` | env | Agent UUID; required — used for `agent_access` PAT exchange and the `/api/v1/agents/heartbeat` posts that drive the UI online dot |
 | `AX_BASE_URL` | env (optional) | Defaults to `https://paxai.app` |
 
 PAT is exchanged for a short-lived JWT at `/auth/exchange` per
@@ -52,6 +52,7 @@ Easiest is `~/.hermes/.env`:
 AX_TOKEN=axp_a_...
 AX_SPACE_ID=49afd277-78d2-4a32-9858-3594cda684af
 AX_AGENT_NAME=axiom
+AX_AGENT_ID=<agent-uuid>
 ```
 
 ## Run

@@ -87,6 +87,12 @@ class AxAdapter(BasePlatformAdapter):
             raise ValueError("aX adapter requires AX_SPACE_ID")
         if not self.agent_name:
             raise ValueError("aX adapter requires AX_AGENT_NAME")
+        if not self.agent_id:
+            raise ValueError(
+                "aX adapter requires AX_AGENT_ID — needed for agent_access "
+                "PAT exchange and /api/v1/agents/heartbeat (without it the "
+                "UI online dot stays gray)"
+            )
 
         self._sse_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -220,8 +226,6 @@ class AxAdapter(BasePlatformAdapter):
             await self._send_heartbeat("connected")
 
     async def _send_heartbeat(self, status: str) -> None:
-        if not self.agent_id:
-            return  # heartbeat endpoint requires agent_id
         try:
             jwt = await self._get_jwt()
         except Exception:
@@ -415,8 +419,11 @@ class AxAdapter(BasePlatformAdapter):
             reply_to_message_id=str(parent_id) if parent_id else None,
         )
 
-        if self._message_handler:
-            asyncio.create_task(self._message_handler(event))
+        # Dispatch through the base adapter so the level-1 active-session
+        # guard (queue/interrupt) and inline command bypass (/stop, /new,
+        # /approve, /deny) apply. handle_message itself returns quickly by
+        # spawning its own background task, so the SSE loop is not blocked.
+        await self.handle_message(event)
 
     # ----------------------------------------------------------- send (out)
 
@@ -568,7 +575,12 @@ def check_requirements() -> bool:
 
 def is_connected() -> bool:
     """Coarse env-only check used by gateway status before adapter init."""
-    return bool(os.getenv("AX_TOKEN") and os.getenv("AX_SPACE_ID") and os.getenv("AX_AGENT_NAME"))
+    return bool(
+        os.getenv("AX_TOKEN")
+        and os.getenv("AX_SPACE_ID")
+        and os.getenv("AX_AGENT_NAME")
+        and os.getenv("AX_AGENT_ID")
+    )
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:
@@ -583,14 +595,15 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     token = os.getenv("AX_TOKEN")
     space = os.getenv("AX_SPACE_ID")
     agent = os.getenv("AX_AGENT_NAME")
-    if not (token and space and agent):
+    agent_id = os.getenv("AX_AGENT_ID")
+    if not (token and space and agent and agent_id):
         return None
     os.environ.setdefault("AX_HOME_CHANNEL", space)
     extra: Dict[str, Any] = {
         "base_url": os.getenv("AX_BASE_URL", DEFAULT_BASE_URL),
         "space_id": space,
         "agent_name": agent,
-        "agent_id": os.getenv("AX_AGENT_ID", ""),
+        "agent_id": agent_id,
     }
     home_channel_id = os.getenv("AX_HOME_CHANNEL", space)
     return {
@@ -626,7 +639,7 @@ def register(ctx: Any) -> None:
         adapter_factory=lambda cfg: AxAdapter(cfg),
         check_fn=check_requirements,
         is_connected=is_connected,
-        required_env=["AX_TOKEN", "AX_SPACE_ID", "AX_AGENT_NAME"],
+        required_env=["AX_TOKEN", "AX_SPACE_ID", "AX_AGENT_NAME", "AX_AGENT_ID"],
         install_hint="No extra packages needed (uses httpx bundled with hermes-agent)",
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="AX_HOME_CHANNEL",

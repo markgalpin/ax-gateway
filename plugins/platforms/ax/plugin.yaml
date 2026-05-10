@@ -23,14 +23,14 @@ requires_env:
     description: "Agent name (without @ prefix)"
     prompt: "aX agent name"
     password: false
+  - name: AX_AGENT_ID
+    description: "Agent UUID — required for agent_access PAT exchange and the heartbeat endpoint that drives the UI online dot"
+    prompt: "aX agent id"
+    password: false
 optional_env:
   - name: AX_BASE_URL
     description: "aX API base URL (default: https://paxai.app)"
     prompt: "aX base URL"
-    password: false
-  - name: AX_AGENT_ID
-    description: "Agent UUID; looked up at startup if omitted"
-    prompt: "aX agent id"
     password: false
   - name: AX_HOME_CHANNEL
     description: "Default space id for cron deliveries (default: AX_SPACE_ID)"
