@@ -29,6 +29,7 @@ AxAdapter = _MODULE.AxAdapter
 
 
 def _adapter() -> AxAdapter:
+    from collections import OrderedDict
     adapter = AxAdapter.__new__(AxAdapter)
     adapter.agent_name = "nova"
     adapter.agent_id = "agent-123"
@@ -38,6 +39,7 @@ def _adapter() -> AxAdapter:
         rf"(?<!\w)@{_re.escape(adapter.agent_name)}(?!\w)",
         _re.IGNORECASE,
     )
+    adapter._seen_message_ids = OrderedDict()
     return adapter
 
 
@@ -149,6 +151,105 @@ def test_dispatch_inbound_uses_stable_thread_chat_type(monkeypatch):
     assert captured[1].source.chat_type == "thread"
     # Same thread root → same chat_id → same session key.
     assert captured[0].source.chat_id == captured[1].source.chat_id == "msg-root"
+
+
+def test_dispatch_inbound_dedupes_double_event(monkeypatch):
+    """aX SSE emits both `event: message` and `event: mention` for any
+    mention — same message_id, two events. Without dedup the second hits
+    the active-session guard and fires the "⚡ Interrupting current task"
+    template even though the agent is idle. Dedup must let the first
+    through and silently drop the second."""
+    from types import SimpleNamespace
+    adapter = _adapter()
+    adapter.platform = SimpleNamespace(value="ax")
+    captured: list = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    payload = {
+        "id": "msg-aaa",
+        "content": "@nova hi",
+        "sender": "alice",
+        "sender_id": "u-1",
+        "parent_id": None,
+    }
+    asyncio.run(adapter._dispatch_inbound(payload))
+    asyncio.run(adapter._dispatch_inbound(payload))  # SSE redelivery
+
+    assert len(captured) == 1, "second SSE event for same message_id must be dropped"
+
+
+def test_dispatch_inbound_strips_leading_agent_mention_before_command(monkeypatch):
+    """Telegram strips its own bot trigger before dispatch so `@bot /cmd`
+    still reaches Hermes as a slash command. aX should do the same; Hermes
+    command detection is text.startswith('/'), so leaving the leading mention
+    would route control commands through the normal busy/interrupt path."""
+    from types import SimpleNamespace
+    adapter = _adapter()
+    adapter.platform = SimpleNamespace(value="ax")
+    captured: list = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    asyncio.run(
+        adapter._dispatch_inbound(
+            {
+                "id": "msg-cmd",
+                "content": "@nova: /busy status",
+                "sender": "alice",
+                "sender_id": "u-1",
+                "parent_id": None,
+            }
+        )
+    )
+
+    assert len(captured) == 1
+    assert captured[0].text == "/busy status"
+    assert captured[0].is_command()
+
+
+def test_ax_adapter_requires_agent_pat_for_runtime_identity():
+    """The runtime adapter should fail closed to an agent PAT. Letting a
+    user PAT exchange to user_access would make Hermes runtime actions appear
+    to come from the bootstrap user instead of the bound aX agent identity."""
+    config = _MODULE.PlatformConfig(
+        token="axp_u_not_for_runtime",
+        extra={
+            "space_id": "space-123",
+            "agent_name": "nova",
+            "agent_id": "agent-123",
+        },
+    )
+
+    with pytest.raises(ValueError, match="agent PAT"):
+        AxAdapter(config)
+
+
+def test_ax_adapter_does_not_advertise_chat_edit_streaming():
+    """aX progress belongs on the processing-status activity stream, not a
+    mutable chat bubble. If SUPPORTS_MESSAGE_EDITING is false, the adapter
+    should inherit the base edit_message stub rather than advertising a
+    half-supported chat edit path."""
+    assert AxAdapter.edit_message is _MODULE.BasePlatformAdapter.edit_message
+
+
+def test_seen_message_lru_evicts_oldest(monkeypatch):
+    """The dedup LRU has a fixed cap; oldest entries get evicted so a long-
+    lived adapter does not leak memory. After the bound is exceeded, the
+    earliest message_id should no longer be considered seen."""
+    monkeypatch.setattr(_MODULE, "SEEN_MESSAGE_LRU_MAX", 4)
+    adapter = _adapter()
+    for n in range(5):
+        adapter._seen_or_record(f"msg-{n}")
+    assert "msg-0" not in adapter._seen_message_ids
+    assert "msg-4" in adapter._seen_message_ids
+    assert len(adapter._seen_message_ids) == 4
 
 
 def test_stop_typing_marks_processing_status_completed(monkeypatch):

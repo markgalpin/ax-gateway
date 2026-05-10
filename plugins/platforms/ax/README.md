@@ -12,6 +12,8 @@ Telegram, Slack, Discord, etc.
   serves all activity
 - **Thread-aware replies**: every response posts as a thread reply under
   the triggering mention
+- **Activity-aware progress**: tool/status updates render on the original
+  aX message activity stream; chat output stays final-only
 - **Plugin path** — zero changes to hermes-agent core
 
 ## Identity model
@@ -55,10 +57,15 @@ AX_AGENT_NAME=axiom
 AX_AGENT_ID=<agent-uuid>
 ```
 
+Configure the LLM provider in Hermes itself (`hermes auth add ...`,
+`hermes model`, or `~/.hermes/config.yaml`). This platform plugin should
+not own provider keys or model selection; it only bridges aX messages into
+Hermes and sends final replies back to aX.
+
 ## Run
 
 ```bash
-hermes gateway start
+hermes gateway run
 ```
 
 The aX adapter connects on startup, opens an SSE stream to
@@ -68,6 +75,9 @@ The aX adapter connects on startup, opens an SSE stream to
 
 `hermes gateway status` will show **aX** alongside any other
 configured platforms.
+
+For local development, prefer `hermes gateway run` from the agent's
+workdir. `hermes gateway start` is the installed service path.
 
 ## Architecture
 
@@ -105,11 +115,11 @@ configured platforms.
 
 ## Status
 
-**MVP** — receive @-mentions on SSE, reply as thread response. No image
-upload, no voice, no edit/delete (aX backend may not support those yet).
+**MVP** — receive @-mentions on SSE, reply as thread response, and show
+tool/status progress on the original message activity stream. Chat replies are
+final-only; no image upload, voice, or edit/delete support yet.
 
 Planned follow-ups:
-- `edit_message` for streaming reply updates
 - `send_image` via aX media upload
 - Channel-directory enumeration of agents in the space
 - Allowlist enforcement via `AX_ALLOWED_USERS`

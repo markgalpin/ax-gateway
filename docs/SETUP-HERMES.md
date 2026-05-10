@@ -16,6 +16,36 @@ working baseline but the plugin path is the long-term shape.
 - One long-lived gateway process serves every space the agent listens in
 - No fork or core changes to `hermes-agent` — pure plugin
 
+## Hermes-native setup contract
+
+The aX integration is a **platform adapter**. It should look like
+Telegram, Teams, or Google Chat to Hermes: receive platform messages,
+normalize them into `MessageEvent`, call `handle_message()`, and send the
+final reply back to the platform. It is not an LLM/provider plugin.
+
+Keep the boundaries crisp:
+
+- **Model access stays in Hermes.** Configure the model with
+  `hermes auth add ...`, `hermes model`, and `~/.hermes/config.yaml`.
+  Platform code should not load OpenAI/Anthropic keys or pick a model.
+  Hermes plugin docs expose `ctx.llm` for general plugins that need
+  out-of-band model calls, but a gateway adapter should normally let the
+  agent runtime own all LLM turns.
+- **Runtime identity is an aX agent PAT.** `AX_TOKEN` must be `axp_a_...`;
+  user PATs would make runtime actions appear to come from the bootstrap
+  user instead of the bound agent.
+- **aX progress belongs on the original message activity stream.**
+  The plugin advertises `SUPPORTS_ACTIVITY_STATUS=True` and keeps chat
+  replies final-only, so tool/status updates do not create duplicate or
+  noisy chat bubbles.
+- **Shared-space triggers are normalized before dispatch.** aX users type
+  `@nova /command`; Hermes command detection expects `/command`, so the
+  adapter strips the leading addressed mention before handing text to
+  `handle_message()`.
+- **Inbound events are deduped.** aX can emit both `message` and `mention`
+  events for the same message id. The adapter records recent ids before
+  dispatch so the same turn does not look like an interruption.
+
 ## Prerequisites
 
 1. **Clone hermes-agent and set up its venv**
@@ -121,6 +151,22 @@ In another terminal, mention the agent from any aX client:
 
 The plugin's SSE consumer dispatches the mention to Hermes, which
 processes it through the configured runtime and replies via REST.
+
+## Verify the adapter contract
+
+Use one short live pass before calling a setup good:
+
+1. `~/hermes-agent/.venv/bin/hermes plugins list` shows
+   `ax-platform` enabled.
+2. `~/hermes-agent/.venv/bin/hermes gateway status` shows aX connected
+   with the expected `AX_AGENT_NAME` and space.
+3. Send `@nova /busy status` from aX. The command should be recognized
+   as a slash command after the leading mention is stripped.
+4. Send a normal message that uses tools. You should see activity/status
+   updates on the original aX message and one final threaded reply, not a
+   stream of duplicate chat bubbles.
+5. Watch for duplicate replies or false "interrupting current task"
+   notices. Those usually mean dedup or trigger normalization regressed.
 
 ## Sandboxing — what's enforced and what isn't
 

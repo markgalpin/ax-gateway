@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
 import httpx
@@ -58,7 +59,13 @@ SSE_RECONNECT_BACKOFF_MAX = 60.0
 SSE_IDLE_TIMEOUT = 90.0
 JWT_REFRESH_BUFFER_SECONDS = 30
 HEARTBEAT_INTERVAL_SECONDS = 30.0
-USER_ACCESS_SCOPE = "messages tasks context agents spaces search"
+# aX's SSE stream emits BOTH `event: message` and `event: mention` for any
+# message that contains a mention — same message_id, two events. Without
+# dedup we'd dispatch the same inbound twice: the first call starts the
+# Hermes run and marks the session active, the second hits the active-session
+# guard and fires the "⚡ Interrupting current task" busy-ack template. The
+# LRU also covers SSE reconnect-replay if aX ever sends backlog on resume.
+SEEN_MESSAGE_LRU_MAX = 1024
 AGENT_RUNTIME_SCOPE = "tasks:read tasks:write messages:read messages:write agents:read"
 DEFAULT_AUDIENCE = "ax-api"
 
@@ -73,27 +80,36 @@ class AxAdapter(BasePlatformAdapter):
     SUPPORTS_ACTIVITY_STATUS = True
 
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, Platform("ax"))
         extra: Dict[str, Any] = config.extra or {}
 
-        self.base_url = (extra.get("base_url") or os.getenv("AX_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-        self.token = (config.token or os.getenv("AX_TOKEN") or "").strip()
-        self.space_id = (extra.get("space_id") or os.getenv("AX_SPACE_ID") or "").strip()
-        self.agent_name = (extra.get("agent_name") or os.getenv("AX_AGENT_NAME") or "").strip()
-        self.agent_id = (extra.get("agent_id") or os.getenv("AX_AGENT_ID") or "").strip()
+        base_url = (extra.get("base_url") or os.getenv("AX_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+        token = (config.token or os.getenv("AX_TOKEN") or "").strip()
+        space_id = (extra.get("space_id") or os.getenv("AX_SPACE_ID") or "").strip()
+        agent_name = (extra.get("agent_name") or os.getenv("AX_AGENT_NAME") or "").strip()
+        agent_id = (extra.get("agent_id") or os.getenv("AX_AGENT_ID") or "").strip()
 
-        if not self.token:
+        if not token:
             raise ValueError("aX adapter requires AX_TOKEN (agent PAT)")
-        if not self.space_id:
+        if not token.startswith("axp_a_"):
+            raise ValueError("aX adapter requires AX_TOKEN to be an agent PAT (axp_a_...)")
+        if not space_id:
             raise ValueError("aX adapter requires AX_SPACE_ID")
-        if not self.agent_name:
+        if not agent_name:
             raise ValueError("aX adapter requires AX_AGENT_NAME")
-        if not self.agent_id:
+        if not agent_id:
             raise ValueError(
                 "aX adapter requires AX_AGENT_ID — needed for agent_access "
                 "PAT exchange and /api/v1/agents/heartbeat (without it the "
                 "UI online dot stays gray)"
             )
+
+        super().__init__(config, Platform("ax"))
+
+        self.base_url = base_url
+        self.token = token
+        self.space_id = space_id
+        self.agent_name = agent_name
+        self.agent_id = agent_id
 
         self._sse_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -106,6 +122,8 @@ class AxAdapter(BasePlatformAdapter):
             rf"(?<!\w)@{re.escape(self.agent_name)}(?!\w)",
             re.IGNORECASE,
         )
+        # See SEEN_MESSAGE_LRU_MAX for why we need this.
+        self._seen_message_ids: "OrderedDict[str, None]" = OrderedDict()
 
     async def _post_processing_status(
         self,
@@ -151,24 +169,19 @@ class AxAdapter(BasePlatformAdapter):
         """Return a cached or freshly-exchanged JWT.
 
         PAT never touches business endpoints — only ``/auth/exchange``
-        per AUTH-SPEC-001 §13. Agent PATs (``axp_a_``) exchange for
-        ``agent_access``; user PATs (``axp_u_``) for ``user_access``.
+        per AUTH-SPEC-001 §13. The runtime adapter intentionally accepts
+        agent PATs only so messages, heartbeats, and activity updates are
+        authored by the bound aX agent identity.
         """
         if not force and self._jwt and time.time() < (self._jwt_expires_at - JWT_REFRESH_BUFFER_SECONDS):
             return self._jwt
 
-        is_agent_pat = self.token.startswith("axp_a_")
-        body: Dict[str, Any] = {"audience": DEFAULT_AUDIENCE}
-        if is_agent_pat:
-            body["requested_token_class"] = "agent_access"
-            body["scope"] = AGENT_RUNTIME_SCOPE
-            if self.agent_id:
-                body["agent_id"] = self.agent_id
-            else:
-                body["agent_name"] = self.agent_name
-        else:
-            body["requested_token_class"] = "user_access"
-            body["scope"] = USER_ACCESS_SCOPE
+        body: Dict[str, Any] = {
+            "audience": DEFAULT_AUDIENCE,
+            "requested_token_class": "agent_access",
+            "scope": AGENT_RUNTIME_SCOPE,
+            "agent_id": self.agent_id,
+        }
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(
@@ -384,6 +397,40 @@ class AxAdapter(BasePlatformAdapter):
         text = str(data.get("content") or data.get("text") or "")
         return bool(self._mention_pattern.search(text))
 
+    def _clean_agent_trigger_text(self, text: str) -> str:
+        """Strip a leading addressed mention before Hermes command parsing.
+
+        Hermes detects slash commands with ``text.startswith("/")``. aX users
+        naturally address agents as ``@agent /command`` in shared spaces, so
+        match Telegram's trigger-cleaning pattern and hand Hermes ``/command``.
+        """
+        if not text:
+            return text
+        cleaned = re.sub(
+            rf"^\s*@{re.escape(self.agent_name)}(?!\w)[,:\-]*\s*",
+            "",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+        return cleaned or text
+
+    def _seen_or_record(self, message_id: str) -> bool:
+        """Return True if message_id was already dispatched recently.
+
+        aX's SSE delivers each mention as both ``event: message`` and
+        ``event: mention``; without this guard Hermes processes the inbound
+        twice and the second run path posts a "⚡ Interrupting current task"
+        busy-ack chat bubble even though the agent was idle.
+        """
+        if message_id in self._seen_message_ids:
+            self._seen_message_ids.move_to_end(message_id)
+            return True
+        self._seen_message_ids[message_id] = None
+        if len(self._seen_message_ids) > SEEN_MESSAGE_LRU_MAX:
+            self._seen_message_ids.popitem(last=False)
+        return False
+
     async def _dispatch_inbound(self, data: Dict[str, Any]) -> None:
         if self._is_self_authored(data):
             return
@@ -393,8 +440,10 @@ class AxAdapter(BasePlatformAdapter):
         message_id = str(data.get("id") or data.get("message_id") or "").strip()
         if not message_id:
             return
+        if self._seen_or_record(message_id):
+            return
 
-        text = str(data.get("content") or data.get("text") or "").strip()
+        text = self._clean_agent_trigger_text(str(data.get("content") or data.get("text") or "").strip())
         if not text:
             return
 
@@ -523,46 +572,6 @@ class AxAdapter(BasePlatformAdapter):
         # MVP: send as text + URL. aX UI inline-renders image links.
         text = (caption + "\n\n" + image_url).strip()
         return await self.send(chat_id, text)
-
-    async def edit_message(
-        self,
-        chat_id: str,
-        message_id: str,
-        content: str,
-        *,
-        finalize: bool = False,
-    ) -> SendResult:
-        """PATCH /api/v1/messages/{id} for in-place streaming edits.
-
-        Hermes calls this repeatedly during a streaming response so the
-        aX UI shows the reply growing instead of one-shot delivery.
-        ``finalize`` is informational on aX (no separate finalize state);
-        we treat it as a normal edit.
-        """
-        try:
-            jwt = await self._get_jwt()
-        except Exception as exc:
-            return SendResult(success=False, error=f"auth: {exc}", retryable=True)
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.patch(
-                    f"{self.base_url}/api/v1/messages/{message_id}",
-                    json={"content": content},
-                    headers={
-                        "Authorization": f"Bearer {jwt}",
-                        "Content-Type": "application/json",
-                        "X-Space-Id": self.space_id,
-                    },
-                )
-        except Exception as exc:
-            return SendResult(success=False, error=str(exc), retryable=True)
-        if r.status_code in (200, 204):
-            return SendResult(success=True, message_id=message_id)
-        return SendResult(
-            success=False,
-            error=f"status {r.status_code}: {r.text[:160]}",
-            retryable=r.status_code in (429,) or 500 <= r.status_code < 600,
-        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {
