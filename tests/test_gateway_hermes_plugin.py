@@ -89,6 +89,31 @@ def test_scaffold_creates_dir_plugin_link_and_dotenv(tmp_path):
     ), "Identity .env must not assign AX_TOKEN"
 
 
+def test_scaffold_writes_allow_all_users_when_opted_in(tmp_path):
+    entry = _base_entry(tmp_path)
+    entry["allow_all_users"] = True
+    home = gateway_core._scaffold_hermes_plugin_home(entry)
+    dotenv = (home / ".env").read_text()
+    assert "AX_ALLOW_ALL_USERS=1" in dotenv
+    assert "GATEWAY_ALLOW_ALL_USERS=true" in dotenv
+
+
+def test_scaffold_omits_allow_all_users_by_default(tmp_path):
+    entry = _base_entry(tmp_path)
+    home = gateway_core._scaffold_hermes_plugin_home(entry)
+    dotenv = (home / ".env").read_text()
+    assert "AX_ALLOW_ALL_USERS=1" not in dotenv
+    assert "GATEWAY_ALLOW_ALL_USERS=true" not in dotenv
+
+
+def test_scaffold_writes_allowed_users(tmp_path):
+    entry = _base_entry(tmp_path)
+    entry["allowed_users"] = "alice,bob"
+    home = gateway_core._scaffold_hermes_plugin_home(entry)
+    dotenv = (home / ".env").read_text()
+    assert "AX_ALLOWED_USERS=alice,bob" in dotenv
+
+
 def test_scaffold_is_idempotent(tmp_path):
     entry = _base_entry(tmp_path)
     home_first = gateway_core._scaffold_hermes_plugin_home(entry)

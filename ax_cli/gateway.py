@@ -4412,6 +4412,19 @@ def _scaffold_hermes_plugin_home(entry: dict[str, Any]) -> Path:
         f"AX_BASE_URL={entry.get('base_url') or 'https://paxai.app'}",
         f"AX_HOME_CHANNEL={entry.get('home_channel_id') or entry.get('space_id') or ''}",
     ]
+    # Allowlist controls. Two independent layers:
+    #   - AX_ALLOWED_USERS / AX_ALLOW_ALL_USERS: plugin-side filter on who
+    #     can @-mention this agent (adapter checks the sender's name).
+    #   - GATEWAY_ALLOW_ALL_USERS: hermes-side gate; without it, hermes
+    #     refuses to dispatch any request when no platform allowlist is set.
+    # Operators opt in by setting `entry["allow_all_users"] = True` (e.g. via
+    # `ax gateway agents add/update --allow-all-users`). Default-closed.
+    if entry.get("allow_all_users"):
+        env_lines.append("AX_ALLOW_ALL_USERS=1")
+        env_lines.append("GATEWAY_ALLOW_ALL_USERS=true")
+    allowed = str(entry.get("allowed_users") or "").strip()
+    if allowed:
+        env_lines.append(f"AX_ALLOWED_USERS={allowed}")
     (home / ".env").write_text("\n".join(env_lines) + "\n", encoding="utf-8")
     # Inherit provider creds from the operator's ~/.hermes/ unless the
     # agent already has its own. Symlink, don't copy, so rotation in one
@@ -6286,8 +6299,17 @@ class GatewayDaemon:
         )
         space_status = _normalized_optional_controlled(entry.get("space_status"), _CONTROLLED_SPACE_STATUSES)
         runtime = self._runtimes.get(name)
+        runtime_type_lower = str(entry.get("runtime_type") or "").strip().lower()
         external_runtime_state = str(entry.get("external_runtime_state") or "").strip().lower()
-        if external_runtime_state or _external_runtime_expected(entry):
+        # The external-runtime branch is for plugin agents the operator runs
+        # themselves (manual `hermes gateway run`). When Gateway is the
+        # supervisor — runtime_type is hermes_plugin — Gateway owns the
+        # process lifecycle and any external-runtime hints on the entry are
+        # leftover announcement state from an earlier hand-launched run.
+        # Skip the external branch so we reach the supervised-subprocess path.
+        if (external_runtime_state or _external_runtime_expected(entry)) and not _is_hermes_plugin_runtime(
+            runtime_type_lower
+        ):
             if runtime is not None:
                 runtime.stop()
                 self._runtimes.pop(name, None)
