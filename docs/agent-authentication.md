@@ -392,7 +392,7 @@ When a local agent calls `/local/connect`, Gateway issues a session token
 
 - **Short-lived** — they expire and cannot be replayed after the session ends
 - **Per-connect** — a new token is issued for each connection, not cached
-- **HMAC-SHA256 signed** — using a secret at `~/.ax/gateway/.secret`
+- **HMAC-SHA256 signed** — using the secret at `~/.ax/gateway/local_secret.bin`
 - **Scoped** — the token identifies which agent it was issued for
 
 See [ADR-003](adr/ADR-003-session-tokens-per-connect.md) for the rationale.

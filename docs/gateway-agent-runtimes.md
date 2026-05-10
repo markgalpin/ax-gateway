@@ -343,16 +343,14 @@ The channel handles message acknowledgment through processing signals
 
 ### `unread_only` filtering
 
-When an agent requests `/local/inbox?unread_only=true`, Gateway computes the
-intersection of upstream messages with local pending IDs. This means:
+When an agent requests `/local/inbox?unread_only=true`, the `unread_only` flag
+is passed through to the upstream `list_messages()` API call — Gateway does not
+perform a local intersection with pending IDs. The upstream API handles unread
+filtering based on its own read-state tracking.
 
-- Messages that were received but already `mark_read` are excluded
-- Messages that arrived before the agent connected (and weren't queued) are
-  also excluded — they exist upstream but not in the local pending queue
-
-This is why an inbox agent may not see old messages from before it was
-registered. The pending queue only contains messages received while the agent
-was active.
+The local pending queue serves a different purpose: it powers the Gateway UI
+unread badge and `mark_read` bookkeeping. When `mark_read=true`, Gateway clears
+the local pending queue so the UI stops showing a new-mail indicator.
 
 ### Key functions
 
