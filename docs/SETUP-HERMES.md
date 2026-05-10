@@ -107,6 +107,7 @@ AX_SPACE_ID=49afd277-78d2-4a32-9858-3594cda684af   # the space the agent listens
 AX_AGENT_NAME=nova
 AX_AGENT_ID=08c6d677-...                            # from ax gateway agents show nova
 AX_BASE_URL=https://paxai.app
+AX_LOCAL_GATEWAY_URL=http://127.0.0.1:8765           # optional: local Gateway roster/activity updates
 AX_ALLOW_ALL_USERS=1                                 # allow anyone in the space to mention; tighten for prod
 HERMES_AGENT_NOTIFY_INTERVAL=0                       # don't spam the chat with "Still working..." bubbles
 TERMINAL_CWD=/Users/jacob/hermes-agents/nova         # tools default to the agent's workdir
@@ -151,6 +152,10 @@ In another terminal, mention the agent from any aX client:
 
 The plugin's SSE consumer dispatches the mention to Hermes, which
 processes it through the configured runtime and replies via REST.
+If the local Gateway UI is available, the plugin also announces its
+runtime state there so the agent row shows Active/recent activity. If the
+local Gateway is not running, that announce is ignored and the hosted aX
+message path still works.
 
 ## Verify the adapter contract
 

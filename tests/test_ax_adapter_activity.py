@@ -34,6 +34,7 @@ def _adapter() -> AxAdapter:
     adapter.agent_name = "nova"
     adapter.agent_id = "agent-123"
     adapter.space_id = "space-123"
+    adapter.local_gateway_url = "http://127.0.0.1:8765"
     import re as _re
     adapter._mention_pattern = _re.compile(
         rf"(?<!\w)@{_re.escape(adapter.agent_name)}(?!\w)",
@@ -264,3 +265,41 @@ def test_stop_typing_marks_processing_status_completed(monkeypatch):
     asyncio.run(adapter.stop_typing("msg-1"))
 
     assert calls == [{"message_id": "msg-1", "status": "completed", "activity": None}]
+
+
+def test_announce_local_gateway_posts_external_runtime_state(monkeypatch):
+    adapter = _adapter()
+    posts = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, **kwargs):
+            posts.append({"url": url, **kwargs})
+            return type("Response", (), {"status_code": 200})()
+
+    monkeypatch.setattr(_MODULE.httpx, "AsyncClient", FakeAsyncClient)
+
+    asyncio.run(
+        adapter._announce_local_gateway(
+            "thinking",
+            activity="Using search_docs",
+            message_id="msg-1",
+            current_tool="search_docs",
+        )
+    )
+
+    assert posts[0]["url"] == "http://127.0.0.1:8765/api/agents/nova/external-runtime-announce"
+    assert posts[0]["json"]["runtime_kind"] == "hermes_plugin"
+    assert posts[0]["json"]["status"] == "thinking"
+    assert posts[0]["json"]["agent_id"] == "agent-123"
+    assert posts[0]["json"]["activity"] == "Using search_docs"
+    assert posts[0]["json"]["message_id"] == "msg-1"
+    assert posts[0]["json"]["current_tool"] == "search_docs"

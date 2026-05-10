@@ -41,6 +41,7 @@ import re
 import time
 from collections import OrderedDict
 from typing import Any, AsyncIterator, Dict, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 from gateway.config import Platform, PlatformConfig
@@ -55,10 +56,12 @@ from gateway.session import SessionSource
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://paxai.app"
+DEFAULT_LOCAL_GATEWAY_URL = "http://127.0.0.1:8765"
 SSE_RECONNECT_BACKOFF_MAX = 60.0
 SSE_IDLE_TIMEOUT = 90.0
 JWT_REFRESH_BUFFER_SECONDS = 30
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+LOCAL_GATEWAY_ANNOUNCE_TIMEOUT = 1.5
 # aX's SSE stream emits BOTH `event: message` and `event: mention` for any
 # message that contains a mention — same message_id, two events. Without
 # dedup we'd dispatch the same inbound twice: the first call starts the
@@ -87,6 +90,12 @@ class AxAdapter(BasePlatformAdapter):
         space_id = (extra.get("space_id") or os.getenv("AX_SPACE_ID") or "").strip()
         agent_name = (extra.get("agent_name") or os.getenv("AX_AGENT_NAME") or "").strip()
         agent_id = (extra.get("agent_id") or os.getenv("AX_AGENT_ID") or "").strip()
+        local_gateway_url = (
+            extra.get("local_gateway_url")
+            or os.getenv("AX_LOCAL_GATEWAY_URL")
+            or os.getenv("AX_GATEWAY_UI_URL")
+            or DEFAULT_LOCAL_GATEWAY_URL
+        )
 
         if not token:
             raise ValueError("aX adapter requires AX_TOKEN (agent PAT)")
@@ -110,6 +119,7 @@ class AxAdapter(BasePlatformAdapter):
         self.space_id = space_id
         self.agent_name = agent_name
         self.agent_id = agent_id
+        self.local_gateway_url = str(local_gateway_url or "").strip().rstrip("/")
 
         self._sse_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -125,6 +135,48 @@ class AxAdapter(BasePlatformAdapter):
         # See SEEN_MESSAGE_LRU_MAX for why we need this.
         self._seen_message_ids: "OrderedDict[str, None]" = OrderedDict()
 
+    async def _announce_local_gateway(
+        self,
+        status: str,
+        *,
+        activity: Optional[str] = None,
+        message_id: Optional[str] = None,
+        current_tool: Optional[str] = None,
+    ) -> None:
+        """Best-effort local Gateway roster/activity update.
+
+        The hosted aX heartbeat makes the web app show the agent online. This
+        local announcement is separate: it tells `ax gateway start` that an
+        externally managed Hermes plugin process is live, so the Gateway UI
+        can show an active row without launching a duplicate runtime.
+        """
+        if not self.local_gateway_url:
+            return
+        body: Dict[str, Any] = {
+            "agent_id": self.agent_id,
+            "agent_name": self.agent_name,
+            "space_id": self.space_id,
+            "status": status,
+            "runtime_kind": "hermes_plugin",
+            "pid": os.getpid(),
+            "workdir": os.getcwd(),
+        }
+        if activity:
+            body["activity"] = activity
+        if message_id:
+            body["message_id"] = message_id
+        if current_tool:
+            body["current_tool"] = current_tool
+        try:
+            async with httpx.AsyncClient(timeout=LOCAL_GATEWAY_ANNOUNCE_TIMEOUT) as client:
+                await client.post(
+                    f"{self.local_gateway_url}/api/agents/{quote(self.agent_name)}/external-runtime-announce",
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                )
+        except Exception:
+            pass
+
     async def _post_processing_status(
         self,
         message_id: str,
@@ -136,6 +188,7 @@ class AxAdapter(BasePlatformAdapter):
         try:
             jwt = await self._get_jwt()
         except Exception:
+            await self._announce_local_gateway(status, activity=activity, message_id=message_id)
             return
         body = {
             "message_id": message_id,
@@ -158,6 +211,7 @@ class AxAdapter(BasePlatformAdapter):
                 )
         except Exception:
             pass
+        await self._announce_local_gateway(status, activity=activity, message_id=message_id)
 
     @property
     def name(self) -> str:
@@ -222,6 +276,7 @@ class AxAdapter(BasePlatformAdapter):
             self.space_id[:8],
             self.base_url,
         )
+        await self._announce_local_gateway("connected", activity="Hermes plugin listener connected")
         return True
 
     async def _heartbeat_loop(self) -> None:
@@ -248,6 +303,7 @@ class AxAdapter(BasePlatformAdapter):
         try:
             jwt = await self._get_jwt()
         except Exception:
+            await self._announce_local_gateway(status)
             return
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -261,12 +317,14 @@ class AxAdapter(BasePlatformAdapter):
                 )
         except Exception:
             pass  # heartbeat is best-effort
+        await self._announce_local_gateway(status)
 
     async def disconnect(self) -> None:
         self._stop_event.set()
         # Mark offline before cancelling so the UI updates promptly.
         try:
             await self._send_heartbeat("offline")
+            await self._announce_local_gateway("offline", activity="Hermes plugin listener stopped")
         except Exception:
             pass
         for task_attr in ("_sse_task", "_heartbeat_task"):
