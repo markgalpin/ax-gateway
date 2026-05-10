@@ -16,7 +16,9 @@ credentials.
 
 ## Decision
 
-Gateway binds exclusively to `127.0.0.1:8765`. No LAN exposure.
+Gateway defaults to `127.0.0.1:8765`. The `--host` flag on `ax gateway start`
+and `ax gateway ui` allows an explicit override (e.g. for SSH tunnel or reverse
+proxy setups), but the default enforces localhost-only binding.
 
 ## Consequences
 

@@ -15,17 +15,17 @@ connections or issued fresh each time.
 ## Decision
 
 Session tokens are short-lived and per-connect. Each `/local/connect` call
-issues a new token. Tokens are HMAC-SHA256 signed with a secret stored at
-`~/.ax/gateway/.secret` (see `issue_local_session()` in
-`ax_cli/gateway.py:1327`). Tokens are not cached on disk or reused across
-agent restarts.
+issues a new token. Tokens are HMAC-SHA256 signed with the secret at
+`~/.ax/gateway/local_secret.bin` (see `local_secret_path()` and
+`issue_local_session()` in `ax_cli/gateway.py`). Tokens are not cached on
+disk or reused across agent restarts.
 
 ## Consequences
 
 - **Positive:** A leaked session token has limited blast radius — it expires
   and cannot be replayed after the session ends.
-- **Positive:** Token compromise does not persist across agent restarts.
-  Stopping and restarting an agent invalidates all outstanding sessions.
+- **Positive:** Token compromise has a bounded window — tokens expire via TTL.
+  There is no restart-based invalidation; the primary protection is short expiry.
 - **Positive:** Simpler token lifecycle — no cache invalidation, no stale token
   bugs, no need for a revocation list.
 - **Negative:** Every agent connect requires a Gateway round-trip to obtain a

@@ -37,7 +37,9 @@ Implemented in PR #172.
 - **Positive:** The reconcile loop no longer races with space switches — session
   writes are independent of registry writes.
 - **Positive:** Space auto-migration only needs to touch session, not registry.
-- **Negative:** Two files to read when debugging space issues. Operators need to
-  know to check `session.json` for active space, not `registry.json`.
+- **Negative:** Two files to read when debugging space issues. During the
+  migration, identity bindings in `registry.json` still carry `active_space_id`
+  and `default_space_id` fields. Operators should check both `session.json` and
+  `registry.json` identity bindings until the migration is complete.
 - **Negative:** Gateway startup must load both files and reconcile any
   inconsistencies between them.
