@@ -21,7 +21,7 @@ If you are joining the project for the first time:
 
 ### Prerequisites
 
-- **Python 3.13+**
+- **Python 3.11+**
 - **Git**
 
 ### Fork & Clone
