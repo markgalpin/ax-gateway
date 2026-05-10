@@ -1039,6 +1039,22 @@ def _external_runtime_connected(snapshot: dict[str, Any], *, last_seen_age: int 
     return last_seen_age is not None and last_seen_age <= RUNTIME_STALE_AFTER_SECONDS
 
 
+def _external_runtime_expected(snapshot: dict[str, Any]) -> bool:
+    """Whether this runtime is owned by an external process/plugin.
+
+    External Hermes platform adapters should stay externally managed across
+    Gateway restarts. A missing fresh heartbeat means "plugin not attached",
+    not permission to fall back to the legacy managed sentinel.
+    """
+    if bool(snapshot.get("external_runtime_managed")):
+        return True
+    if str(snapshot.get("external_runtime_kind") or "").strip():
+        return True
+    if str(snapshot.get("external_runtime_instance_id") or "").strip():
+        return True
+    return False
+
+
 def _pid_is_alive(pid: object) -> bool:
     try:
         pid_int = int(pid or 0)
@@ -5933,24 +5949,31 @@ class GatewayDaemon:
         space_status = _normalized_optional_controlled(entry.get("space_status"), _CONTROLLED_SPACE_STATUSES)
         runtime = self._runtimes.get(name)
         external_runtime_state = str(entry.get("external_runtime_state") or "").strip().lower()
-        if external_runtime_state:
+        if external_runtime_state or _external_runtime_expected(entry):
             if runtime is not None:
                 runtime.stop()
                 self._runtimes.pop(name, None)
             last_seen_age = _age_seconds(entry.get("last_seen_at"))
+            external_connected = _external_runtime_connected(entry, last_seen_age=last_seen_age)
+            external_stopped = external_runtime_state in {"offline", "stopped", "disconnected"}
             entry.update(
                 {
                     "effective_state": "running"
-                    if _external_runtime_connected(entry, last_seen_age=last_seen_age)
-                    else ("stopped" if external_runtime_state in {"offline", "stopped", "disconnected"} else "stale"),
+                    if external_connected
+                    else ("stopped" if external_stopped else "stale"),
                     "runtime_instance_id": entry.get("external_runtime_instance_id"),
                     "backlog_depth": 0,
                 }
             )
-            if external_runtime_state in {"offline", "stopped", "disconnected"}:
+            if not external_connected:
                 entry["current_status"] = None
                 entry["current_tool"] = None
                 entry["current_tool_call_id"] = None
+                if not external_stopped:
+                    entry["local_attach_state"] = "external_stale"
+                    entry["local_attach_detail"] = (
+                        "Gateway is waiting for a fresh external runtime heartbeat before routing work."
+                    )
             return
         hermes_status = hermes_setup_status(entry)
         if not hermes_status.get("ready", True):

@@ -1837,6 +1837,7 @@ def _announce_external_agent_runtime(name: str, body: dict) -> dict:
     entry["runtime_instance_id"] = runtime_instance_id
     entry["external_runtime_instance_id"] = runtime_instance_id
     entry["external_runtime_kind"] = runtime_kind
+    entry["external_runtime_managed"] = True
     entry["external_runtime_seen_at"] = now
     entry["external_runtime_status"] = status
     entry["external_runtime_state"] = "offline" if status in _EXTERNAL_RUNTIME_STOPPED_STATUSES else "connected"

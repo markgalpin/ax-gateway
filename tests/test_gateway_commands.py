@@ -5090,6 +5090,7 @@ def test_gateway_ui_external_runtime_announce_marks_plugin_active(monkeypatch, t
             stored = gateway_core.find_agent_entry(gateway_core.load_gateway_registry(), "nova")
             assert stored["desired_state"] == "running"
             assert stored["effective_state"] == "running"
+            assert stored["external_runtime_managed"] is True
             assert stored["external_runtime_state"] == "connected"
             assert stored["external_runtime_kind"] == "hermes_plugin"
     finally:
@@ -5117,6 +5118,31 @@ def test_gateway_daemon_does_not_launch_managed_process_for_external_runtime(tmp
     assert daemon._runtimes == {}
     assert entry["effective_state"] == "running"
     assert entry["runtime_instance_id"] == "external:hermes_plugin:nova:12345"
+
+
+def test_gateway_daemon_preserves_stale_external_plugin_without_legacy_fallback(tmp_path):
+    entry = {
+        "name": "nova",
+        "template_id": "hermes",
+        "runtime_type": "hermes_sentinel",
+        "desired_state": "running",
+        "effective_state": "running",
+        "external_runtime_managed": True,
+        "external_runtime_kind": "hermes_plugin",
+        "external_runtime_instance_id": "external:hermes_plugin:nova:12345",
+        "last_seen_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=gateway_core.RUNTIME_STALE_AFTER_SECONDS + 10)
+        ).isoformat(),
+    }
+
+    daemon = gateway_core.GatewayDaemon(client_factory=lambda **kwargs: None)
+    daemon._reconcile_runtime(entry)
+
+    assert daemon._runtimes == {}
+    assert entry["effective_state"] == "stale"
+    assert entry["runtime_instance_id"] == "external:hermes_plugin:nova:12345"
+    assert entry["local_attach_state"] == "external_stale"
+    assert "fresh external runtime heartbeat" in entry["local_attach_detail"]
 
 
 def test_gateway_daemon_marks_stopped_when_desired_state_is_stopped():
