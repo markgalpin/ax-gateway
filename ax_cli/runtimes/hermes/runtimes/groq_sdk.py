@@ -2,9 +2,9 @@
 # vendor sync. See ax_cli/runtimes/hermes/README.md for vendoring guidance.
 """Groq SDK runtime — wraps Groq's chat completions API.
 
-Phase 1 skeleton: single non-streaming chat call, no tool support, no
-agent loop. Streaming, history reuse, and tool calls land in subsequent
-phases (mirror the patterns in openai_sdk.py).
+Phase 2: streaming chat completions with history reuse. Tool calls,
+multi-turn agent loop, and SDK_PREAMBLE injection land in later phases
+(mirror the patterns in openai_sdk.py).
 
 Auth: GROQ_API_KEY environment variable.
 Models: https://console.groq.com/docs/models
@@ -28,10 +28,10 @@ DEFAULT_MODEL = "llama-3.3-70b-versatile"
 class GroqSDKRuntime(BaseRuntime):
     """Runs agent turns via the Groq Python SDK.
 
-    Phase 1: single non-streaming chat completion, no tool calls,
-    no multi-turn agent loop. Returns the model's first reply as
-    final text. Sufficient to prove registration + discovery and
-    smoke-test the API surface.
+    Phase 2: streaming chat completion with history reuse. Still
+    single-turn (no tool calls, no agent loop). Caller may pass
+    prior conversation via extra_args["history"]; the runtime appends
+    the new user message and the assistant reply before returning.
     """
 
     def execute(
@@ -67,16 +67,16 @@ class GroqSDKRuntime(BaseRuntime):
 
         try:
             client = Groq(api_key=api_key)
-            response = client.chat.completions.create(
+            stream = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": instructions},
                     *history,
                 ],
-                stream=False,
+                stream=True,
             )
         except Exception as e:
-            log.error(f"groq_sdk: API error: {e}")
+            log.error(f"groq_sdk: API error opening stream: {e}")
             return RuntimeResult(
                 text="Agent encountered an API error and could not complete the task.",
                 history=history,
@@ -84,7 +84,29 @@ class GroqSDKRuntime(BaseRuntime):
                 elapsed_seconds=int(time.time() - start_time),
             )
 
-        final_text = (response.choices[0].message.content or "").strip()
+        chunks: list[str] = []
+        try:
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                content = getattr(delta, "content", None)
+                if content:
+                    chunks.append(content)
+                    cb.on_text_delta(content)
+        except Exception as e:
+            log.error(f"groq_sdk: stream error after {len(chunks)} chunks: {e}")
+            partial = "".join(chunks).strip()
+            if partial:
+                history.append({"role": "assistant", "content": partial})
+            return RuntimeResult(
+                text=partial or "Agent encountered a stream error mid-response.",
+                history=history,
+                exit_reason="crashed",
+                elapsed_seconds=int(time.time() - start_time),
+            )
+
+        final_text = "".join(chunks).strip()
         history.append({"role": "assistant", "content": final_text})
         cb.on_text_complete(final_text)
 
