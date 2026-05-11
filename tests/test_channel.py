@@ -1422,6 +1422,7 @@ def test_channel_setup_uses_gateway_registry_defaults(monkeypatch, tmp_path):
 def test_channel_setup_can_generate_docker_mcp_command(tmp_path):
     token_file = tmp_path / "token"
     token_file.write_text("axp_a_agent.secret\n")
+    env_path = tmp_path / "orion.env"
 
     result = runner.invoke(
         channel_mod.app,
@@ -1438,6 +1439,8 @@ def test_channel_setup_can_generate_docker_mcp_command(tmp_path):
             "docker",
             "--container-image",
             "ax-channel:demo",
+            "--env-path",
+            str(env_path),
             "--json",
         ],
     )
@@ -1449,3 +1452,4 @@ def test_channel_setup_can_generate_docker_mcp_command(tmp_path):
     assert "ax-channel:demo" in server["args"]
     assert "-i" in server["args"]
     assert "axctl" in server["args"]
+    assert env_path.exists()
