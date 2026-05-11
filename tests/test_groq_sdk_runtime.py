@@ -26,7 +26,25 @@ from ax_cli.runtimes.hermes.runtimes import groq_sdk  # noqa: F401, E402
 
 def _fake_chunk(content: str | None):
     """Build a duck-typed chat.completions chunk holding a single delta."""
-    delta = types.SimpleNamespace(content=content)
+    delta = types.SimpleNamespace(content=content, tool_calls=None)
+    choice = types.SimpleNamespace(delta=delta, finish_reason=None)
+    return types.SimpleNamespace(choices=[choice])
+
+
+def _fake_tool_call_delta(index, *, call_id=None, name=None, arguments=None):
+    """Build one tool_call delta entry as the SDK yields it inside a chunk."""
+    fn = types.SimpleNamespace(name=name, arguments=arguments)
+    return types.SimpleNamespace(
+        index=index,
+        id=call_id,
+        type="function" if call_id else None,
+        function=fn,
+    )
+
+
+def _fake_chunk_with_tool_calls(tool_call_deltas):
+    """Build a chat.completions chunk that carries tool_call deltas (no text)."""
+    delta = types.SimpleNamespace(content=None, tool_calls=tool_call_deltas)
     choice = types.SimpleNamespace(delta=delta, finish_reason=None)
     return types.SimpleNamespace(choices=[choice])
 
@@ -145,6 +163,66 @@ def test_groq_sdk_threads_system_prompt_into_messages(monkeypatch):
     assert messages[0]["content"] == "You are a strict reviewer."
     assert messages[-1]["role"] == "user"
     assert messages[-1]["content"] == "Question."
+
+
+def test_groq_sdk_dispatches_tool_call_and_continues_to_final_answer(monkeypatch):
+    """Model emits a tool_call streamed across chunks; runtime executes it, threads
+    the result into history with role=tool, and finalizes on the next turn."""
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
+    from ax_cli.runtimes.hermes import tools as tools_mod
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+
+    # Turn 1: tool_call streamed across two chunks. First chunk carries
+    # id + name; second chunk only accumulates arguments.
+    turn1 = iter([
+        _fake_chunk_with_tool_calls([
+            _fake_tool_call_delta(0, call_id="call_abc", name="read_file", arguments=""),
+        ]),
+        _fake_chunk_with_tool_calls([
+            _fake_tool_call_delta(0, arguments='{"path": "/etc/hostname"}'),
+        ]),
+    ])
+    # Turn 2: plain text finalization.
+    turn2 = iter([_fake_chunk("The hostname is foo.")])
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = [turn1, turn2]
+    _install_fake_groq(monkeypatch, fake_client)
+
+    # Stub execute_tool so we do not touch the real filesystem.
+    monkeypatch.setattr(
+        tools_mod,
+        "execute_tool",
+        lambda name, args, workdir: tools_mod.ToolResult(output=f"stubbed {name}({args})"),
+    )
+
+    rt = get_runtime("groq_sdk")
+    cb = _RecordingCallback()
+    result = rt.execute("Read /etc/hostname.", workdir="/tmp", stream_cb=cb)
+
+    assert result.exit_reason == "done"
+    assert result.text == "The hostname is foo."
+    assert result.tool_count == 1
+    # Two turns = two API calls.
+    assert fake_client.chat.completions.create.call_count == 2
+
+    # History shape: user, assistant-with-tool-calls, tool result, final assistant.
+    roles = [h.get("role") for h in result.history]
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    # Tool call assembled correctly across the two chunks.
+    assistant_with_tools = result.history[1]
+    tc = assistant_with_tools["tool_calls"][0]
+    assert tc["id"] == "call_abc"
+    assert tc["function"]["name"] == "read_file"
+    assert tc["function"]["arguments"] == '{"path": "/etc/hostname"}'
+    # Tool message references the call_id.
+    assert result.history[2]["tool_call_id"] == "call_abc"
+    assert "stubbed read_file" in result.history[2]["content"]
+    # Final assistant carries the visible reply.
+    assert result.history[3]["content"] == "The hostname is foo."
+    # Tool execution surfaces through the callback.
+    assert cb.statuses == ["thinking"]
 
 
 def test_groq_sdk_preserves_partial_text_on_mid_stream_error(monkeypatch):
