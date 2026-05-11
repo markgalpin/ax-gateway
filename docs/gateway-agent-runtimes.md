@@ -157,7 +157,7 @@ reply. This is how operators know work did not disappear into a black hole.
 
 Minimum signals:
 
-- `picked_up` or `working`: the runtime received the message.
+- `accepted` or `working`: the runtime received the message.
 - `thinking`: the model/runtime started processing.
 - `tool_call`: the runtime is using a tool, with a useful tool name or summary
   when available.
@@ -239,10 +239,10 @@ When Gateway needs a space name for an agent, it checks three sources in order:
    both caches miss.
 
 The key function is `space_name_from_cache(space_id)` in `ax_cli/gateway.py`.
-It checks the global disk cache for slug→UUID resolution and friendly-name
-hydration. `_fallback_allowed_spaces()` is a separate function that synthesizes
-per-agent space rows from entry/session fields — it does not populate the
-global disk cache.
+It does id-to-name lookup against the global disk cache.
+`lookup_space_in_cache()` handles slug-to-UUID resolution separately.
+`_fallback_allowed_spaces()` synthesizes per-agent space rows from
+entry/session fields — it does not populate the global disk cache.
 
 ### Common failure: UUID-as-name
 
@@ -251,8 +251,8 @@ platform bug or data inconsistency), the per-agent cache stores that UUID as the
 "name." The operator then sees a UUID in `agents show`, the UI agent table, and
 log messages — confusing but not a functional failure.
 
-**Fix:** The cache needs to validate that a name doesn't look like a UUID before
-storing it. This is a good first issue (see issue backlog).
+**Status:** The `_UUID_RE` guard now validates that a name doesn't look like a
+UUID before caching, preventing this at the storage layer.
 
 ### Space state storage
 
@@ -278,11 +278,12 @@ is key to debugging agent issues.
 | Layer | What it represents | Who sets it | Example values |
 | --- | --- | --- | --- |
 | **Desired state** | What the operator wants | `agents start`, `agents stop` | `running`, `stopped` |
-| **Effective state** | What Gateway observes locally | Reconcile loop | `running`, `stopped`, `error`, `pending_approval` |
-| **Presence** | What the upstream platform reports | Upstream API heartbeat | `online`, `offline`, `stale` |
+| **Effective state** | What Gateway observes locally | Reconcile loop | `running`, `stopped`, `error`, `starting`, `reconnecting` |
+| **Presence** | What Gateway derives locally | `_derive_presence()` | `IDLE`, `OFFLINE`, `STALE`, `WORKING`, `QUEUED`, `BLOCKED`, `ERROR` |
 
-The reconcile loop bridges desired to effective. It runs every ~10 seconds
-(`GatewayDaemon.run()` at `ax_cli/gateway.py:5767`) and for each agent:
+The reconcile loop bridges desired to effective. It runs every ~1 second
+(`GatewayDaemon.run()` at `ax_cli/gateway.py:6334`, default `poll_interval=1.0`)
+and for each agent:
 
 1. Compares `desired_state` to `effective_state`
 2. If they differ, takes action (start process, stop process, restart)
@@ -295,8 +296,14 @@ decisions. An agent can be `effective_state: running` locally but
 
 ### Manual attach
 
-An operator can force an agent to `running` effective state with `agents attach`.
-This is useful when:
+For attached-session agents (Claude Code channels), `agents mark-attached`
+forces both `desired_state` and `effective_state` to `running` immediately
+(see `_mark_attached_agent_session()` at `commands/gateway.py:1772`). This is
+the correct command for incident recovery of attached agents.
+
+`agents attach` is the setup command — it writes MCP/channel config, sets
+`desired_state` to `running`, and prints the attach command, but does not force
+`effective_state`. Use `mark-attached` when:
 - The reconcile loop hasn't caught up yet
 - The agent's runtime is managed externally (e.g., systemd) and Gateway just
   needs to know it's alive
@@ -340,7 +347,7 @@ messages from the upstream API, not from the local queue.
 Claude Code Channel agents maintain a live SSE connection. Messages are
 delivered in real-time through the channel — there is no local pending queue.
 The channel handles message acknowledgment through processing signals
-(`picked_up`, `working`, `completed`).
+(`accepted`, `working`, `completed`).
 
 ### `unread_only` filtering
 
@@ -357,7 +364,7 @@ the local pending queue so the UI stops showing a new-mail indicator.
 
 | Function | Location | Purpose |
 | --- | --- | --- |
-| `append_agent_pending_message()` | `ax_cli/gateway.py:2870` | Adds message to pending queue |
-| `remove_agent_pending_message()` | `ax_cli/gateway.py:2893` | Removes message (mark_read) |
-| `load_agent_pending_messages()` | `ax_cli/gateway.py:2853` | Reads pending queue from disk |
-| `_local_session_inbox()` | `ax_cli/commands/gateway.py:602` | HTTP handler for `/local/inbox` |
+| `append_agent_pending_message()` | `ax_cli/gateway.py:3046` | Adds message to pending queue |
+| `remove_agent_pending_message()` | `ax_cli/gateway.py:3069` | Removes message (mark_read) |
+| `load_agent_pending_messages()` | `ax_cli/gateway.py:3029` | Reads pending queue from disk |
+| `_local_session_inbox()` | `ax_cli/commands/gateway.py:860` | HTTP handler for `/local/inbox` |

@@ -103,7 +103,7 @@
   <text x="668" y="488" class="step">1. Maintains live SSE connection</text>
   <text x="668" y="512" class="step">2. Receives messages in real-time</text>
   <text x="668" y="536" class="step">3. Emits processing signals</text>
-  <text x="668" y="560" class="step">4. picked_up → working → completed</text>
+  <text x="668" y="560" class="step">4. accepted → working → completed</text>
 
   <!-- Live label -->
   <text x="998" y="396" class="note" style="fill:#86EFAC;">real-time push</text>

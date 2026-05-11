@@ -46,7 +46,7 @@
   <text x="112" y="450" class="allowed">revoke credentials</text>
   <text x="112" y="474" class="allowed">start/stop Gateway</text>
 
-  <text x="92" y="510" class="body">Auth: ax auth login</text>
+  <text x="92" y="510" class="body">Auth: ax login</text>
   <text x="92" y="540" class="body">Stored separately from agent config</text>
 
   <!-- TRUST BOUNDARY (center) -->
@@ -55,25 +55,30 @@
   <text x="553" y="154" class="label" style="font-size:14px; fill:#FDE68A;">TRUST BOUNDARY</text>
 
   <!-- PROXY GATE (center box) -->
-  <rect x="496" y="240" width="208" height="380" rx="22" fill="#111827" stroke="#F59E0B" stroke-width="2"/>
+  <rect x="496" y="240" width="240" height="380" rx="22" fill="#111827" stroke="#F59E0B" stroke-width="2"/>
   <text x="528" y="280" class="small" style="fill:#FDE68A;">Proxy allowlist</text>
   <text x="528" y="310" class="label" style="font-size:16px;">Allowed methods</text>
 
-  <text x="520" y="342" class="allowed">whoami</text>
-  <text x="520" y="366" class="allowed">list_spaces</text>
-  <text x="520" y="390" class="allowed">list_agents</text>
-  <text x="520" y="414" class="allowed">list_messages</text>
-  <text x="520" y="438" class="allowed">get_message</text>
-  <text x="520" y="462" class="allowed">search_messages</text>
-  <text x="520" y="486" class="allowed">list_tasks</text>
-  <text x="520" y="510" class="allowed">get_task</text>
-  <text x="520" y="534" class="allowed">update_task</text>
+  <text x="520" y="336" class="allowed">whoami</text>
+  <text x="520" y="354" class="allowed">list_spaces</text>
+  <text x="520" y="372" class="allowed">list_agents</text>
+  <text x="520" y="390" class="allowed">list_agents_availability</text>
+  <text x="520" y="408" class="allowed">list_context</text>
+  <text x="520" y="426" class="allowed">get_context</text>
+  <text x="520" y="444" class="allowed">list_messages</text>
+  <text x="520" y="462" class="allowed">get_message</text>
+  <text x="520" y="480" class="allowed">search_messages</text>
+  <text x="520" y="498" class="allowed">list_tasks</text>
+  <text x="520" y="516" class="allowed">get_task</text>
 
-  <line x1="516" y1="554" x2="684" y2="554" stroke="#334155"/>
-  <text x="520" y="578" class="allowed">upload_file</text>
-  <text x="636" y="578" class="mono" style="fill:#FDE68A;">ADMIN</text>
-  <text x="520" y="602" class="blocked">send_message</text>
-  <text x="660" y="602" class="body" style="font-size:12px;">/local/send</text>
+  <line x1="516" y1="530" x2="716" y2="530" stroke="#334155"/>
+  <text x="520" y="548" class="allowed">update_task</text>
+  <text x="636" y="548" class="mono" style="fill:#FDE68A;">ADMIN</text>
+  <text x="520" y="566" class="allowed">upload_file</text>
+  <text x="636" y="566" class="mono" style="fill:#FDE68A;">ADMIN</text>
+  <line x1="516" y1="580" x2="716" y2="580" stroke="#334155"/>
+  <text x="520" y="598" class="blocked">send_message</text>
+  <text x="660" y="598" class="body" style="font-size:12px;">/local/send</text>
 
   <!-- AGENT SIDE -->
   <rect x="760" y="140" width="380" height="480" rx="28" fill="#0F172A" stroke="#EF4444" stroke-width="2"/>
@@ -100,5 +105,5 @@
 
   <!-- Arrows -->
   <path d="M440 280H490" stroke="#22C55E" stroke-width="3" marker-end="url(#arrow)" style="--arrow-fill:#22C55E;"/>
-  <path d="M710 280H754" stroke="#F87171" stroke-width="3" marker-end="url(#arrowRed)"/>
+  <path d="M740 280H754" stroke="#F87171" stroke-width="3" marker-end="url(#arrowRed)"/>
 </svg>

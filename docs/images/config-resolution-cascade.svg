@@ -44,7 +44,7 @@
   <text x="83" y="242" class="num">2</text>
   <rect x="128" y="212" width="980" height="68" rx="18" fill="#0F172A" stroke="#334155" stroke-width="2"/>
   <text x="160" y="244" class="label">Environment variable</text>
-  <text x="400" y="244" class="mono">AX_BASE_URL  AX_TOKEN  AX_AGENT_NAME  AX_SPACE_ID</text>
+  <text x="400" y="244" class="mono">AX_BASE_URL  AX_TOKEN  AX_AGENT_NAME  AX_AGENT_ID  AX_SPACE_ID</text>
   <text x="160" y="266" class="note">Useful for CI, containers, and scripted setups.</text>
 
   <!-- Arrow down -->
@@ -57,7 +57,7 @@
   <text x="160" y="324" class="label">Project config</text>
   <text x="360" y="324" class="mono">.ax/config.toml</text>
   <text x="560" y="324" class="note">(walks up from cwd looking for nearest .ax/ directory)</text>
-  <text x="160" y="346" class="note">Workspace-scoped. Shared by all agents in this directory. No credentials here.</text>
+  <text x="160" y="346" class="note">Workspace-scoped. Shared by all agents in this directory. Agent identity, not credentials.</text>
 
   <!-- Arrow down -->
   <path d="M90 338V370" stroke="#60A5FA" stroke-width="2" stroke-dasharray="6 6"/>
@@ -83,5 +83,5 @@
 
   <!-- Side annotation -->
   <rect x="72" y="536" width="640" height="30" rx="12" fill="#0B1220" stroke="#1E293B"/>
-  <text x="96" y="556" class="note">User login credentials are separate: ~/.ax/user.toml (never in config resolution)</text>
+  <text x="96" y="556" class="note">User login credentials (~/.ax/user.toml) are merged into config but stored separately from agent config</text>
 </svg>

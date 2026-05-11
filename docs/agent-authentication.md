@@ -359,12 +359,12 @@ boundary is critical for security.
 | --- | --- | --- |
 | **Credential** | User PAT (`axp_u_...`) in `~/.ax/user.toml` | Agent-scoped PAT (`axp_a_...`) brokered by Gateway |
 | **Access** | Full user authority — create agents, mint tokens, manage spaces | Limited to the proxy allowlist and dedicated endpoints |
-| **Authentication** | `ax auth login` → stored user credential | `/local/connect` → short-lived session token (`axgw_s_...`) |
+| **Authentication** | `ax login` → stored user credential | `/local/connect` → session token (`axgw_s_...`, 24h TTL) |
 | **Trust level** | Trusted operator in a trusted terminal | Untrusted-by-default local process |
 
 ### The proxy allowlist
 
-The proxy dispatcher (`_LOCAL_PROXY_METHODS` in `ax_cli/commands/gateway.py:540`)
+The proxy dispatcher (`_LOCAL_PROXY_METHODS` in `ax_cli/commands/gateway.py:782`)
 is the enforcement mechanism. It controls which `AxClient` methods an agent
 session can call through Gateway's `/local/proxy` endpoint.
 
@@ -373,8 +373,8 @@ Current allowlist:
 ```
 whoami, list_spaces, list_agents, list_agents_availability,
 list_context, get_context, list_messages, get_message,
-search_messages, list_tasks, get_task, update_task,
-upload_file (admin tier, workdir-sandboxed)
+search_messages, list_tasks, get_task,
+update_task (admin tier), upload_file (admin tier, workdir-sandboxed)
 ```
 
 Write operations like `send_message` and `create_task` go through dedicated
@@ -393,8 +393,9 @@ agents to upload from their own workspace.
 When a local agent calls `/local/connect`, Gateway issues a session token
 (`axgw_s_<payload>.<signature>`). These tokens are:
 
-- **Short-lived** — they expire via TTL (no active session-end invalidation)
-- **Per-connect** — a new token is issued for each connection, not cached
+- **TTL-bounded** — 24-hour expiry (no active session-end invalidation)
+- **Per-connect** — a new token is issued for each `/local/connect` call; the agent
+  reuses it across subsequent API calls within that connection via `X-Gateway-Session`
 - **HMAC-SHA256 signed** — using the secret at `~/.ax/gateway/local_secret.bin`
 - **Scoped** — the token identifies which agent it was issued for
 
@@ -417,7 +418,9 @@ See [ADR-006](adr/ADR-006-use-admin-proxy-tiers.md).
    but is never used as an agent runtime credential.
 3. **The proxy is the gate.** Any method not in `_LOCAL_PROXY_METHODS` is
    rejected. Write operations go through dedicated endpoints.
-4. **Session tokens are disposable.** No caching, no reuse, no persistence.
+4. **Session tokens are disposable.** Issued per-connect with a 24h TTL. Issued
+   sessions are recorded in `registry["local_sessions"]` for audit and status
+   checks. The token is reused within a connection but not across connections.
 5. **Gateway binds to localhost only.** The OS network stack is the first
    access control layer. See [ADR-001](adr/ADR-001-gateway-localhost-only.md).
 
