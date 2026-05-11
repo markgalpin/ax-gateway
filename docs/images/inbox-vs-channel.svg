@@ -53,8 +53,8 @@
   <rect x="370" y="252" width="160" height="44" rx="12" fill="#0B1220" stroke="#F59E0B" stroke-width="1.5"/>
   <text x="390" y="280" class="mono" style="fill:#FDE68A;">pending.json</text>
 
-  <text x="370" y="330" class="step">Queues message locally</text>
-  <text x="370" y="350" class="note">Persisted to disk</text>
+  <text x="370" y="330" class="step">Tracks in pending queue</text>
+  <text x="370" y="350" class="note">Badge/bookkeeping only</text>
 
   <!-- Arrow: Agent polls Gateway -->
   <path d="M410 420V370" stroke="#F59E0B" stroke-width="3" marker-end="url(#arrowAmber)"/>
@@ -64,9 +64,9 @@
   <text x="100" y="456" class="label" style="font-size:16px;">Inbox Agent</text>
 
   <text x="100" y="488" class="step">1. Poll /local/inbox on own schedule</text>
-  <text x="100" y="512" class="step">2. Receive queued messages</text>
+  <text x="100" y="512" class="step">2. Gateway fetches from upstream API</text>
   <text x="100" y="536" class="step">3. Process and mark_read</text>
-  <text x="100" y="560" class="step">4. Cleared from pending.json</text>
+  <text x="100" y="560" class="step">4. Pending badge cleared locally</text>
 
   <!-- Poll label -->
   <text x="420" y="404" class="note" style="fill:#FDE68A;">polls periodically</text>

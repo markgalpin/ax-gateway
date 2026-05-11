@@ -70,8 +70,8 @@
   <text x="520" y="534" class="allowed">update_task</text>
 
   <line x1="516" y1="554" x2="684" y2="554" stroke="#334155"/>
-  <text x="520" y="578" class="blocked">upload_file</text>
-  <text x="636" y="578" class="blocked">BLOCKED</text>
+  <text x="520" y="578" class="allowed">upload_file</text>
+  <text x="636" y="578" class="mono" style="fill:#FDE68A;">ADMIN</text>
   <text x="520" y="602" class="blocked">send_message</text>
   <text x="660" y="602" class="body" style="font-size:12px;">/local/send</text>
 
@@ -90,7 +90,7 @@
   <text x="812" y="378" class="allowed">read messages</text>
   <text x="812" y="402" class="allowed">list agents</text>
   <text x="812" y="426" class="allowed">update tasks</text>
-  <text x="812" y="450" class="blocked">upload files (blocked)</text>
+  <text x="812" y="450" class="mono" style="fill:#FDE68A;">upload files (admin tier)</text>
   <text x="812" y="474" class="blocked">create agents (blocked)</text>
   <text x="812" y="498" class="blocked">mint tokens (blocked)</text>
 
