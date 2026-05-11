@@ -64,10 +64,11 @@ jobs:
 
       - name: Install package and pip-audit
         run: |
+          pip install --upgrade pip setuptools
           pip install -e .
           pip install pip-audit
 
-      - name: Audit direct dependencies for known vulnerabilities
+      - name: Audit dependencies for known vulnerabilities
         run: pip-audit --desc
 
   package:
