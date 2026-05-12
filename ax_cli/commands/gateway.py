@@ -87,6 +87,9 @@ from ..gateway import (
     lookup_space_in_cache,
     ollama_setup_status,
     record_gateway_activity,
+    _daemon_request_logger,
+    _ui_request_logger,
+    _RequestLogger,
     remove_agent_entry,
     save_agent_pending_messages,
     save_gateway_registry,
@@ -171,9 +174,10 @@ def _resolve_gateway_login_token(explicit_token: str | None) -> str:
 
 
 _gateway_rate_limit_state = _RateLimitState()
+_cli_request_logger = _RequestLogger(role="cli")
 
 
-def _load_gateway_user_client() -> AxClient:
+def _load_gateway_user_client(request_logger: "_RequestLogger | None" = None) -> AxClient:
     session = load_gateway_session()
     if not session:
         err_console.print("[red]Gateway is not logged in.[/red] Run `ax gateway login` first.")
@@ -194,12 +198,14 @@ def _load_gateway_user_client() -> AxClient:
         )
         record_gateway_activity("rate_limit_wait", wait_seconds=wait_seconds, reset_at=reset_str)
 
+    logger = request_logger or _cli_request_logger
     return AxClient(
         base_url=str(session.get("base_url") or auth_cmd.DEFAULT_LOGIN_BASE_URL),
         token=token,
         on_rate_limit_wait=_on_rate_limit_wait,
         max_rate_limit_wait=RATE_LIMIT_MAX_WAIT,
         rate_limit_state=_gateway_rate_limit_state,
+        on_request_complete=logger.make_callback(),
     )
 
 
@@ -7113,6 +7119,10 @@ def ui(
             webbrowser.open_new_tab(url)
         except Exception:
             err_console.print("[yellow]Could not open a browser automatically.[/yellow]")
+    try:
+        _gateway_rate_limit_state.warm(_load_gateway_user_client(request_logger=_ui_request_logger))
+    except Exception:
+        pass  # best-effort — don't block UI startup on a warm failure
     try:
         server.serve_forever()
     except KeyboardInterrupt:

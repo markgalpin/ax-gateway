@@ -146,6 +146,7 @@ def _check_honeypot(token: str, base_url: str) -> None:
 
 
 RATE_LIMIT_MAX_WAIT = 120.0  # shared cap for proactive and reactive rate-limit waits
+RATE_LIMIT_LOW_WATER = 10   # start waiting when remaining drops to this level, not 0
 
 
 class _RateLimitState:
@@ -157,17 +158,34 @@ class _RateLimitState:
     already handles. Sleeping while holding a lock would be worse.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, low_water: int = RATE_LIMIT_LOW_WATER) -> None:
         import threading
         self._lock = threading.Lock()
+        self._low_water = low_water
         self.exhausted: bool = False
         self.reset_at: float = 0.0
+        self.remaining: int = 9999  # unknown until first response
 
     def record(self, remaining: int, reset_at: float) -> None:
         with self._lock:
-            self.exhausted = remaining == 0
+            self.remaining = remaining
+            self.exhausted = remaining <= self._low_water
             if reset_at:
                 self.reset_at = reset_at
+
+    def warm(self, client: "AxClient", path: str = "/api/v1/agents") -> None:
+        """Issue a lightweight GET to populate rate-limit state before a burst.
+
+        Call this once at process startup before spinning up multiple clients
+        so they all start with an accurate picture of the current window rather
+        than firing blind.
+        """
+        try:
+            r = client._http.get(path, params={"limit": 1})
+            # _record_rate_limit is called inside _retry, so state is already
+            # updated by the time this returns.
+        except Exception:
+            pass  # best-effort — don't block startup on a warm failure
 
     def wait_if_needed(self, max_wait: float, on_wait=None) -> None:
         if not self.exhausted:
@@ -229,18 +247,24 @@ class _RetryOnAuthClient:
         on_rate_limit_wait=None,
         max_rate_limit_wait: float = RATE_LIMIT_MAX_WAIT,
         rate_limit_state: _RateLimitState | None = None,
+        on_request_complete=None,
     ):
         self._inner = inner
         self._get_fresh_jwt = get_fresh_jwt
         self._on_rate_limit_wait = on_rate_limit_wait
         self._max_rate_limit_wait = max_rate_limit_wait
         self._rl = rate_limit_state or _RateLimitState()
+        self._on_request_complete = on_request_complete
 
     def _record_rate_limit(self, r: httpx.Response) -> None:
         try:
             remaining = int(r.headers.get("x-ratelimit-remaining", "1"))
             reset_ts = float(r.headers.get("x-ratelimit-reset", "0"))
             self._rl.record(remaining, reset_ts)
+            if self._on_request_complete:
+                method = r.request.method if r.request else "?"
+                path = r.request.url.path if r.request else "?"
+                self._on_request_complete(method, path, r.status_code, remaining, reset_ts or None)
         except (ValueError, TypeError):
             pass
 
@@ -286,7 +310,16 @@ class _RetryOnAuthClient:
         return self._retry("delete", *args, **kwargs)
 
     def stream(self, *args, **kwargs):
-        return self._inner.stream(*args, **kwargs)
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _tracked_stream():
+            self._wait_if_rate_limited()
+            with self._inner.stream(*args, **kwargs) as response:
+                self._record_rate_limit(response)
+                yield response
+
+        return _tracked_stream()
 
     def close(self):
         self._inner.close()
@@ -324,6 +357,7 @@ class AxClient:
         on_rate_limit_wait=None,
         max_rate_limit_wait: float = RATE_LIMIT_MAX_WAIT,
         rate_limit_state: _RateLimitState | None = None,
+        on_request_complete=None,
     ):
         self.base_url = base_url.rstrip("/")
         self.token = token
@@ -369,6 +403,7 @@ class AxClient:
             on_rate_limit_wait=on_rate_limit_wait,
             max_rate_limit_wait=max_rate_limit_wait,
             rate_limit_state=rate_limit_state,
+            on_request_complete=on_request_complete,
         )
 
     def _get_jwt(self, *, force_refresh: bool = False) -> str:

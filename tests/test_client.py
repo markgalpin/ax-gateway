@@ -937,7 +937,7 @@ class TestRateLimitState:
     def test_record_clears_exhausted_when_remaining_positive(self):
         state = _RateLimitState()
         state.record(remaining=0, reset_at=9999999999.0)
-        state.record(remaining=5, reset_at=9999999999.0)
+        state.record(remaining=50, reset_at=9999999999.0)
         assert state.exhausted is False
 
     def test_record_updates_reset_at(self):
@@ -950,8 +950,20 @@ class TestRateLimitState:
         sleeps = []
         monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
         state = _RateLimitState()
+        state.record(remaining=50, reset_at=_time.time() + 30)
         state.wait_if_needed(120.0)
         assert sleeps == []
+
+    def test_low_water_threshold_triggers_before_zero(self, monkeypatch):
+        """Exhaustion fires at <= RATE_LIMIT_LOW_WATER, not just at 0."""
+        import time as _time
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+        from ax_cli.client import RATE_LIMIT_LOW_WATER
+        state = _RateLimitState()
+        state.record(remaining=RATE_LIMIT_LOW_WATER, reset_at=_time.time() + 30)
+        assert state.exhausted is True
+        state.record(remaining=RATE_LIMIT_LOW_WATER + 1, reset_at=_time.time() + 30)
+        assert state.exhausted is False
 
     def test_wait_if_needed_sleeps_when_exhausted(self, monkeypatch):
         import time as _time
