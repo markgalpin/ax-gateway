@@ -225,10 +225,16 @@ class GroqSDKRuntime(BaseRuntime):
                         continue
                     delta = chunk.choices[0].delta
 
+                    # Buffer text locally for this turn. Don't publish to the
+                    # callback yet — if the model pivots into tool calls, this
+                    # is pre-tool chatter (e.g. "I'll inspect...") that would
+                    # leak as visible chat content and suppress the sentinel's
+                    # tool-progress UI. We only emit via on_text_complete when
+                    # the turn is confirmed text-only (no tool calls). Mirrors
+                    # the buffering pattern in openai_sdk.py.
                     content = getattr(delta, "content", None)
                     if content:
                         turn_text += content
-                        cb.on_text_delta(content)
 
                     tc_deltas = getattr(delta, "tool_calls", None) or []
                     for tc_d in tc_deltas:
@@ -279,6 +285,30 @@ class GroqSDKRuntime(BaseRuntime):
                 )
 
                 for tc in tool_calls:
+                    # Re-check the deadline before each tool. A long-running
+                    # tool can otherwise block the listener well past the
+                    # operator's --timeout.
+                    now_tool = time.time()
+                    remaining_for_tool = deadline - now_tool
+                    if remaining_for_tool <= 0:
+                        log.warning(
+                            f"groq_sdk: timeout exceeded before tool "
+                            f"{tc['function']['name']} "
+                            f"(elapsed {int(now_tool - start_time)}s)"
+                        )
+                        return RuntimeResult(
+                            text=(
+                                final_text
+                                or "Agent timed out before completing tool calls."
+                            ),
+                            history=history,
+                            session_id=None,
+                            tool_count=tool_count,
+                            files_written=files_written,
+                            exit_reason="timeout",
+                            elapsed_seconds=int(now_tool - start_time),
+                        )
+
                     tool_count += 1
                     name = tc["function"]["name"]
                     raw_args = tc["function"]["arguments"]
@@ -286,6 +316,20 @@ class GroqSDKRuntime(BaseRuntime):
                         args = json.loads(raw_args) if raw_args else {}
                     except json.JSONDecodeError:
                         args = {}
+
+                    # Clamp any model-supplied "timeout" arg to the remaining
+                    # wall-clock budget. Tools like `bash` honor args["timeout"]
+                    # directly, so without this a model could request a 600s
+                    # bash inside a 30s sentinel budget. Tools without a
+                    # "timeout" arg are unaffected.
+                    if "timeout" in args:
+                        try:
+                            args["timeout"] = min(
+                                int(args["timeout"]),
+                                max(1, int(remaining_for_tool)),
+                            )
+                        except (TypeError, ValueError):
+                            args["timeout"] = max(1, int(remaining_for_tool))
 
                     summary = _tool_display(name, args)
                     log.info(

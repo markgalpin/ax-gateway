@@ -136,8 +136,9 @@ def test_groq_sdk_streams_chunks_and_accumulates_history(monkeypatch):
         stream_cb=cb,
     )
 
-    # Stream deltas received in order.
-    assert cb.deltas == ["Hello ", "world."]
+    # No incremental deltas should fire; text is buffered until the turn is
+    # confirmed text-only (no tool calls), matching openai_sdk.py's pattern.
+    assert cb.deltas == []
     # on_text_complete fires with the assembled text.
     assert cb.complete == "Hello world."
     # RuntimeResult fields.
@@ -266,8 +267,10 @@ def test_groq_sdk_preserves_partial_text_on_mid_stream_error(monkeypatch):
         h.get("role") == "assistant" and h.get("content") == "Partial reply"
         for h in result.history
     )
-    # Deltas fired before the error.
-    assert cb.deltas == ["Partial ", "reply"]
+    # Text is buffered locally during the stream and is never emitted as
+    # incremental deltas, so the callback sees no on_text_delta calls even
+    # though the partial text is preserved in result.text and history.
+    assert cb.deltas == []
 
 
 def test_groq_sdk_handles_missing_groq_package_gracefully(monkeypatch):
@@ -287,6 +290,61 @@ def test_groq_sdk_handles_missing_groq_package_gracefully(monkeypatch):
     # Message should mention the missing package so the operator can act.
     assert "groq" in result.text.lower()
     assert "pip install" in result.text
+
+
+def test_groq_sdk_clamps_tool_timeout_to_remaining_budget(monkeypatch):
+    """A model-supplied `timeout` arg on a tool call should be clamped down
+    to the wall-clock budget remaining, so a single tool cannot block the
+    listener past the operator's --timeout."""
+    from itertools import chain, repeat
+
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
+    from ax_cli.runtimes.hermes.runtimes import groq_sdk as groq_mod
+    import tools as tools_mod
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+
+    # Fake clock: start at t=0, every later read returns t=5. With timeout=30,
+    # remaining_for_tool ends up ~25s, so a model-supplied 600s timeout must
+    # be clamped down to 25.
+    clock = chain([0.0], repeat(5.0))
+    monkeypatch.setattr(groq_mod.time, "time", lambda: next(clock))
+
+    # Turn 1: one bash tool call asking for a 600-second budget.
+    turn1 = iter([
+        _fake_chunk_with_tool_calls([
+            _fake_tool_call_delta(
+                0,
+                call_id="call_bash",
+                name="bash",
+                arguments='{"command":"sleep 999","timeout":600}',
+            ),
+        ]),
+    ])
+    # Turn 2: text-only finalization so the runtime exits cleanly.
+    turn2 = iter([_fake_chunk("ok")])
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = [turn1, turn2]
+    _install_fake_groq(monkeypatch, fake_client)
+
+    captured: list[dict] = []
+
+    def recording_execute_tool(name, args, workdir):
+        captured.append({"name": name, "args": dict(args)})
+        return tools_mod.ToolResult(output="stubbed")
+
+    monkeypatch.setattr(tools_mod, "execute_tool", recording_execute_tool)
+
+    rt = get_runtime("groq_sdk")
+    rt.execute("run it", workdir="/tmp", timeout=30)
+
+    assert captured, "execute_tool should have been invoked"
+    forwarded = captured[0]["args"]
+    # The model asked for 600 but only ~25 seconds remained in the budget.
+    assert forwarded["timeout"] <= 25
+    # And it must still be a positive value (not zero or negative).
+    assert forwarded["timeout"] >= 1
 
 
 def test_groq_sdk_returns_timeout_when_deadline_exceeded(monkeypatch):
