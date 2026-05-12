@@ -268,3 +268,65 @@ def test_groq_sdk_preserves_partial_text_on_mid_stream_error(monkeypatch):
     )
     # Deltas fired before the error.
     assert cb.deltas == ["Partial ", "reply"]
+
+
+def test_groq_sdk_handles_missing_groq_package_gracefully(monkeypatch):
+    """If the `groq` SDK is not installed, return a clean RuntimeResult
+    instead of letting ModuleNotFoundError kill the sentinel."""
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    # Force `from groq import Groq` to raise ModuleNotFoundError by setting
+    # the entry in sys.modules to None (Python treats this as "not importable").
+    monkeypatch.setitem(sys.modules, "groq", None)
+
+    rt = get_runtime("groq_sdk")
+    result = rt.execute("hello", workdir="/tmp")
+
+    assert result.exit_reason == "crashed"
+    # Message should mention the missing package so the operator can act.
+    assert "groq" in result.text.lower()
+    assert "pip install" in result.text
+
+
+def test_groq_sdk_returns_iteration_limit_when_max_turns_exhausted(monkeypatch):
+    """If the model keeps producing tool calls and never finalizes, the runtime
+    should exit with exit_reason='iteration_limit' rather than a misleading 'done'."""
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
+    import tools as tools_mod
+    from ax_cli.runtimes.hermes.runtimes.groq_sdk import MAX_TURNS
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+
+    counter = {"n": 0}
+
+    def one_turn_with_tool_call(*_args, **_kwargs):
+        counter["n"] += 1
+        return iter([
+            _fake_chunk_with_tool_calls([
+                _fake_tool_call_delta(
+                    0,
+                    call_id=f"call_{counter['n']}",
+                    name="bash",
+                    arguments='{"command":"ls"}',
+                ),
+            ]),
+        ])
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = one_turn_with_tool_call
+    _install_fake_groq(monkeypatch, fake_client)
+    monkeypatch.setattr(
+        tools_mod,
+        "execute_tool",
+        lambda name, args, workdir: tools_mod.ToolResult(output="stubbed"),
+    )
+
+    rt = get_runtime("groq_sdk")
+    result = rt.execute("loop forever", workdir="/tmp")
+
+    assert result.exit_reason == "iteration_limit"
+    assert result.tool_count == MAX_TURNS
+    assert fake_client.chat.completions.create.call_count == MAX_TURNS
+    # User-visible message should reflect the bounded-loop exit.
+    assert "turn limit" in result.text.lower()

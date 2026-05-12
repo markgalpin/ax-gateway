@@ -96,7 +96,25 @@ class GroqSDKRuntime(BaseRuntime):
                 elapsed_seconds=0,
             )
 
-        from groq import Groq
+        try:
+            from groq import Groq
+        except ImportError as e:
+            # pyproject.toml does not declare `groq` as a hard dependency, so
+            # packaged axctl installs (and the Docker image, which only runs
+            # `pip install .`) will not have it. Surface a clean RuntimeResult
+            # so the sentinel can render an actionable message instead of
+            # crashing on a bare ModuleNotFoundError.
+            log.error(f"groq_sdk: groq Python SDK is not installed ({e})")
+            return RuntimeResult(
+                text=(
+                    "Agent could not start because the `groq` Python package "
+                    "is not installed in this runtime environment. "
+                    "Install it with `pip install groq` and retry."
+                ),
+                exit_reason="crashed",
+                elapsed_seconds=0,
+            )
+
         # Absolute import matches openai_sdk.py and the other sibling runtimes.
         # The Hermes sentinel prepends ax_cli/runtimes/hermes to sys.path and
         # loads this module as `runtimes.groq_sdk`, so a relative `from ..tools`
@@ -262,6 +280,28 @@ class GroqSDKRuntime(BaseRuntime):
                 cb.on_text_complete(final_text)
                 history.append({"role": "assistant", "content": visible})
             break
+        else:
+            # The for-loop completed without break, meaning every turn produced
+            # tool calls and the model never finalized. Surface this as
+            # iteration_limit so the sentinel renders a bounded-loop notice
+            # rather than a misleading "Completed with no text output".
+            elapsed = int(time.time() - start_time)
+            log.warning(
+                f"groq_sdk: hit MAX_TURNS={MAX_TURNS} without final answer "
+                f"(elapsed {elapsed}s, {tool_count} tools)"
+            )
+            return RuntimeResult(
+                text=(
+                    final_text
+                    or "Agent hit the maximum turn limit without producing a final answer."
+                ),
+                history=history,
+                session_id=None,
+                tool_count=tool_count,
+                files_written=files_written,
+                exit_reason="iteration_limit",
+                elapsed_seconds=elapsed,
+            )
 
         elapsed = int(time.time() - start_time)
         log.info(
