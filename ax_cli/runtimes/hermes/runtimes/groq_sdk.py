@@ -130,6 +130,7 @@ class GroqSDKRuntime(BaseRuntime):
         tools = [_to_chat_completion_tool(t) for t in TOOL_DEFINITIONS]
 
         start_time = time.time()
+        deadline = start_time + timeout
         history: list[dict] = list((extra_args or {}).get("history", []))
         history.append({"role": "user", "content": message})
 
@@ -139,6 +140,26 @@ class GroqSDKRuntime(BaseRuntime):
         client = Groq(api_key=api_key)
 
         for turn in range(MAX_TURNS):
+            now = time.time()
+            remaining = deadline - now
+            if remaining <= 0:
+                log.warning(
+                    f"groq_sdk: timeout exceeded at turn {turn + 1} "
+                    f"(budget={timeout}s, elapsed {int(now - start_time)}s)"
+                )
+                return RuntimeResult(
+                    text=(
+                        final_text
+                        or "Agent timed out before producing a final answer."
+                    ),
+                    history=history,
+                    session_id=None,
+                    tool_count=tool_count,
+                    files_written=files_written,
+                    exit_reason="timeout",
+                    elapsed_seconds=int(now - start_time),
+                )
+
             log.info(f"groq_sdk: turn {turn + 1}, {len(history)} messages")
 
             try:
@@ -150,15 +171,32 @@ class GroqSDKRuntime(BaseRuntime):
                     ],
                     tools=tools,
                     stream=True,
+                    timeout=remaining,
                 )
             except Exception as e:
                 error_str = str(e)
                 log.error(f"groq_sdk: API error opening stream: {error_str}")
+                is_timeout = (
+                    "timeout" in error_str.lower()
+                    or "timed out" in error_str.lower()
+                )
                 is_rate_limit = (
                     "429" in error_str
                     or "rate" in error_str.lower()
                     or "usage_limit" in error_str.lower()
                 )
+                if is_timeout:
+                    return RuntimeResult(
+                        text=(
+                            final_text
+                            or "Agent timed out while waiting for the model."
+                        ),
+                        history=history,
+                        tool_count=tool_count,
+                        files_written=files_written,
+                        exit_reason="timeout",
+                        elapsed_seconds=int(time.time() - start_time),
+                    )
                 if is_rate_limit:
                     return RuntimeResult(
                         text="",

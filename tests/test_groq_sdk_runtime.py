@@ -289,6 +289,37 @@ def test_groq_sdk_handles_missing_groq_package_gracefully(monkeypatch):
     assert "pip install" in result.text
 
 
+def test_groq_sdk_returns_timeout_when_deadline_exceeded(monkeypatch):
+    """When wall-clock exceeds the timeout budget before the first turn can
+    open a stream, the runtime should return exit_reason='timeout' rather
+    than blocking the sentinel past its configured per-invocation budget."""
+    from itertools import chain, repeat
+
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
+    from ax_cli.runtimes.hermes.runtimes import groq_sdk as groq_mod
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+
+    # Fake clock. First call (captures start_time) returns 0; every later
+    # call returns 2, which is already past the 1-second timeout.
+    clock = chain([0.0], repeat(2.0))
+    monkeypatch.setattr(groq_mod.time, "time", lambda: next(clock))
+
+    fake_client = MagicMock()
+    # Should never be called because the deadline check fires first.
+    fake_client.chat.completions.create.side_effect = AssertionError(
+        "API should not be called once deadline has passed"
+    )
+    _install_fake_groq(monkeypatch, fake_client)
+
+    rt = get_runtime("groq_sdk")
+    result = rt.execute("any prompt", workdir="/tmp", timeout=1)
+
+    assert result.exit_reason == "timeout"
+    assert fake_client.chat.completions.create.call_count == 0
+    assert "timed out" in result.text.lower()
+
+
 def test_groq_sdk_returns_iteration_limit_when_max_turns_exhausted(monkeypatch):
     """If the model keeps producing tool calls and never finalizes, the runtime
     should exit with exit_reason='iteration_limit' rather than a misleading 'done'."""
