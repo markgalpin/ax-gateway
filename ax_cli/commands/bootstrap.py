@@ -103,6 +103,34 @@ def _effective_config_line() -> str:
     return f"[dim]base_url={base_url}  user_env={user_env}  source={source}[/dim]"
 
 
+def _html_response_diag(r: httpx.Response) -> str:
+    """Build a diagnostic string from an unexpected HTML response.
+
+    Extracts HTTP status, page title, key CDN/server headers, and a body
+    snippet so operators can identify whether the response is a CloudFront
+    fallback, an S3 SPA shell, or something else — without having to re-run
+    with a debugger.
+    """
+    import re as _re
+    html = r.text or ""
+    title_match = _re.search(r"<title[^>]*>([^<]+)</title>", html, _re.IGNORECASE)
+    title = title_match.group(1).strip() if title_match else None
+    diag_headers = {
+        k: r.headers[k]
+        for k in ("cf-ray", "x-request-id", "x-amzn-requestid", "x-cache", "server", "location")
+        if k in r.headers
+    }
+    body_snippet = html[:500].strip() if html else ""
+    diag = f"HTTP {r.status_code}"
+    if title:
+        diag += f', page title: "{title}"'
+    if diag_headers:
+        diag += f", headers: {diag_headers}"
+    if body_snippet:
+        diag += f", body: {body_snippet!r}"
+    return diag
+
+
 def _is_route_miss(exc: httpx.HTTPStatusError) -> bool:
     """Management routes sometimes get caught by the frontend proxy on prod,
     returning HTML or 404/405. Detect so we can fall back.
@@ -184,29 +212,11 @@ def _create_agent_in_space(client, *, name: str, space_id: str, description: str
                 ) from exc
             if _is_route_miss(exc):
                 host = exc.response.url.host if exc.response.url else "the server"
-                # Extract whatever diagnostic detail the HTML response carries.
-                import re as _re
-                _html = exc.response.text or ""
-                _title_match = _re.search(r"<title[^>]*>([^<]+)</title>", _html, _re.IGNORECASE)
-                _title = _title_match.group(1).strip() if _title_match else None
-                _hdrs = exc.response.headers
-                _diag_headers = {
-                    k: _hdrs[k]
-                    for k in ("cf-ray", "x-request-id", "x-amzn-requestid", "x-cache", "server", "location")
-                    if k in _hdrs
-                }
-                _body_snippet = _html[:500].strip() if _html else ""
-                _diag = f"HTTP {status}"
-                if _title:
-                    _diag += f', page title: "{_title}"'
-                if _diag_headers:
-                    _diag += f", headers: {_diag_headers}"
-                if _body_snippet:
-                    _diag += f", body: {_body_snippet!r}"
                 raise httpx.HTTPStatusError(
                     f"Agent creation API not available on {host} — "
                     f"management routes /api/v1/agents/manage/create and /agents/manage/create "
-                    f"returned an HTML page instead of a JSON agent record ({_diag}). "
+                    f"returned an HTML page instead of a JSON agent record "
+                    f"({_html_response_diag(exc.response)}). "
                     f"The server is not routing these requests to the backend. "
                     f"If the agent already exists on {host}, create it there first, "
                     f"then re-run `ax gateway agents add` — the command will "
@@ -233,6 +243,17 @@ def _create_agent_in_space(client, *, name: str, space_id: str, description: str
         # error so caller sees what the backend reported, not a misleading 404.
         r.raise_for_status()
     r.raise_for_status()
+    _ct = r.headers.get("content-type", "")
+    if "text/html" in _ct or r.text.lstrip().startswith("<!"):
+        host = r.url.host if r.url else "the server"
+        raise httpx.HTTPStatusError(
+            f"Agent creation API not available on {host} — "
+            f"POST /api/v1/agents returned an HTML page instead of a JSON agent record "
+            f"({_html_response_diag(r)}). "
+            f"The server is not routing this request to the backend.",
+            request=r.request,
+            response=r,
+        )
     return client._parse_json(r)
 
 
