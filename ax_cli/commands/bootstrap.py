@@ -105,10 +105,17 @@ def _effective_config_line() -> str:
 
 def _is_route_miss(exc: httpx.HTTPStatusError) -> bool:
     """Management routes sometimes get caught by the frontend proxy on prod,
-    returning HTML or 404/405. Detect so we can fall back."""
+    returning HTML or 404/405. Detect so we can fall back.
+
+    Only 2xx HTML (SPA default shell for a non-existent route) and explicit
+    404/405 are route misses. A 4xx HTML response means the route exists but
+    auth or rate-limit failed — surface it so the caller sees the real error
+    and so 429s propagate to the retry wrapper rather than being swallowed.
+    """
     r = exc.response
     ct = r.headers.get("content-type", "")
-    if "text/html" in ct or r.text.lstrip().startswith("<!"):
+    is_html = "text/html" in ct or r.text.lstrip().startswith("<!")
+    if is_html and r.status_code < 400:
         return True
     return r.status_code in {404, 405}
 
@@ -136,9 +143,10 @@ def _find_agent_in_space(client, name: str, space_id: str) -> Optional[dict]:
 
 
 def _create_agent_in_space(client, *, name: str, space_id: str, description: str | None, model: str | None) -> dict:
-    """POST /api/v1/agents with X-Space-Id. This is the creation path proven
-    to route through the ALB on prod (POST survives; PATCH/PUT to the same
-    prefix don't — see avatar-day PR).
+    """Create an agent in a space.
+
+    PAT/exchange clients use the management API (``/api/v1/agents/manage/create``).
+    Cognito clients fall back to the legacy ``POST /api/v1/agents`` path.
 
     On 409 ("agent already exists in this space"), fall back to GET-by-name —
     the caller's intent is "ensure this agent exists"; if backend already has
@@ -147,6 +155,59 @@ def _create_agent_in_space(client, *, name: str, space_id: str, description: str
     auto-created switchboard sender agent already exists on the backend but
     isn't in the local Gateway registry (drift after registry resets).
     """
+    if hasattr(client, "_exchanger") and client._exchanger:
+        try:
+            return client.mgmt_create_agent(name, space_id=space_id, description=description, model=model)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 401:
+                raise httpx.HTTPStatusError(
+                    "Agent creation unauthenticated (401) — token is invalid or expired. "
+                    "Re-run `ax gateway login` to refresh your session.",
+                    request=exc.request,
+                    response=exc.response,
+                ) from exc
+            if status == 403:
+                raise httpx.HTTPStatusError(
+                    "Agent creation forbidden (403) — token is missing agents.create scope. "
+                    "Re-issue your token with the required scope or contact your space admin.",
+                    request=exc.request,
+                    response=exc.response,
+                ) from exc
+            if _is_route_miss(exc):
+                host = exc.response.url.host if exc.response.url else "the server"
+                # Extract whatever diagnostic detail the HTML response carries.
+                import re as _re
+                _html = exc.response.text or ""
+                _title_match = _re.search(r"<title[^>]*>([^<]+)</title>", _html, _re.IGNORECASE)
+                _title = _title_match.group(1).strip() if _title_match else None
+                _hdrs = exc.response.headers
+                _diag_headers = {
+                    k: _hdrs[k]
+                    for k in ("cf-ray", "x-request-id", "x-amzn-requestid", "x-cache", "server", "location")
+                    if k in _hdrs
+                }
+                _body_snippet = _html[:500].strip() if _html else ""
+                _diag = f"HTTP {status}"
+                if _title:
+                    _diag += f', page title: "{_title}"'
+                if _diag_headers:
+                    _diag += f", headers: {_diag_headers}"
+                if _body_snippet:
+                    _diag += f", body: {_body_snippet!r}"
+                raise httpx.HTTPStatusError(
+                    f"Agent creation API not available on {host} — "
+                    f"management routes /api/v1/agents/manage/create and /agents/manage/create "
+                    f"returned an HTML page instead of a JSON agent record ({_diag}). "
+                    f"The server is not routing these requests to the backend. "
+                    f"If the agent already exists on {host}, create it there first, "
+                    f"then re-run `ax gateway agents add` — the command will "
+                    f"find the existing agent automatically without trying to create it.",
+                    request=exc.request,
+                    response=exc.response,
+                ) from exc
+            raise
+
     body: dict = {"name": name}
     if description is not None:
         body["description"] = description

@@ -372,8 +372,12 @@ class AxClient:
         Some environments expose agent management at /api/v1/agents/manage/*,
         while older/local mounts expose /agents/manage/*. Fall back only for
         route-shape misses; authz/authn failures must remain visible.
+
+        A 2xx HTML response means the SPA shell was returned for a non-existent
+        backend route — that's a miss. A 4xx HTML response means the route exists
+        but auth failed — surface it so the caller sees the real error.
         """
-        if self._is_html_response(r):
+        if self._is_html_response(r) and r.status_code < 400:
             return True
         return r.status_code in {404, 405}
 
