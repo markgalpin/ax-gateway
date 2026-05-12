@@ -33,7 +33,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .client import AxClient
+from .client import AxClient, _RateLimitState
 from .commands.listen import (
     _is_self_authored,
     _iter_sse,
@@ -4735,10 +4735,12 @@ class ManagedAgentRuntime:
         *,
         client_factory: Callable[..., Any] = AxClient,
         logger: RuntimeLogger | None = None,
+        rate_limit_state: _RateLimitState | None = None,
     ) -> None:
         self.entry = dict(entry)
         self.client_factory = client_factory
         self.logger = logger or (lambda _msg: None)
+        self._rate_limit_state = rate_limit_state
         self.stop_event = threading.Event()
         self._listener_thread: threading.Thread | None = None
         self._worker_thread: threading.Thread | None = None
@@ -4810,6 +4812,7 @@ class ManagedAgentRuntime:
             token=self._token(),
             agent_name=self.name,
             agent_id=self.agent_id,
+            rate_limit_state=self._rate_limit_state,
         )
 
     def _update_state(self, **fields: Any) -> None:
@@ -6390,6 +6393,7 @@ class GatewayDaemon:
         self.poll_interval = poll_interval
         self._runtimes: dict[str, ManagedAgentRuntime] = {}
         self._stop = threading.Event()
+        self._rate_limit_state = _RateLimitState()
 
     def _log(self, message: str) -> None:
         self.logger(message)
@@ -6574,7 +6578,7 @@ class GatewayDaemon:
                     self._runtimes.pop(name, None)
                     runtime = None
             if runtime is None:
-                runtime = ManagedAgentRuntime(entry, client_factory=self.client_factory, logger=self.logger)
+                runtime = ManagedAgentRuntime(entry, client_factory=self.client_factory, logger=self.logger, rate_limit_state=self._rate_limit_state)
                 self._runtimes[name] = runtime
                 runtime.start()
             else:
@@ -6741,6 +6745,7 @@ class GatewayDaemon:
             return self.client_factory(
                 base_url=session.get("base_url"),
                 token=token,
+                rate_limit_state=self._rate_limit_state,
             )
         except Exception:  # noqa: BLE001
             return None
@@ -6750,6 +6755,7 @@ class GatewayDaemon:
         registry: dict[str, Any],
         *,
         session: dict[str, Any] | None,
+        client: Any | None = None,
     ) -> None:
         """Per-tick sweep: signal liveness transitions upstream.
 
@@ -6767,7 +6773,7 @@ class GatewayDaemon:
         agents = registry.get("agents") or []
         if not agents:
             return
-        client = self._sweep_client(session)
+        client = client or self._sweep_client(session)
         for entry in agents:
             if not isinstance(entry, dict):
                 continue
@@ -6831,11 +6837,12 @@ class GatewayDaemon:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 previous_handlers[sig] = signal.getsignal(sig)
                 signal.signal(sig, _request_stop)
+        sweep_client = self._sweep_client(session)
         try:
             while not self._stop.is_set():
                 registry = load_gateway_registry()
                 registry = self._reconcile_registry(registry, session)
-                self._sweep_lifecycle(registry, session=session)
+                self._sweep_lifecycle(registry, session=session, client=sweep_client)
                 save_gateway_registry(registry)
                 if once:
                     break

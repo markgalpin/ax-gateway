@@ -7355,8 +7355,9 @@ def test_with_upstream_429_retry_falls_back_to_exp_backoff_without_retry_after(m
 
 
 def test_with_upstream_429_retry_caps_wait_at_max(monkeypatch):
-    """Pathological Retry-After values are capped at ``max_wait`` so a
-    misbehaving server can't hang the CLI for hours.
+    """Retry-After values exceeding max_wait cause immediate failure — retrying
+    after a shorter window would ignore the server's explicit guidance and could
+    trigger circuit-breaker escalation.
     """
     sleeps: list[float] = []
     monkeypatch.setattr(gateway_cmd.time, "sleep", lambda s: sleeps.append(s))
@@ -7375,7 +7376,7 @@ def test_with_upstream_429_retry_caps_wait_at_max(monkeypatch):
         gateway_cmd._with_upstream_429_retry(
             call, max_retries=2, base_wait=1.0, max_wait=30.0
         )
-    assert sleeps == [30.0, 30.0]  # both capped at max_wait
+    assert sleeps == []  # no sleep — fails immediately when Retry-After exceeds max_wait
 
 
 def test_with_upstream_429_retry_propagates_other_errors(monkeypatch):
@@ -7394,6 +7395,123 @@ def test_with_upstream_429_retry_propagates_other_errors(monkeypatch):
 
     with pytest.raises(httpx.HTTPStatusError):
         gateway_cmd._with_upstream_429_retry(call, max_retries=3, base_wait=0.1)
+
+
+def test_upstream_rate_limited_error_includes_retry_after_in_message(monkeypatch):
+    """UpstreamRateLimitedError message includes the retry-after time."""
+    monkeypatch.setattr(gateway_cmd.time, "sleep", lambda s: None)
+
+    def call():
+        raise _make_429_error()  # retry-after: 12
+
+    with pytest.raises(gateway_cmd.UpstreamRateLimitedError) as exc_info:
+        gateway_cmd._with_upstream_429_retry(call, max_retries=1, base_wait=1.0)
+    assert "12s" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# _RetryOnAuthClient proactive rate-limit tests
+# ---------------------------------------------------------------------------
+
+def _make_retry_client(*, on_rate_limit_wait=None, max_rate_limit_wait=120.0):
+    """Build a _RetryOnAuthClient with a mock inner httpx.Client."""
+    from ax_cli.client import _RetryOnAuthClient
+    import unittest.mock as mock
+    inner = mock.MagicMock()
+    return _RetryOnAuthClient(
+        inner,
+        get_fresh_jwt=None,
+        on_rate_limit_wait=on_rate_limit_wait,
+        max_rate_limit_wait=max_rate_limit_wait,
+    )
+
+
+def _response_with_rate_limit(remaining: int, reset_at: float, status: int = 200) -> httpx.Response:
+    request = httpx.Request("GET", "https://paxai.app/api/v1/agents")
+    return httpx.Response(
+        status,
+        headers={"x-ratelimit-remaining": str(remaining), "x-ratelimit-reset": str(reset_at)},
+        request=request,
+    )
+
+
+def test_retry_client_no_wait_when_remaining_positive(monkeypatch):
+    """No proactive sleep when rate limit is not exhausted."""
+    import time as _time
+    sleeps = []
+    monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+
+    from ax_cli.client import _RetryOnAuthClient
+    import unittest.mock as mock
+    inner = mock.MagicMock()
+    inner.get.return_value = _response_with_rate_limit(remaining=5, reset_at=_time.time() + 60)
+    client = _RetryOnAuthClient(inner, get_fresh_jwt=None)
+    client.get("/api/v1/agents")
+    assert sleeps == []
+
+
+def test_retry_client_waits_when_exhausted(monkeypatch):
+    """Proactive sleep fires before the next request when remaining hits 0."""
+    import time as _time
+    sleeps = []
+    monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+    reset_at = _time.time() + 30
+
+    from ax_cli.client import _RetryOnAuthClient
+    import unittest.mock as mock
+    inner = mock.MagicMock()
+    inner.get.return_value = _response_with_rate_limit(remaining=0, reset_at=reset_at)
+    client = _RetryOnAuthClient(inner, get_fresh_jwt=None)
+
+    client.get("/api/v1/agents")  # records exhaustion
+    client.get("/api/v1/agents")  # should sleep before this request
+    assert len(sleeps) == 1
+    assert sleeps[0] > 0
+
+
+def test_retry_client_calls_callback_on_wait(monkeypatch):
+    """on_rate_limit_wait callback is called with wait_seconds and reset_at."""
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
+    reset_at = _time.time() + 30
+    calls = []
+
+    from ax_cli.client import _RetryOnAuthClient
+    import unittest.mock as mock
+    inner = mock.MagicMock()
+    inner.get.return_value = _response_with_rate_limit(remaining=0, reset_at=reset_at)
+    client = _RetryOnAuthClient(
+        inner, get_fresh_jwt=None,
+        on_rate_limit_wait=lambda w, r: calls.append((w, r)),
+    )
+
+    client.get("/api/v1/agents")
+    client.get("/api/v1/agents")
+    assert len(calls) == 1
+    wait, reset = calls[0]
+    assert wait > 0
+    assert reset == reset_at
+
+
+def test_retry_client_raises_preempted_when_wait_exceeds_max(monkeypatch):
+    """RateLimitPreemptedError raised immediately when reset window > max_rate_limit_wait."""
+    import time as _time
+    sleeps = []
+    monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+    reset_at = _time.time() + 999
+
+    from ax_cli.client import _RetryOnAuthClient, RateLimitPreemptedError
+    import unittest.mock as mock
+    inner = mock.MagicMock()
+    inner.get.return_value = _response_with_rate_limit(remaining=0, reset_at=reset_at)
+    client = _RetryOnAuthClient(inner, get_fresh_jwt=None, max_rate_limit_wait=30.0)
+
+    client.get("/api/v1/agents")  # records exhaustion
+    with pytest.raises(RateLimitPreemptedError) as exc_info:
+        client.get("/api/v1/agents")
+    assert sleeps == []  # no sleep — raised immediately
+    assert exc_info.value.retry_after_seconds > 0
+    assert "try again after" in str(exc_info.value)
 
 
 def test_backend_agent_record_falls_back_to_cache_on_failure(monkeypatch, tmp_path):
