@@ -157,9 +157,17 @@ def _create_agent_in_space(client, *, name: str, space_id: str, description: str
     """
     if hasattr(client, "_exchanger") and client._exchanger:
         try:
-            return client.mgmt_create_agent(name, space_id=space_id, description=description, model=model)
+            result = client.mgmt_create_agent(name, space_id=space_id, description=description, model=model)
+            # Management API may wrap the agent in {"agent": {...}} — unwrap so
+            # callers always get the agent dict and .get("id") resolves correctly.
+            return result.get("agent", result) if isinstance(result, dict) else result
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
+            if status == 409:
+                existing = _find_agent_in_space(client, name, space_id)
+                if existing:
+                    return existing
+                raise
             if status == 401:
                 raise httpx.HTTPStatusError(
                     "Agent creation unauthenticated (401) — token is invalid or expired. "
