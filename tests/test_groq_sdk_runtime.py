@@ -9,11 +9,22 @@ and partial-failure handling when the stream raises mid-response.
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from unittest.mock import MagicMock
 
 import pytest  # noqa: F401  (pytest is the test runner; import keeps tooling happy)
+
+# The Hermes sentinel prepends ax_cli/runtimes/hermes to sys.path in production
+# so vendored runtimes can do `from tools import ...` as an absolute import.
+# Replicate that here so the same import path resolves under pytest.
+_HERMES_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "ax_cli", "runtimes", "hermes",
+)
+if _HERMES_DIR not in sys.path:
+    sys.path.insert(0, _HERMES_DIR)
 
 # Importing the module triggers `@register("groq_sdk")` at module load time,
 # so the runtime is in REGISTRY regardless of which other tests in the suite
@@ -169,7 +180,11 @@ def test_groq_sdk_dispatches_tool_call_and_continues_to_final_answer(monkeypatch
     """Model emits a tool_call streamed across chunks; runtime executes it, threads
     the result into history with role=tool, and finalizes on the next turn."""
     from ax_cli.runtimes.hermes.runtimes import get_runtime
-    from ax_cli.runtimes.hermes import tools as tools_mod
+    # Production code imports `from tools import ...` (absolute) because the
+    # hermes sentinel puts ax_cli/runtimes/hermes on sys.path. We do the same
+    # in module setup above, so this import lands on the same module object
+    # that the runtime will read.
+    import tools as tools_mod
 
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
 

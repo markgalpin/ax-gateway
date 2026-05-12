@@ -97,12 +97,13 @@ class GroqSDKRuntime(BaseRuntime):
             )
 
         from groq import Groq
-        # Relative import from the sibling tools package. openai_sdk.py uses the
-        # absolute `from tools import ...` which relies on hermes-agent putting
-        # tools/ on sys.path root in production. We use the relative form so the
-        # runtime works in local dev too. Upstream may choose to switch to the
-        # absolute form during PR review.
-        from ..tools import TOOL_DEFINITIONS, execute_tool
+        # Absolute import matches openai_sdk.py and the other sibling runtimes.
+        # The Hermes sentinel prepends ax_cli/runtimes/hermes to sys.path and
+        # loads this module as `runtimes.groq_sdk`, so a relative `from ..tools`
+        # would escape past the top-level package and raise ImportError at runtime.
+        # Tests in tests/test_groq_sdk_runtime.py insert the same hermes directory
+        # into sys.path so the absolute form resolves there too.
+        from tools import TOOL_DEFINITIONS, execute_tool
 
         cb = stream_cb or StreamCallback()
         model = model or DEFAULT_MODEL
