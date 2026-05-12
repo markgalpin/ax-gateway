@@ -33,7 +33,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .. import gateway as gateway_core
-from ..client import AxClient
+from ..client import AxClient, RATE_LIMIT_MAX_WAIT, _RateLimitState
 from ..commands import auth as auth_cmd
 from ..commands.bootstrap import (
     _create_agent_in_space,
@@ -170,6 +170,9 @@ def _resolve_gateway_login_token(explicit_token: str | None) -> str:
     return auth_cmd._resolve_login_token(None)
 
 
+_gateway_rate_limit_state = _RateLimitState()
+
+
 def _load_gateway_user_client() -> AxClient:
     session = load_gateway_session()
     if not session:
@@ -182,7 +185,22 @@ def _load_gateway_user_client() -> AxClient:
     if not token.startswith("axp_u_"):
         err_console.print("[red]Gateway bootstrap currently requires a user PAT (axp_u_).[/red]")
         raise typer.Exit(1)
-    return AxClient(base_url=str(session.get("base_url") or auth_cmd.DEFAULT_LOGIN_BASE_URL), token=token)
+    import datetime
+
+    def _on_rate_limit_wait(wait_seconds: float, reset_at: float) -> None:
+        reset_str = datetime.datetime.fromtimestamp(reset_at).strftime("%H:%M:%S")
+        err_console.print(
+            f"[yellow]Rate limit reached — waiting {wait_seconds:.0f}s until {reset_str} before next request.[/yellow]"
+        )
+        record_gateway_activity("rate_limit_wait", wait_seconds=wait_seconds, reset_at=reset_str)
+
+    return AxClient(
+        base_url=str(session.get("base_url") or auth_cmd.DEFAULT_LOGIN_BASE_URL),
+        token=token,
+        on_rate_limit_wait=_on_rate_limit_wait,
+        max_rate_limit_wait=RATE_LIMIT_MAX_WAIT,
+        rate_limit_state=_gateway_rate_limit_state,
+    )
 
 
 def _load_gateway_session_or_exit() -> dict:
@@ -229,7 +247,8 @@ class UpstreamRateLimitedError(RuntimeError):
         except (ValueError, AttributeError, TypeError):
             retry_after = None
         self.retry_after_seconds = retry_after
-        super().__init__(f"Upstream rate-limited after {retries_attempted} retries")
+        wait_hint = f" — retry after {retry_after}s" if retry_after else ""
+        super().__init__(f"Upstream rate-limited after {retries_attempted} retries{wait_hint}")
 
 
 def _with_upstream_429_retry(
@@ -237,7 +256,7 @@ def _with_upstream_429_retry(
     *,
     max_retries: int,
     base_wait: float = 1.0,
-    max_wait: float = 120.0,
+    max_wait: float = RATE_LIMIT_MAX_WAIT,
 ):
     """Run ``call`` and retry on httpx 429, honoring ``Retry-After`` when present.
 
@@ -266,6 +285,8 @@ def _with_upstream_429_retry(
                 hint = float(retry_after_raw) if retry_after_raw is not None else 0.0
             except (TypeError, ValueError):
                 hint = 0.0
+            if hint > max_wait:
+                raise UpstreamRateLimitedError(exc, attempts) from exc
             exp = base_wait * (2**attempts)
             wait = min(max(exp, hint), max_wait)
             time.sleep(wait)

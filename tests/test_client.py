@@ -7,11 +7,13 @@ import pytest
 
 from ax_cli.client import (
     AxClient,
+    RateLimitPreemptedError,
+    _RateLimitState,
+    _RetryOnAuthClient,
     _build_fingerprint,
     _check_honeypot,
     _mime_from_ext,
     _mime_from_filename,
-    _RetryOnAuthClient,
 )
 
 
@@ -932,6 +934,7 @@ class TestCredentialManagement:
 
 
 # ---------------------------------------------------------------------------
+<<<<<<< HEAD
 # Helper for building mock responses
 # ---------------------------------------------------------------------------
 
@@ -2163,3 +2166,99 @@ def test_create_task_auth_contract_raises_when_no_id_in_response(monkeypatch):
     client._http.post = MagicMock(return_value=task_response)
     with pytest.raises(RuntimeError, match="did not include an id"):
         client.create_task_auth_contract("Missing ID task")
+
+
+# ---------------------------------------------------------------------------
+# _RateLimitState tests
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimitState:
+    def test_record_sets_exhausted_when_remaining_zero(self):
+        state = _RateLimitState()
+        state.record(remaining=0, reset_at=9999999999.0)
+        assert state.exhausted is True
+
+    def test_record_clears_exhausted_when_remaining_positive(self):
+        state = _RateLimitState()
+        state.record(remaining=0, reset_at=9999999999.0)
+        state.record(remaining=5, reset_at=9999999999.0)
+        assert state.exhausted is False
+
+    def test_record_updates_reset_at(self):
+        state = _RateLimitState()
+        state.record(remaining=0, reset_at=1234567890.0)
+        assert state.reset_at == 1234567890.0
+
+    def test_wait_if_needed_no_op_when_not_exhausted(self, monkeypatch):
+        import time as _time
+        sleeps = []
+        monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+        state = _RateLimitState()
+        state.wait_if_needed(120.0)
+        assert sleeps == []
+
+    def test_wait_if_needed_sleeps_when_exhausted(self, monkeypatch):
+        import time as _time
+        sleeps = []
+        monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+        state = _RateLimitState()
+        state.record(remaining=0, reset_at=_time.time() + 30)
+        state.wait_if_needed(120.0)
+        assert len(sleeps) == 1
+        assert sleeps[0] > 0
+
+    def test_wait_if_needed_calls_callback(self, monkeypatch):
+        import time as _time
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+        calls = []
+        state = _RateLimitState()
+        state.record(remaining=0, reset_at=_time.time() + 30)
+        state.wait_if_needed(120.0, on_wait=lambda w, r: calls.append((w, r)))
+        assert len(calls) == 1
+        assert calls[0][0] > 0
+
+    def test_wait_if_needed_clears_exhausted_after_wait(self, monkeypatch):
+        import time as _time
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+        state = _RateLimitState()
+        state.record(remaining=0, reset_at=_time.time() + 30)
+        state.wait_if_needed(120.0)
+        assert state.exhausted is False
+
+    def test_wait_if_needed_raises_preempted_when_wait_exceeds_max(self, monkeypatch):
+        import time as _time
+        sleeps = []
+        monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+        state = _RateLimitState()
+        state.record(remaining=0, reset_at=_time.time() + 999)
+        with pytest.raises(RateLimitPreemptedError) as exc_info:
+            state.wait_if_needed(30.0)
+        assert sleeps == []
+        assert exc_info.value.retry_after_seconds > 0
+        assert "try again after" in str(exc_info.value)
+
+    def test_shared_state_coordinates_across_clients(self, monkeypatch):
+        """Two _RetryOnAuthClient instances sharing state both see exhaustion."""
+        import time as _time
+        sleeps = []
+        monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+
+        shared = _RateLimitState()
+        request = httpx.Request("GET", "https://example.com/api/v1/agents")
+        ok = httpx.Response(200, headers={
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": str(_time.time() + 30),
+        }, request=request)
+
+        inner_a = MagicMock()
+        inner_a.get.return_value = ok
+        client_a = _RetryOnAuthClient(inner_a, get_fresh_jwt=None, rate_limit_state=shared)
+
+        inner_b = MagicMock()
+        inner_b.get.return_value = ok
+        client_b = _RetryOnAuthClient(inner_b, get_fresh_jwt=None, rate_limit_state=shared)
+
+        client_a.get("/api/v1/agents")   # records exhaustion on shared state
+        client_b.get("/api/v1/agents")   # should sleep before making its request
+        assert len(sleeps) == 1          # exactly one sleep from client_b's proactive wait
