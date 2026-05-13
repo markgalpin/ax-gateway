@@ -168,11 +168,18 @@ class _RateLimitState:
         self.remaining: int = 9999  # unknown until first response
 
     def record(self, remaining: int, reset_at: float) -> None:
+        import time as _time
         with self._lock:
             self.remaining = remaining
             self.exhausted = remaining <= self._low_water
             if reset_at:
                 self.reset_at = reset_at
+            elif self.exhausted:
+                # No reset header — use now so wait_if_needed sleeps at most
+                # 0.5s rather than waiting on a stale window from a prior call.
+                # If budget is truly exhausted the next request will 429 and
+                # provide a real reset timestamp via the retry path.
+                self.reset_at = _time.time()
 
     def warm(self, client: "AxClient", path: str = "/api/v1/agents") -> None:
         """Issue a lightweight GET to populate rate-limit state before a burst.

@@ -1055,6 +1055,22 @@ class TestRateLimitState:
         assert state.remaining == 50  # unchanged
         assert state.exhausted is False
 
+    def test_exhausted_without_reset_header_uses_current_time(self):
+        """When remaining hits low-water but reset header is absent, reset_at is set to
+        now so wait_if_needed sleeps at most 0.5s instead of waiting on a stale window."""
+        import time as _time
+        state = _RateLimitState()
+        stale_reset = _time.time() + 9999  # far future — a leftover from a previous window
+        state.record(remaining=50, reset_at=stale_reset)
+
+        # Now record exhaustion with no reset header
+        before = _time.time()
+        state.record(remaining=0, reset_at=0.0)
+        after = _time.time()
+
+        assert state.exhausted is True
+        assert before <= state.reset_at <= after + 1  # reset_at ≈ now, not the stale future
+
     def test_missing_rate_limit_headers_pass_none_to_callback(self):
         """on_request_complete receives remaining=None when headers are absent."""
         calls = []
