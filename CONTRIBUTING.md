@@ -7,14 +7,14 @@ changes should be easy for operators to understand, test, and release.
 
 This project is governed by our [Code of Conduct](./CODE_OF_CONDUCT.md). By
 participating, you are expected to uphold it. Report unacceptable behavior to
-**support@ax-platform.com**.
+**support@fulcrumdefense.ai**.
 
 ## New Here?
 
 If you are joining the project for the first time:
 
 1. Read through this guide and the [Development Setup](#development-setup) section below
-2. Browse **[Good First Issues](https://github.com/ax-platform/ax-gateway/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)** —
+2. Browse **[Good First Issues](https://github.com/FulcrumDefense/ax-gateway/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)** —
    small, well-scoped tasks tagged for newcomers
 
 ## Getting Started
@@ -34,16 +34,8 @@ If you are joining the project for the first time:
    ```
 3. Add upstream remote:
    ```bash
-   git remote add upstream https://github.com/ax-platform/ax-gateway.git
+   git remote add upstream https://github.com/FulcrumDefense/ax-gateway.git
    ```
-
-## Contributor License Agreement (CLA)
-
-Before we can accept your first pull request, you must sign our
-[Contributor License Agreement](CLA.md). This is handled automatically by the
-CLA Assistant bot on GitHub. When you open your first PR, you will receive a
-comment with a link to sign the CLA. You only need to sign once. Without a
-signed CLA, the PR cannot be merged.
 
 ## Development Setup
 
@@ -115,7 +107,7 @@ The short version:
 
 ## Community & Support
 
-- **GitHub Issues**: [Report bugs or request features](https://github.com/ax-platform/ax-gateway/issues)
+- **GitHub Issues**: [Report bugs or request features](https://github.com/FulcrumDefense/ax-gateway/issues)
 - **Security Vulnerabilities**: See [SECURITY.md](./SECURITY.md) — do not open a public issue
 
 ## License
