@@ -20,6 +20,9 @@ for log in api-requests.log gateway.log gateway-ui.log; do
 done
 
 echo "==> Upgrading axctl..."
+# Assumes axctl was installed via 'pipx install -e .' from this checkout.
+# pipx records the original spec, so upgrade re-installs from the local path.
+# If it was installed from PyPI instead, this will pull the published package.
 pipx upgrade axctl
 
 echo "==> Starting gateway..."

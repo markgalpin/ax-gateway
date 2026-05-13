@@ -199,17 +199,24 @@ class _RateLimitState:
         if not self.exhausted:
             return
         import time as _time
-        wait = max(0.0, self.reset_at - _time.time() + 0.5)
+        reset_at = self.reset_at
+        wait = max(0.0, reset_at - _time.time() + 0.5)
         if wait == 0.0:
-            # Reset window has already passed — clear the flag and proceed.
+            # Window already expired — clear unconditionally. Any new exhaustion
+            # from a concurrent record() will be caught on the next call.
             self.exhausted = False
             return
         if wait > max_wait:
-            raise RateLimitPreemptedError(wait, self.reset_at)
+            raise RateLimitPreemptedError(wait, reset_at)
         if on_wait:
-            on_wait(wait, self.reset_at)
+            on_wait(wait, reset_at)
         _time.sleep(wait)
-        self.exhausted = False
+        with self._lock:
+            # Re-read reset_at under lock: a concurrent record() may have set a
+            # newer window during the sleep. Only clear if the current window has
+            # actually expired or remaining has independently recovered.
+            if _time.time() >= self.reset_at or self.remaining > self._low_water:
+                self.exhausted = False
 
 
 class RateLimitPreemptedError(RuntimeError):
