@@ -133,17 +133,16 @@ def _html_response_diag(r: httpx.Response) -> str:
 
 def _is_route_miss(exc: httpx.HTTPStatusError) -> bool:
     """Management routes sometimes get caught by the frontend proxy on prod,
-    returning HTML or 404/405. Detect so we can fall back.
+    returning non-JSON responses or 404/405. Detect so we can fall back.
 
-    Only 2xx HTML (SPA default shell for a non-existent route) and explicit
-    404/405 are route misses. A 4xx HTML response means the route exists but
-    auth or rate-limit failed — surface it so the caller sees the real error
-    and so 429s propagate to the retry wrapper rather than being swallowed.
+    The real backend always returns JSON. Any non-JSON response (except for
+    a genuine 401 or 429, which should never be non-JSON) means CDN/proxy
+    intercepted the request before it reached the API. Explicit 404/405 are
+    also route misses regardless of content type.
     """
     r = exc.response
-    ct = r.headers.get("content-type", "")
-    is_html = "text/html" in ct or r.text.lstrip().startswith("<!")
-    if is_html and r.status_code < 400:
+    is_json = "application/json" in r.headers.get("content-type", "")
+    if not is_json and r.status_code not in {401, 429}:
         return True
     return r.status_code in {404, 405}
 
