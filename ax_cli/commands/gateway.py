@@ -33,7 +33,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .. import gateway as gateway_core
-from ..client import AxClient, RATE_LIMIT_CLI_LOW_WATER, RATE_LIMIT_MAX_WAIT, _RateLimitState
+from ..client import RATE_LIMIT_CLI_LOW_WATER, RATE_LIMIT_MAX_WAIT, AxClient, _RateLimitState
 from ..commands import auth as auth_cmd
 from ..commands.bootstrap import (
     _create_agent_in_space,
@@ -50,6 +50,8 @@ from ..gateway import (
     _is_passive_runtime,
     _is_system_agent,
     _plugin_source_dir,
+    _RequestLogger,
+    _ui_request_logger,
     active_gateway_pid,
     active_gateway_pids,
     active_gateway_ui_pid,
@@ -87,9 +89,6 @@ from ..gateway import (
     lookup_space_in_cache,
     ollama_setup_status,
     record_gateway_activity,
-    _daemon_request_logger,
-    _ui_request_logger,
-    _RequestLogger,
     remove_agent_entry,
     save_agent_pending_messages,
     save_gateway_registry,

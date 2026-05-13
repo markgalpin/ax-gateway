@@ -182,7 +182,7 @@ class _RateLimitState:
         than firing blind.
         """
         try:
-            r = client._http.get(path, params={"limit": 1})
+            client._http.get(path, params={"limit": 1})
             # _record_rate_limit is called inside _retry, so state is already
             # updated by the time this returns.
         except Exception:
@@ -262,9 +262,15 @@ class _RetryOnAuthClient:
 
     def _record_rate_limit(self, r: httpx.Response) -> None:
         try:
-            remaining = int(r.headers.get("x-ratelimit-remaining", "1"))
-            reset_ts = float(r.headers.get("x-ratelimit-reset", "0"))
-            self._rl.record(remaining, reset_ts)
+            remaining_hdr = r.headers.get("x-ratelimit-remaining")
+            reset_hdr = r.headers.get("x-ratelimit-reset")
+            if remaining_hdr is not None:
+                remaining: int | None = int(remaining_hdr)
+                reset_ts = float(reset_hdr or "0")
+                self._rl.record(remaining, reset_ts)
+            else:
+                remaining = None
+                reset_ts = float(reset_hdr or "0")
             if self._on_request_complete:
                 method = r.request.method if r.request else "?"
                 path = r.request.url.path if r.request else "?"
