@@ -373,11 +373,12 @@ class AxClient:
         while older/local mounts expose /agents/manage/*. Fall back only for
         route-shape misses; authz/authn failures must remain visible.
 
-        A 2xx HTML response means the SPA shell was returned for a non-existent
-        backend route — that's a miss. A 4xx HTML response means the route exists
-        but auth failed — surface it so the caller sees the real error.
+        The real backend always returns JSON. Any non-JSON response (except a
+        genuine 401 or 429) means CDN/proxy caught the request — treat as a
+        miss. Explicit 404/405 are also misses regardless of content type.
         """
-        if self._is_html_response(r) and r.status_code < 400:
+        is_json = "application/json" in r.headers.get("content-type", "")
+        if not is_json and r.status_code not in {401, 429}:
             return True
         return r.status_code in {404, 405}
 
