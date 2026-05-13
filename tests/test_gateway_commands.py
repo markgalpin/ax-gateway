@@ -503,6 +503,7 @@ class _SharedRuntimeClient:
         self.sent = []
         self.processing = []
         self.tool_calls = []
+        self.heartbeats = []
         self.connect_calls = 0
 
     def connect_sse(self, *, space_id, timeout=None):
@@ -538,6 +539,10 @@ class _SharedRuntimeClient:
     def record_tool_call(self, **payload):
         self.tool_calls.append(payload)
         return {"ok": True, "tool_call_id": payload["tool_call_id"]}
+
+    def send_heartbeat(self, *, agent_id=None, status=None, note=None, cadence_seconds=None):
+        self.heartbeats.append({"agent_id": agent_id, "status": status})
+        return {"ok": True}
 
     def close(self):
         return None
@@ -2358,6 +2363,90 @@ def test_managed_echo_runtime_processes_message(tmp_path, monkeypatch):
     assert "message_received" in event_names
     assert "message_claimed" in event_names
     assert "reply_sent" in event_names
+
+
+def test_runtime_sends_connected_heartbeat_on_first_sse_event(tmp_path, monkeypatch):
+    """Listener loop sends 'connected' heartbeat on first SSE event after connecting."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    token_file = tmp_path / "token"
+    token_file.write_text("axp_a_agent.secret")
+    payload = {"id": "msg-hb", "content": "ping", "author": {"id": "u1", "name": "u", "type": "user"}, "mentions": ["hb-bot"]}
+    shared = _SharedRuntimeClient(payload)
+    runtime = gateway_core.ManagedAgentRuntime(
+        {"name": "hb-bot", "agent_id": "agent-hb", "space_id": "s1", "base_url": "https://paxai.app", "runtime_type": "echo", "token_file": str(token_file)},
+        client_factory=lambda **kwargs: shared,
+    )
+    runtime.start()
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not shared.heartbeats:
+        time.sleep(0.05)
+    runtime.stop()
+    assert any(h["status"] == "connected" for h in shared.heartbeats)
+
+
+def test_runtime_sends_stale_heartbeat_on_sse_disconnect(tmp_path, monkeypatch):
+    """Listener loop sends 'stale' heartbeat when SSE connection drops."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    token_file = tmp_path / "token"
+    token_file.write_text("axp_a_agent.secret")
+
+    class _FailOnSecondConnect(_SharedRuntimeClient):
+        def connect_sse(self, *, space_id, timeout=None):
+            self.connect_calls += 1
+            if self.connect_calls == 1:
+                raise ConnectionError("SSE dropped")
+            raise ConnectionError("test done")
+
+    shared = _FailOnSecondConnect({})
+    runtime = gateway_core.ManagedAgentRuntime(
+        {"name": "stale-bot", "agent_id": "agent-stale", "space_id": "s1", "base_url": "https://paxai.app", "runtime_type": "echo", "token_file": str(token_file)},
+        client_factory=lambda **kwargs: shared,
+    )
+    runtime.start()
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not any(h["status"] == "stale" for h in shared.heartbeats):
+        time.sleep(0.05)
+    runtime.stop()
+    assert any(h["status"] == "stale" for h in shared.heartbeats)
+
+
+def test_runtime_sends_offline_heartbeat_on_stop(tmp_path, monkeypatch):
+    """stop() sends 'offline' heartbeat using the agent-bound client."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    token_file = tmp_path / "token"
+    token_file.write_text("axp_a_agent.secret")
+    shared = _SharedRuntimeClient({})
+    runtime = gateway_core.ManagedAgentRuntime(
+        {"name": "offline-bot", "agent_id": "agent-off", "space_id": "s1", "base_url": "https://paxai.app", "runtime_type": "echo", "token_file": str(token_file)},
+        client_factory=lambda **kwargs: shared,
+    )
+    runtime.stop()
+    assert any(h["status"] == "offline" for h in shared.heartbeats)
+
+
+def test_runtime_sends_setup_error_heartbeat_on_error_state(tmp_path, monkeypatch):
+    """_update_state fires 'setup_error' heartbeat on first transition to error."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
+    token_file = tmp_path / "token"
+    token_file.write_text("axp_a_agent.secret")
+    shared = _SharedRuntimeClient({})
+    runtime = gateway_core.ManagedAgentRuntime(
+        {"name": "err-bot", "agent_id": "agent-err", "space_id": "s1", "base_url": "https://paxai.app", "runtime_type": "echo", "token_file": str(token_file)},
+        client_factory=lambda **kwargs: shared,
+    )
+    runtime._update_state(effective_state="error", last_error="test error")
+    assert any(h["status"] == "setup_error" for h in shared.heartbeats)
+    # Second transition to error should not fire again
+    runtime._update_state(effective_state="error", last_error="still broken")
+    assert sum(1 for h in shared.heartbeats if h["status"] == "setup_error") == 1
 
 
 def test_managed_exec_runtime_parses_gateway_progress_events(tmp_path, monkeypatch):
@@ -6041,8 +6130,9 @@ def test_sweep_does_not_auto_hide_stale_agent(monkeypatch, tmp_path):
     assert "hidden_reason" not in entry
     recent = gateway_core.load_recent_gateway_activity()
     assert not any(r.get("event") == "managed_agent_hidden" for r in recent)
-    # Upstream liveness signal still goes out — that's the sweep's only job.
-    assert client.heartbeats and client.heartbeats[0]["status"] == "stale"
+    # Sweep no longer sends heartbeats — agent runtimes send them from their
+    # own bound clients. Sweep's user token is rejected by the heartbeat endpoint.
+    assert client.heartbeats == []
 
 
 def test_sweep_skips_switchboard(monkeypatch, tmp_path):
@@ -6683,50 +6773,6 @@ def test_operator_cleanup_restore_unhides_selected_agents(monkeypatch, tmp_path)
     assert [event["event"] for event in recent].count("managed_agent_unhidden") == 1
 
 
-def test_lifecycle_signal_sent_on_connected_to_stale(monkeypatch, tmp_path):
-    _isolate_gateway_paths(monkeypatch, tmp_path)
-    client = _RecordingHeartbeatClient()
-    daemon = _build_daemon(client)
-    entry = _stale_hermes_entry("hermes-flap", age_seconds=20 * 60)
-    registry = {"agents": [entry]}
-    daemon._sweep_lifecycle(registry, session={"token": "axp_u_test", "base_url": "http://x"})
-    assert len(client.heartbeats) == 1
-    assert client.heartbeats[0]["status"] == "stale"
-    assert client.heartbeats[0]["agent_id"] == entry["agent_id"]
-    assert entry["last_lifecycle_signal"]["phase"] == "stale"
-
-
-def test_lifecycle_signal_idempotent(monkeypatch, tmp_path):
-    _isolate_gateway_paths(monkeypatch, tmp_path)
-    client = _RecordingHeartbeatClient()
-    daemon = _build_daemon(client)
-    entry = _stale_hermes_entry("hermes-flap", age_seconds=20 * 60)
-    registry = {"agents": [entry]}
-    session = {"token": "axp_u_test", "base_url": "http://x"}
-    daemon._sweep_lifecycle(registry, session=session)
-    daemon._sweep_lifecycle(registry, session=session)
-    assert len(client.heartbeats) == 1
-
-
-def test_lifecycle_signal_404_tolerant(monkeypatch, tmp_path):
-    _isolate_gateway_paths(monkeypatch, tmp_path)
-    boom = httpx.HTTPStatusError(
-        "platform has no record",
-        request=httpx.Request("POST", "http://x/api/v1/agents/heartbeat"),
-        response=httpx.Response(404),
-    )
-    client = _RecordingHeartbeatClient(fail_with=boom, fail_status_code=404)
-    daemon = _build_daemon(client)
-    entry = _stale_hermes_entry("hermes-ghost", age_seconds=20 * 60)
-    registry = {"agents": [entry]}
-    daemon._sweep_lifecycle(registry, session={"token": "axp_u_test", "base_url": "http://x"})
-    # Sweep doesn't mutate lifecycle_phase regardless of upstream response.
-    assert entry.get("lifecycle_phase", "active") == "active"
-    # 404 counts as "platform doesn't know about this agent" — sticky signal
-    # still updated so we don't retry forever.
-    assert entry["last_lifecycle_signal"]["phase"] == "stale"
-
-
 def test_remove_managed_agent_calls_delete_agent_then_local_remove(monkeypatch, tmp_path):
     _isolate_gateway_paths(monkeypatch, tmp_path)
     token_path = tmp_path / "tok"
@@ -6854,8 +6900,6 @@ def test_archive_managed_agent_sets_phase_and_stops_runtime(monkeypatch, tmp_pat
     assert stored["desired_state"] == "stopped"
     assert stored["desired_state_before_archive"] == "running"
     assert "archived_at" in stored
-    # Upstream signal sent best-effort.
-    assert any(h["status"] == "archived" for h in client.heartbeats)
     # Audit event recorded.
     recent = gateway_core.load_recent_gateway_activity()
     assert any(r.get("event") == "managed_agent_archived" for r in recent)
@@ -6913,8 +6957,6 @@ def test_archive_then_restore_returns_to_prior_desired_state(monkeypatch, tmp_pa
     assert "desired_state_before_archive" not in stored
     recent = gateway_core.load_recent_gateway_activity()
     assert any(r.get("event") == "managed_agent_restored" for r in recent)
-    # Restore signals 'connected' upstream.
-    assert any(h["status"] == "connected" for h in client.heartbeats)
 
 
 def test_restore_unarchived_agent_is_noop(monkeypatch, tmp_path):
