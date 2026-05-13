@@ -994,9 +994,11 @@ class TestRateLimitState:
 
     def test_wait_if_needed_clears_exhausted_after_wait(self, monkeypatch):
         import time as _time
-        monkeypatch.setattr(_time, "sleep", lambda s: None)
+        now = [_time.time()]
+        monkeypatch.setattr(_time, "sleep", lambda s: now.__setitem__(0, now[0] + s))
+        monkeypatch.setattr(_time, "time", lambda: now[0])
         state = _RateLimitState()
-        state.record(remaining=0, reset_at=_time.time() + 30)
+        state.record(remaining=0, reset_at=now[0] + 30)
         state.wait_if_needed(120.0)
         assert state.exhausted is False
 
@@ -1036,6 +1038,23 @@ class TestRateLimitState:
         client_a.get("/api/v1/agents")   # records exhaustion on shared state
         client_b.get("/api/v1/agents")   # should sleep before making its request
         assert len(sleeps) == 1          # exactly one sleep from client_b's proactive wait
+
+    def test_wait_if_needed_does_not_clear_exhausted_if_record_fires_during_sleep(self, monkeypatch):
+        """If record() sets a new low-water window during the sleep, the post-sleep
+        clear must not overwrite it back to False."""
+        import time as _time
+        sleeps = []
+
+        def fake_sleep(s):
+            sleeps.append(s)
+            # Simulate a concurrent record() arriving while we were sleeping
+            state.record(remaining=0, reset_at=_time.time() + 60)
+
+        monkeypatch.setattr(_time, "sleep", fake_sleep)
+        state = _RateLimitState()
+        state.record(remaining=0, reset_at=_time.time() + 0.1)  # just expired
+        state.wait_if_needed(120.0)
+        assert state.exhausted is True  # new window set during sleep must survive
 
     def test_missing_rate_limit_headers_do_not_update_state(self):
         """Responses without x-ratelimit-remaining must not touch _RateLimitState."""
