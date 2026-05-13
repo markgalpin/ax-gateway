@@ -2957,21 +2957,20 @@ class _RequestLogger:
             "path": path,
             "status": status,
         }
-        if content_type:
-            record["content_type"] = content_type
-        if agent_name:
-            record["agent_name"] = agent_name
-        if agent_id:
-            record["agent_id"] = agent_id
-        if remaining is not None:
-            record["remaining"] = remaining
-        if reset_at is not None:
-            record["reset_at"] = reset_at
+        record["content_type"] = content_type or None
+        record["agent_name"] = agent_name or None
+        record["agent_id"] = agent_id or None
+        record["remaining"] = remaining
+        record["reset_at"] = reset_at or None
         line = _json.dumps(record) + "\n"
         log_path = api_requests_log_path()
-        with self._lock:
-            with open(log_path, "a") as f:
-                f.write(line)
+        try:
+            with self._lock:
+                with open(log_path, "a") as f:
+                    f.write(line)
+        except OSError as exc:
+            import sys
+            print(f"[ax-gateway] WARNING: api-requests.log write failed: {exc}", file=sys.stderr)
 
 
 _daemon_request_logger = _RequestLogger(role="daemon")

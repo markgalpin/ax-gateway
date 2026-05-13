@@ -8685,3 +8685,74 @@ def test_gateway_local_connect_404_uses_actionable_guidance(monkeypatch):
     assert "@wishy" in msg
     assert "Live Listener" in msg
     assert "ax gateway local connect wishy --workdir /repo" in msg
+
+
+def _get_log_records(log_path) -> list[dict]:
+    import json as _json
+    records = []
+    if log_path.exists():
+        for line in log_path.read_text().splitlines():
+            if line.strip():
+                try:
+                    records.append(_json.loads(line))
+                except Exception:
+                    pass
+    return records
+
+
+def test_load_gateway_user_client_logs_cli_role_by_default(monkeypatch, tmp_path):
+    """Requests made via _load_gateway_user_client are logged as role=cli by default."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(gateway_cmd._cli_request_logger, "_enabled", True)
+    monkeypatch.setattr(gateway_cmd._ui_request_logger, "_enabled", True)
+    monkeypatch.setattr(gateway_cmd, "_is_ui_server_process", False)
+    monkeypatch.setattr(gateway_cmd, "load_gateway_session", lambda: {"token": "axp_u_test", "base_url": "http://x"})
+
+    client = gateway_cmd._load_gateway_user_client()
+    client._http._on_request_complete("GET", "/api/v1/agents", 200, 50, 9999999999.0, "application/json")
+
+    log_path = gateway_core.api_requests_log_path()
+    records = _get_log_records(log_path)
+    assert records, "expected at least one log entry"
+    record = records[-1]
+    assert record["role"] == "cli"
+    assert record["method"] == "GET"
+    assert record["path"] == "/api/v1/agents"
+    assert record["status"] == 200
+    assert record["remaining"] == 50
+    assert record["content_type"] == "application/json"
+
+
+def test_load_gateway_user_client_logs_ui_server_role_in_ui_process(monkeypatch, tmp_path):
+    """Requests made in the UI server process are logged as role=ui_server."""
+    _isolate_gateway_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(gateway_cmd._cli_request_logger, "_enabled", True)
+    monkeypatch.setattr(gateway_cmd._ui_request_logger, "_enabled", True)
+    monkeypatch.setattr(gateway_cmd, "_is_ui_server_process", True)
+    monkeypatch.setattr(gateway_cmd, "load_gateway_session", lambda: {"token": "axp_u_test", "base_url": "http://x"})
+
+    client = gateway_cmd._load_gateway_user_client()
+    client._http._on_request_complete("GET", "/api/v1/agents", 200, 50, None, "application/json")
+
+    log_path = gateway_core.api_requests_log_path()
+    records = _get_log_records(log_path)
+    assert records, "expected at least one log entry"
+    assert records[-1]["role"] == "ui_server"
+    monkeypatch.setattr(gateway_cmd, "_is_ui_server_process", False)
+
+
+def test_request_logger_write_failure_prints_to_stderr(monkeypatch, tmp_path, capsys):
+    """_RequestLogger._write prints a warning to stderr on OSError instead of crashing."""
+    from ax_cli.gateway import _RequestLogger
+    monkeypatch.setenv("AX_LOG_API_REQUESTS", "1")
+    logger = _RequestLogger(role="test")
+
+    def bad_open(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("builtins.open", bad_open)
+    # Should not raise
+    logger._write("GET", "/test", 200, 99, None, agent_name=None, agent_id=None)
+    captured = capsys.readouterr()
+    assert "api-requests.log write failed" in captured.err
+    assert "disk full" in captured.err
