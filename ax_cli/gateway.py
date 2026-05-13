@@ -2928,8 +2928,8 @@ class _RequestLogger:
 
     def make_callback(self, *, agent_name: str | None = None, agent_id: str | None = None):
         """Return an on_request_complete callback capturing this logger's identity."""
-        def _cb(method: str, path: str, status: int, remaining: int | None, reset_at: float | None) -> None:
-            self._write(method, path, status, remaining, reset_at, agent_name=agent_name, agent_id=agent_id)
+        def _cb(method: str, path: str, status: int, remaining: int | None, reset_at: float | None, content_type: str = "") -> None:
+            self._write(method, path, status, remaining, reset_at, agent_name=agent_name, agent_id=agent_id, content_type=content_type)
         return _cb
 
     def _write(
@@ -2942,6 +2942,7 @@ class _RequestLogger:
         *,
         agent_name: str | None,
         agent_id: str | None,
+        content_type: str = "",
     ) -> None:
         if not self._enabled:
             return
@@ -2955,6 +2956,8 @@ class _RequestLogger:
             "path": path,
             "status": status,
         }
+        if content_type:
+            record["content_type"] = content_type
         if agent_name:
             record["agent_name"] = agent_name
         if agent_id:
