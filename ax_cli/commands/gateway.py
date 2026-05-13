@@ -174,6 +174,7 @@ def _resolve_gateway_login_token(explicit_token: str | None) -> str:
 
 _gateway_rate_limit_state = _RateLimitState(low_water=RATE_LIMIT_CLI_LOW_WATER)
 _cli_request_logger = _RequestLogger(role="cli")
+_is_ui_server_process = False  # set to True at UI server startup for correct log attribution
 
 
 def _load_gateway_user_client(request_logger: "_RequestLogger | None" = None) -> AxClient:
@@ -197,7 +198,7 @@ def _load_gateway_user_client(request_logger: "_RequestLogger | None" = None) ->
         )
         record_gateway_activity("rate_limit_wait", wait_seconds=wait_seconds, reset_at=reset_str)
 
-    logger = request_logger or _cli_request_logger
+    logger = request_logger or (_ui_request_logger if _is_ui_server_process else _cli_request_logger)
     return AxClient(
         base_url=str(session.get("base_url") or auth_cmd.DEFAULT_LOGIN_BASE_URL),
         token=token,
@@ -7118,6 +7119,8 @@ def ui(
             webbrowser.open_new_tab(url)
         except Exception:
             err_console.print("[yellow]Could not open a browser automatically.[/yellow]")
+    global _is_ui_server_process
+    _is_ui_server_process = True
     try:
         _gateway_rate_limit_state.warm(_load_gateway_user_client(request_logger=_ui_request_logger))
     except Exception:
