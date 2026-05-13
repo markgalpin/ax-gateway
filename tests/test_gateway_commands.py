@@ -7415,8 +7415,9 @@ def test_upstream_rate_limited_error_includes_retry_after_in_message(monkeypatch
 
 def _make_retry_client(*, on_rate_limit_wait=None, max_rate_limit_wait=120.0):
     """Build a _RetryOnAuthClient with a mock inner httpx.Client."""
-    from ax_cli.client import _RetryOnAuthClient
     import unittest.mock as mock
+
+    from ax_cli.client import _RetryOnAuthClient
     inner = mock.MagicMock()
     return _RetryOnAuthClient(
         inner,
@@ -7441,8 +7442,9 @@ def test_retry_client_no_wait_when_remaining_positive(monkeypatch):
     sleeps = []
     monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
 
-    from ax_cli.client import _RetryOnAuthClient
     import unittest.mock as mock
+
+    from ax_cli.client import _RetryOnAuthClient
     inner = mock.MagicMock()
     inner.get.return_value = _response_with_rate_limit(remaining=5, reset_at=_time.time() + 60)
     client = _RetryOnAuthClient(inner, get_fresh_jwt=None)
@@ -7457,8 +7459,9 @@ def test_retry_client_waits_when_exhausted(monkeypatch):
     monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
     reset_at = _time.time() + 30
 
-    from ax_cli.client import _RetryOnAuthClient
     import unittest.mock as mock
+
+    from ax_cli.client import _RetryOnAuthClient
     inner = mock.MagicMock()
     inner.get.return_value = _response_with_rate_limit(remaining=0, reset_at=reset_at)
     client = _RetryOnAuthClient(inner, get_fresh_jwt=None)
@@ -7476,8 +7479,9 @@ def test_retry_client_calls_callback_on_wait(monkeypatch):
     reset_at = _time.time() + 30
     calls = []
 
-    from ax_cli.client import _RetryOnAuthClient
     import unittest.mock as mock
+
+    from ax_cli.client import _RetryOnAuthClient
     inner = mock.MagicMock()
     inner.get.return_value = _response_with_rate_limit(remaining=0, reset_at=reset_at)
     client = _RetryOnAuthClient(
@@ -7500,8 +7504,9 @@ def test_retry_client_raises_preempted_when_wait_exceeds_max(monkeypatch):
     monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
     reset_at = _time.time() + 999
 
-    from ax_cli.client import _RetryOnAuthClient, RateLimitPreemptedError
     import unittest.mock as mock
+
+    from ax_cli.client import RateLimitPreemptedError, _RetryOnAuthClient
     inner = mock.MagicMock()
     inner.get.return_value = _response_with_rate_limit(remaining=0, reset_at=reset_at)
     client = _RetryOnAuthClient(inner, get_fresh_jwt=None, max_rate_limit_wait=30.0)

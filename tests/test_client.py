@@ -5,7 +5,14 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from ax_cli.client import AxClient, _mime_from_ext, _mime_from_filename, _RateLimitState, RateLimitPreemptedError, _RetryOnAuthClient
+from ax_cli.client import (
+    AxClient,
+    RateLimitPreemptedError,
+    _mime_from_ext,
+    _mime_from_filename,
+    _RateLimitState,
+    _RetryOnAuthClient,
+)
 
 
 class TestTokenClassSelection:
@@ -1029,3 +1036,37 @@ class TestRateLimitState:
         client_a.get("/api/v1/agents")   # records exhaustion on shared state
         client_b.get("/api/v1/agents")   # should sleep before making its request
         assert len(sleeps) == 1          # exactly one sleep from client_b's proactive wait
+
+    def test_missing_rate_limit_headers_do_not_update_state(self):
+        """Responses without x-ratelimit-remaining must not touch _RateLimitState."""
+        import time as _time
+        state = _RateLimitState()
+        state.record(remaining=50, reset_at=_time.time() + 30)
+
+        request = httpx.Request("GET", "https://example.com/api/v1/agents")
+        # Response with no rate-limit headers at all (e.g. CDN, health-check endpoint)
+        no_headers = httpx.Response(200, request=request)
+
+        inner = MagicMock()
+        inner.get.return_value = no_headers
+        client = _RetryOnAuthClient(inner, get_fresh_jwt=None, rate_limit_state=state)
+        client.get("/api/v1/agents")
+
+        assert state.remaining == 50  # unchanged
+        assert state.exhausted is False
+
+    def test_missing_rate_limit_headers_pass_none_to_callback(self):
+        """on_request_complete receives remaining=None when headers are absent."""
+        calls = []
+        request = httpx.Request("GET", "https://example.com/api/v1/agents")
+        no_headers = httpx.Response(200, request=request)
+
+        inner = MagicMock()
+        inner.get.return_value = no_headers
+        client = _RetryOnAuthClient(
+            inner,
+            get_fresh_jwt=None,
+            on_request_complete=lambda method, path, status, remaining, reset_at, ct="": calls.append(remaining),
+        )
+        client.get("/api/v1/agents")
+        assert calls == [None]
