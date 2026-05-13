@@ -211,20 +211,11 @@ def _create_agent_in_space(client, *, name: str, space_id: str, description: str
                     response=exc.response,
                 ) from exc
             if _is_route_miss(exc):
-                host = exc.response.url.host if exc.response.url else "the server"
-                raise httpx.HTTPStatusError(
-                    f"Agent creation API not available on {host} — "
-                    f"management routes /api/v1/agents/manage/create and /agents/manage/create "
-                    f"returned an HTML page instead of a JSON agent record "
-                    f"({_html_response_diag(exc.response)}). "
-                    f"The server is not routing these requests to the backend. "
-                    f"If the agent already exists on {host}, create it there first, "
-                    f"then re-run `ax gateway agents add` — the command will "
-                    f"find the existing agent automatically without trying to create it.",
-                    request=exc.request,
-                    response=exc.response,
-                ) from exc
-            raise
+                # Management routes not available on this backend — fall through
+                # to the legacy POST /api/v1/agents path below.
+                pass
+            else:
+                raise
 
     body: dict = {"name": name}
     if description is not None:
