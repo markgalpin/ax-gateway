@@ -33,7 +33,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .. import gateway as gateway_core
-from ..client import AxClient, RATE_LIMIT_MAX_WAIT, _RateLimitState
+from ..client import AxClient, RATE_LIMIT_CLI_LOW_WATER, RATE_LIMIT_MAX_WAIT, _RateLimitState
 from ..commands import auth as auth_cmd
 from ..commands.bootstrap import (
     _create_agent_in_space,
@@ -173,7 +173,7 @@ def _resolve_gateway_login_token(explicit_token: str | None) -> str:
     return auth_cmd._resolve_login_token(None)
 
 
-_gateway_rate_limit_state = _RateLimitState()
+_gateway_rate_limit_state = _RateLimitState(low_water=RATE_LIMIT_CLI_LOW_WATER)
 _cli_request_logger = _RequestLogger(role="cli")
 
 

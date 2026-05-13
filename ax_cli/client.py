@@ -146,7 +146,8 @@ def _check_honeypot(token: str, base_url: str) -> None:
 
 
 RATE_LIMIT_MAX_WAIT = 120.0  # shared cap for proactive and reactive rate-limit waits
-RATE_LIMIT_LOW_WATER = 10   # start waiting when remaining drops to this level, not 0
+RATE_LIMIT_LOW_WATER = 10   # daemon/UI: start waiting when remaining drops to this level
+RATE_LIMIT_CLI_LOW_WATER = 2  # CLI: only back off when nearly empty — leaves headroom for interactive ops
 
 
 class _RateLimitState:
@@ -192,12 +193,15 @@ class _RateLimitState:
             return
         import time as _time
         wait = max(0.0, self.reset_at - _time.time() + 0.5)
+        if wait == 0.0:
+            # Reset window has already passed — clear the flag and proceed.
+            self.exhausted = False
+            return
         if wait > max_wait:
             raise RateLimitPreemptedError(wait, self.reset_at)
-        if wait > 0:
-            if on_wait:
-                on_wait(wait, self.reset_at)
-            _time.sleep(wait)
+        if on_wait:
+            on_wait(wait, self.reset_at)
+        _time.sleep(wait)
         self.exhausted = False
 
 
@@ -264,7 +268,8 @@ class _RetryOnAuthClient:
             if self._on_request_complete:
                 method = r.request.method if r.request else "?"
                 path = r.request.url.path if r.request else "?"
-                self._on_request_complete(method, path, r.status_code, remaining, reset_ts or None)
+                content_type = r.headers.get("content-type", "")
+                self._on_request_complete(method, path, r.status_code, remaining, reset_ts or None, content_type)
         except (ValueError, TypeError):
             pass
 
