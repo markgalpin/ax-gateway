@@ -2222,14 +2222,6 @@ def _archive_managed_agent(name: str, *, reason: str | None = None, client_facto
         entry=entry,
         reason=str(reason).strip() if reason else None,
     )
-    user_client = client_factory() if client_factory is not None else _build_session_client_silent()
-    if user_client is not None:
-        from ..gateway import _post_lifecycle_signal as _signal
-
-        try:
-            _signal(user_client, entry, phase="archived", note=str(reason or "")[:240] or None)
-        except Exception:  # noqa: BLE001
-            pass
     return annotate_runtime_health(entry, registry=registry)
 
 
@@ -2255,14 +2247,6 @@ def _restore_managed_agent(name: str, *, client_factory=None) -> dict:
     entry["desired_state"] = prior if prior in {"running", "stopped"} else "stopped"
     save_gateway_registry(registry, merge_archive=False)
     record_gateway_activity("managed_agent_restored", entry=entry)
-    user_client = client_factory() if client_factory is not None else _build_session_client_silent()
-    if user_client is not None:
-        from ..gateway import _post_lifecycle_signal as _signal
-
-        try:
-            _signal(user_client, entry, phase="connected")
-        except Exception:  # noqa: BLE001
-            pass
     return annotate_runtime_health(entry, registry=registry)
 
 
