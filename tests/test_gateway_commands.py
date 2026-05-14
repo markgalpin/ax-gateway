@@ -24,7 +24,11 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _strip_ansi(text: str) -> str:
-    return ANSI_RE.sub("", text)
+    cleaned = ANSI_RE.sub("", text)
+    # Rich panels wrap long messages across lines with box-drawing chars;
+    # strip borders and collapse whitespace so substring assertions survive.
+    cleaned = re.sub(r"[│╭╮╰╯─]", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned)
 
 
 class _FakeTokenExchanger:
