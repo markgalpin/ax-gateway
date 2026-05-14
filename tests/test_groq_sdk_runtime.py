@@ -63,9 +63,25 @@ def _fake_chunk_with_tool_calls(tool_call_deltas):
 
 
 def _install_fake_groq(monkeypatch, fake_client):
-    """Swap `groq` in sys.modules so `from groq import Groq` returns our mock."""
+    """Swap `groq` in sys.modules so `from groq import Groq, ...` returns
+    our mock for the client and the REAL classes for the typed exception
+    hierarchy. The runtime catches Groq SDK exceptions by class, so the
+    typed exception classes must remain the real ones imported from the
+    installed `groq` package, otherwise the `except RateLimitError as e:`
+    catches would never fire."""
+    import groq as real_groq
+
     fake_module = types.ModuleType("groq")
     fake_module.Groq = MagicMock(return_value=fake_client)
+    # Re-export the typed exception classes that the runtime imports for its
+    # error-classification catch chain. Keeping the real classes means tests
+    # can raise actual Groq exceptions and exercise the matching catch arms.
+    fake_module.RateLimitError = real_groq.RateLimitError
+    fake_module.APITimeoutError = real_groq.APITimeoutError
+    fake_module.AuthenticationError = real_groq.AuthenticationError
+    fake_module.PermissionDeniedError = real_groq.PermissionDeniedError
+    fake_module.InternalServerError = real_groq.InternalServerError
+    fake_module.APIStatusError = real_groq.APIStatusError
     monkeypatch.setitem(sys.modules, "groq", fake_module)
     return fake_module
 
@@ -441,37 +457,166 @@ def test_groq_sdk_returns_iteration_limit_when_max_turns_exhausted(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "exception_message, expected_exit_reason, expected_text_substring",
+    "exc_kind, expected_exit_reason, expected_text_substring",
     [
-        ("HTTP 429: rate limit exceeded", "rate_limited", ""),
-        ("Connection timed out after 60s", "timeout", "timed out"),
-        ("Server returned malformed response", "crashed", "api error"),
+        ("rate_limit_429", "rate_limited", "rate-limited"),
+        ("api_timeout", "timeout", "timed out"),
+        ("auth_401", "auth_error", "authentication failed"),
+        ("permission_403", "auth_error", "authentication failed"),
+        ("server_500", "server_error", "500"),
+        ("api_status_400", "api_error", "400"),
+        ("generic_runtime_error", "crashed", "unexpected"),
     ],
 )
-def test_groq_sdk_classifies_api_open_error_by_message(
+def test_groq_sdk_classifies_api_open_error_by_exception_type(
     monkeypatch,
-    exception_message,
+    exc_kind,
     expected_exit_reason,
     expected_text_substring,
 ):
-    """When chat.completions.create itself raises before any chunk is yielded,
-    the runtime classifies the error string and returns the matching exit_reason."""
+    """When chat.completions.create raises a typed Groq exception, the runtime
+    classifies it by exception class (not by string-matching the message) and
+    returns the matching exit_reason with status-code-aware operator text.
+
+    Covers the full typed exception hierarchy:
+      - RateLimitError      → exit_reason="rate_limited"
+      - APITimeoutError     → exit_reason="timeout"
+      - AuthenticationError → exit_reason="auth_error"
+      - PermissionDeniedError → exit_reason="auth_error"
+      - InternalServerError → exit_reason="server_error"
+      - APIStatusError      → exit_reason="api_error"  (other 4xx)
+      - Catch-all Exception → exit_reason="crashed"   (non-SDK errors)
+    """
+    import httpx
+    from groq import (
+        APIStatusError,
+        APITimeoutError,
+        AuthenticationError,
+        InternalServerError,
+        PermissionDeniedError,
+        RateLimitError,
+    )
+
     from ax_cli.runtimes.hermes.runtimes import get_runtime
 
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
 
+    # Helper to construct a Groq APIStatusError-family instance with a
+    # synthetic httpx.Response carrying the requested status code.
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+
+    def _status_err(cls, code, msg):
+        return cls(msg, response=httpx.Response(code, request=request), body=None)
+
+    factories = {
+        "rate_limit_429": lambda: _status_err(RateLimitError, 429, "rate limited"),
+        "api_timeout": lambda: APITimeoutError(request=request),
+        "auth_401": lambda: _status_err(AuthenticationError, 401, "invalid api key"),
+        "permission_403": lambda: _status_err(PermissionDeniedError, 403, "forbidden"),
+        "server_500": lambda: _status_err(InternalServerError, 500, "server failed"),
+        "api_status_400": lambda: _status_err(APIStatusError, 400, "bad request"),
+        "generic_runtime_error": lambda: RuntimeError("network adapter exploded"),
+    }
+
     fake_client = MagicMock()
-    fake_client.chat.completions.create.side_effect = RuntimeError(exception_message)
+    fake_client.chat.completions.create.side_effect = factories[exc_kind]()
     _install_fake_groq(monkeypatch, fake_client)
 
     rt = get_runtime("groq_sdk")
     result = rt.execute("test prompt", workdir="/tmp")
 
     assert result.exit_reason == expected_exit_reason
-    if expected_text_substring:
-        assert expected_text_substring in result.text.lower()
-    else:
-        assert result.text == ""
+    assert expected_text_substring in result.text.lower()
+
+
+def test_groq_sdk_marks_truncated_tool_output(monkeypatch):
+    """Tool output exceeding TOOL_OUTPUT_CAP should be capped AND get a
+    visible truncation marker in the role=tool history message, so the
+    model can tell that content was clipped rather than fully delivered."""
+    import tools as tools_mod
+
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
+    from ax_cli.runtimes.hermes.runtimes.groq_sdk import TOOL_OUTPUT_CAP
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+
+    # Turn 1: one tool call. Turn 2: finalization.
+    turn1 = iter(
+        [
+            _fake_chunk_with_tool_calls(
+                [
+                    _fake_tool_call_delta(0, call_id="call_1", name="read_file", arguments='{"path":"/big"}'),
+                ]
+            ),
+        ]
+    )
+    turn2 = iter([_fake_chunk("done")])
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = [turn1, turn2]
+    _install_fake_groq(monkeypatch, fake_client)
+
+    # execute_tool returns output larger than the cap so the truncation
+    # branch triggers.
+    oversize_output = "A" * (TOOL_OUTPUT_CAP + 500)
+    monkeypatch.setattr(
+        tools_mod,
+        "execute_tool",
+        lambda name, args, workdir: tools_mod.ToolResult(output=oversize_output),
+    )
+
+    rt = get_runtime("groq_sdk")
+    result = rt.execute("read it", workdir="/tmp")
+
+    # Find the role=tool message that should carry the truncated content.
+    tool_msgs = [h for h in result.history if h.get("role") == "tool"]
+    assert tool_msgs, "Expected at least one role=tool history entry"
+    tool_content = tool_msgs[0]["content"]
+    # Length is capped at TOOL_OUTPUT_CAP plus the marker (~18 chars).
+    assert len(tool_content) <= TOOL_OUTPUT_CAP + 32
+    # Marker is present so the model knows content was clipped.
+    assert "[output truncated]" in tool_content
+    # The bulk of the original content still landed.
+    assert tool_content.startswith("A" * 100)
+
+
+def test_groq_sdk_does_not_mark_untruncated_tool_output(monkeypatch):
+    """Tool output that fits within TOOL_OUTPUT_CAP should NOT get the
+    truncation marker. Negative case complement to the truncation test."""
+    import tools as tools_mod
+
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+
+    turn1 = iter(
+        [
+            _fake_chunk_with_tool_calls(
+                [
+                    _fake_tool_call_delta(0, call_id="call_1", name="read_file", arguments='{"path":"/tiny"}'),
+                ]
+            ),
+        ]
+    )
+    turn2 = iter([_fake_chunk("done")])
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = [turn1, turn2]
+    _install_fake_groq(monkeypatch, fake_client)
+
+    monkeypatch.setattr(
+        tools_mod,
+        "execute_tool",
+        lambda name, args, workdir: tools_mod.ToolResult(output="small output"),
+    )
+
+    rt = get_runtime("groq_sdk")
+    result = rt.execute("read it", workdir="/tmp")
+
+    tool_msgs = [h for h in result.history if h.get("role") == "tool"]
+    assert tool_msgs
+    assert tool_msgs[0]["content"] == "small output"
+    assert "[output truncated]" not in tool_msgs[0]["content"]
 
 
 def test_groq_sdk_per_tool_deadline_aborts_remaining_tools(monkeypatch):

@@ -97,13 +97,30 @@ class GroqSDKRuntime(BaseRuntime):
             )
 
         try:
-            from groq import Groq
+            from groq import (
+                Groq,
+                RateLimitError,
+                APITimeoutError,
+                AuthenticationError,
+                PermissionDeniedError,
+                InternalServerError,
+                APIStatusError,
+            )
         except ImportError as e:
             # pyproject.toml does not declare `groq` as a hard dependency, so
             # packaged axctl installs (and the Docker image, which only runs
             # `pip install .`) will not have it. Surface a clean RuntimeResult
             # so the sentinel can render an actionable message instead of
             # crashing on a bare ModuleNotFoundError.
+            #
+            # Why bare `pip install` and not the managed `ax gateway runtime
+            # install groq_sdk` flow: the groq package is a single small wheel
+            # with no native code, no venv scaffolding, and no post-install
+            # verification needed (unlike hermes-agent, which the managed
+            # installer was built for per AUTOSETUP-001). Bare pip is enough
+            # for now. If groq_sdk grows native deps, multi-process state, or
+            # post-install verification needs, this is the right moment to
+            # move it under the managed-install allowlist.
             log.error(f"groq_sdk: groq Python SDK is not installed ({e})")
             return RuntimeResult(
                 text=(
@@ -173,41 +190,88 @@ class GroqSDKRuntime(BaseRuntime):
                     stream=True,
                     timeout=remaining,
                 )
-            except Exception as e:
-                error_str = str(e)
-                log.error(f"groq_sdk: API error opening stream: {error_str}")
-                is_timeout = (
-                    "timeout" in error_str.lower()
-                    or "timed out" in error_str.lower()
-                )
-                is_rate_limit = (
-                    "429" in error_str
-                    or "rate" in error_str.lower()
-                    or "usage_limit" in error_str.lower()
-                )
-                if is_timeout:
-                    return RuntimeResult(
-                        text=(
-                            final_text
-                            or "Agent timed out while waiting for the model."
-                        ),
-                        history=history,
-                        tool_count=tool_count,
-                        files_written=files_written,
-                        exit_reason="timeout",
-                        elapsed_seconds=int(time.time() - start_time),
-                    )
-                if is_rate_limit:
-                    return RuntimeResult(
-                        text="",
-                        history=history,
-                        tool_count=tool_count,
-                        files_written=files_written,
-                        exit_reason="rate_limited",
-                        elapsed_seconds=int(time.time() - start_time),
-                    )
+            except RateLimitError as e:
+                # 429. Throttle, surface the status code so the operator can
+                # tell rate-limit from auth-fail at a glance.
+                log.warning(f"groq_sdk: rate limited (HTTP {e.status_code}): {e.message}")
                 return RuntimeResult(
-                    text=final_text or "Agent encountered an API error and could not complete the task.",
+                    text=(
+                        final_text
+                        or f"Groq API rate-limited (HTTP {e.status_code}). Retry after a short delay."
+                    ),
+                    history=history,
+                    tool_count=tool_count,
+                    files_written=files_written,
+                    exit_reason="rate_limited",
+                    elapsed_seconds=int(time.time() - start_time),
+                )
+            except APITimeoutError as e:
+                # Connection or read timeout from the Groq SDK (httpx-backed).
+                # Distinct from a sentinel-budget timeout, but maps to the same
+                # exit_reason since the user-visible cause is identical.
+                log.error(f"groq_sdk: API timeout: {e}")
+                return RuntimeResult(
+                    text=(
+                        final_text
+                        or "Agent timed out while waiting for the model."
+                    ),
+                    history=history,
+                    tool_count=tool_count,
+                    files_written=files_written,
+                    exit_reason="timeout",
+                    elapsed_seconds=int(time.time() - start_time),
+                )
+            except (AuthenticationError, PermissionDeniedError) as e:
+                # 401 / 403. Operator-actionable. Never silently swallow auth
+                # failures — the user must see them in the chat reply so they
+                # can rotate or fix the GROQ_API_KEY.
+                log.error(f"groq_sdk: auth failed (HTTP {e.status_code}): {e.message}")
+                return RuntimeResult(
+                    text=f"Groq authentication failed (HTTP {e.status_code}). Check GROQ_API_KEY.",
+                    history=history,
+                    tool_count=tool_count,
+                    files_written=files_written,
+                    exit_reason="auth_error",
+                    elapsed_seconds=int(time.time() - start_time),
+                )
+            except InternalServerError as e:
+                # 5xx from Groq. Retry is plausible; signal that to the operator.
+                log.error(f"groq_sdk: server error (HTTP {e.status_code}): {e.message}")
+                return RuntimeResult(
+                    text=(
+                        final_text
+                        or f"Groq API returned HTTP {e.status_code}. Retry may succeed."
+                    ),
+                    history=history,
+                    tool_count=tool_count,
+                    files_written=files_written,
+                    exit_reason="server_error",
+                    elapsed_seconds=int(time.time() - start_time),
+                )
+            except APIStatusError as e:
+                # Any other 4xx not matched above (e.g. 400 BadRequest,
+                # 422 UnprocessableEntity, 404 NotFound). Surface the status
+                # and the message so the operator knows what to fix.
+                log.error(f"groq_sdk: API error (HTTP {e.status_code}): {e.message}")
+                return RuntimeResult(
+                    text=(
+                        final_text
+                        or f"Groq API error (HTTP {e.status_code}): {e.message}"
+                    ),
+                    history=history,
+                    tool_count=tool_count,
+                    files_written=files_written,
+                    exit_reason="api_error",
+                    elapsed_seconds=int(time.time() - start_time),
+                )
+            except Exception as e:
+                # Catch-all for anything outside the Groq SDK's typed exception
+                # hierarchy (network adapter bugs, connection refused before an
+                # APIConnectionError, etc.). Logged with full repr so the
+                # underlying type is visible in ops triage.
+                log.error(f"groq_sdk: unexpected error opening stream: {e!r}")
+                return RuntimeResult(
+                    text=final_text or "Agent encountered an unexpected error and could not complete the task.",
                     history=history,
                     tool_count=tool_count,
                     files_written=files_written,
@@ -344,11 +408,21 @@ class GroqSDKRuntime(BaseRuntime):
                     short = result.output[:200] if result.output else ""
                     cb.on_tool_end(name, short)
 
+                    # Cap tool output at TOOL_OUTPUT_CAP bytes to bound context
+                    # growth, and surface a truncation marker when we hit the
+                    # cap so the model can tell content was clipped (otherwise
+                    # it may reason as if it has the full output, e.g. assume a
+                    # large file was fully read).
+                    full_output = result.output or ""
+                    if len(full_output) > TOOL_OUTPUT_CAP:
+                        tool_content = full_output[:TOOL_OUTPUT_CAP] + "\n[output truncated]"
+                    else:
+                        tool_content = full_output
                     history.append(
                         {
                             "role": "tool",
                             "tool_call_id": tc["id"],
-                            "content": (result.output or "")[:TOOL_OUTPUT_CAP],
+                            "content": tool_content,
                         }
                     )
 
