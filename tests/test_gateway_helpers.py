@@ -9,12 +9,16 @@ with a real ~/.ax directory.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from ax_cli import gateway as gw
+from ax_cli.commands import gateway as gw_cmd
 
 # ---------------------------------------------------------------------------
 # ax_cli.gateway — pure helpers
@@ -2679,3 +2683,395 @@ class TestIsHermesPluginRuntime:
 
         assert _is_hermes_plugin_runtime("hermes_plugin") is True
         assert _is_hermes_plugin_runtime("hermes_sentinel") is False
+
+
+# ---------------------------------------------------------------------------
+# Unique classes migrated from test_gateway_coverage.py
+# ---------------------------------------------------------------------------
+
+
+class TestAttachedSessionLogIsReady:
+    def test_no_path(self):
+        assert gw._attached_session_log_is_ready(None) is False
+        assert gw._attached_session_log_is_ready("") is False
+
+    def test_nonexistent_path(self):
+        assert gw._attached_session_log_is_ready("/tmp/nonexistent_log_12345.txt") is False
+
+    def test_with_listening_marker(self, tmp_path):
+        log = tmp_path / "test.log"
+        log.write_text("Starting up\nListening for channel messages\nReady")
+        assert gw._attached_session_log_is_ready(str(log)) is True
+
+    def test_with_ax_channel_marker(self, tmp_path):
+        log = tmp_path / "test.log"
+        log.write_text("Starting up\nConnected to ax-channel\nReady")
+        assert gw._attached_session_log_is_ready(str(log)) is True
+
+    def test_without_marker(self, tmp_path):
+        log = tmp_path / "test.log"
+        log.write_text("Starting up\nLoading model\n")
+        assert gw._attached_session_log_is_ready(str(log)) is False
+
+
+class TestB64UrlEncoding:
+    def test_roundtrip(self):
+        original = b"hello world! This is a test."
+        encoded = gw._b64url_encode(original)
+        decoded = gw._b64url_decode(encoded)
+        assert decoded == original
+
+    def test_no_padding_in_encoded(self):
+        encoded = gw._b64url_encode(b"test")
+        assert "=" not in encoded
+
+
+class TestComposeAgentSystemPrompt:
+    def test_with_operator_prompt(self):
+        entry = {"system_prompt": "You are a helpful bot.", "name": "test", "base_url": "https://paxai.app"}
+        result = gw._compose_agent_system_prompt(entry)
+        assert "You are a helpful bot" in result
+        assert "aX environment context" in result
+
+    def test_skip_environment(self):
+        entry = {
+            "system_prompt": "Just the prompt.",
+            "system_prompt_skip_environment": "true",
+        }
+        result = gw._compose_agent_system_prompt(entry)
+        assert result == "Just the prompt."
+        assert "aX environment context" not in result
+
+    def test_no_prompt_still_has_environment(self):
+        entry = {"name": "test"}
+        result = gw._compose_agent_system_prompt(entry)
+        assert result is not None
+        assert "aX environment context" in result
+
+
+class TestEntryRequiresOperatorApproval:
+    def test_pass_through_requires(self):
+        assert gw._entry_requires_operator_approval({"template_id": "pass_through"}) is True
+
+    def test_explicit_flag(self):
+        assert gw._entry_requires_operator_approval({"requires_approval": True}) is True
+
+    def test_echo_does_not_require(self):
+        assert gw._entry_requires_operator_approval({"template_id": "echo_test"}) is False
+
+
+class TestGenerateSessionChallengeCode:
+    def test_returns_string(self):
+        code = gw_cmd._generate_session_challenge_code()
+        assert isinstance(code, str)
+        assert len(code) > 0
+
+    def test_uppercase(self):
+        code = gw_cmd._generate_session_challenge_code()
+        assert code == code.upper()
+
+    def test_unique(self):
+        codes = {gw_cmd._generate_session_challenge_code() for _ in range(10)}
+        assert len(codes) > 1
+
+
+class TestHermesPluginHome:
+    def test_explicit_home(self):
+        result = gw._hermes_plugin_home({"hermes_home": "/custom/hermes"})
+        assert str(result) == "/custom/hermes"
+
+    def test_default_under_workdir(self):
+        result = gw._hermes_plugin_home({"workdir": "/agent/work"})
+        assert str(result) == "/agent/work/.hermes"
+
+
+class TestHermesPluginWorkdir:
+    def test_explicit_workdir(self):
+        result = gw._hermes_plugin_workdir({"workdir": "/custom/path"})
+        assert str(result) == "/custom/path"
+
+    def test_default_workdir(self):
+        result = gw._hermes_plugin_workdir({"name": "test-agent"})
+        assert "test-agent" in str(result)
+
+
+class TestHermesRepoCandidates:
+    def test_with_entry_path(self):
+        candidates = gw._hermes_repo_candidates({"hermes_repo_path": "/custom/hermes"})
+        assert Path("/custom/hermes") in candidates
+
+    def test_with_env_var(self, monkeypatch):
+        monkeypatch.setenv("HERMES_REPO_PATH", "/env/hermes")
+        candidates = gw._hermes_repo_candidates({})
+        assert Path("/env/hermes") in candidates
+
+    def test_deduplicates(self):
+        candidates = gw._hermes_repo_candidates({"hermes_repo_path": str(Path.home() / "hermes-agent")})
+        paths = [str(c) for c in candidates]
+        assert len(paths) == len(set(paths))
+
+    def test_home_fallback_always_included(self, monkeypatch):
+        monkeypatch.delenv("HERMES_REPO_PATH", raising=False)
+        candidates = gw._hermes_repo_candidates({})
+        assert Path.home() / "hermes-agent" in candidates
+
+
+class TestHermesSentinelModel:
+    def test_hermes_model_field(self):
+        assert gw._hermes_sentinel_model({"hermes_model": "codex:gpt-4"}) == "codex:gpt-4"
+
+    def test_sentinel_model_field(self):
+        assert gw._hermes_sentinel_model({"sentinel_model": "my-model"}) == "my-model"
+
+    def test_runtime_model(self):
+        assert gw._hermes_sentinel_model({"runtime_model": "rt-model"}) == "rt-model"
+
+    def test_default_from_env(self, monkeypatch):
+        monkeypatch.delenv("AX_GATEWAY_HERMES_MODEL", raising=False)
+        result = gw._hermes_sentinel_model({})
+        assert result
+
+
+class TestLoadGatewaySessionOrExit:
+    def test_exits_when_no_session(self, monkeypatch, tmp_path):
+        import typer
+
+        monkeypatch.setenv("AX_CONFIG_DIR", str(tmp_path / "config"))
+        with pytest.raises(typer.Exit):
+            gw_cmd._load_gateway_session_or_exit()
+
+    def test_returns_session_when_exists(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AX_CONFIG_DIR", str(tmp_path / "config"))
+        gw.save_gateway_session({"token": "axp_u_test", "base_url": "https://paxai.app"})
+        session = gw_cmd._load_gateway_session_or_exit()
+        assert session["token"] == "axp_u_test"
+
+
+class TestLoadGatewayUserClient:
+    def test_no_session_exits(self, monkeypatch, tmp_path):
+        import typer
+
+        monkeypatch.setenv("AX_CONFIG_DIR", str(tmp_path / "config"))
+        with pytest.raises(typer.Exit):
+            gw_cmd._load_gateway_user_client()
+
+    def test_missing_token_exits(self, monkeypatch, tmp_path):
+        import typer
+
+        monkeypatch.setenv("AX_CONFIG_DIR", str(tmp_path / "config"))
+        gw.save_gateway_session({"base_url": "https://paxai.app"})
+        with pytest.raises(typer.Exit):
+            gw_cmd._load_gateway_user_client()
+
+    def test_non_user_token_exits(self, monkeypatch, tmp_path):
+        import typer
+
+        monkeypatch.setenv("AX_CONFIG_DIR", str(tmp_path / "config"))
+        gw.save_gateway_session({"token": "axp_a_agent.token", "base_url": "https://paxai.app"})
+        with pytest.raises(typer.Exit):
+            gw_cmd._load_gateway_user_client()
+
+    def test_valid_session_returns_client(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AX_CONFIG_DIR", str(tmp_path / "config"))
+        gw.save_gateway_session({"token": "axp_u_test.token", "base_url": "https://paxai.app"})
+        client = gw_cmd._load_gateway_user_client()
+        assert client is not None
+        client.close()
+
+
+class TestLocalOriginSignature:
+    def test_excludes_agent_name(self):
+        fp = {"exe_path": "/usr/bin/python3", "cwd": "/home/user", "user": "testuser"}
+        sig1 = gw_cmd._local_origin_signature(fp)
+        assert sig1.startswith("sha256:")
+
+
+class TestLocalProcessFingerprint:
+    def test_returns_expected_keys(self, monkeypatch):
+        monkeypatch.setattr(gw, "_file_sha256", lambda p: "sha256:abc")
+        fp = gw_cmd._local_process_fingerprint(agent_name="test-agent")
+        assert fp["agent_name"] == "test-agent"
+        assert "pid" in fp
+        assert "cwd" in fp
+        assert "exe_path" in fp
+        assert "user" in fp
+        assert "platform" in fp
+
+
+class TestLocalTrustSignature:
+    def test_deterministic(self):
+        fp = {"exe_path": "/usr/bin/python3", "cwd": "/home/user", "user": "testuser"}
+        sig1 = gw_cmd._local_trust_signature("agent", fp)
+        sig2 = gw_cmd._local_trust_signature("agent", fp)
+        assert sig1 == sig2
+        assert sig1.startswith("sha256:")
+
+
+class TestPidIsAlive:
+    def test_zero_pid(self):
+        assert gw._pid_is_alive(0) is False
+
+    def test_none_pid(self):
+        assert gw._pid_is_alive(None) is False
+
+    def test_negative_pid(self):
+        assert gw._pid_is_alive(-1) is False
+
+    def test_non_numeric(self):
+        assert gw._pid_is_alive("abc") is False
+
+    def test_current_pid_is_alive(self):
+        assert gw._pid_is_alive(os.getpid()) is True
+
+
+class TestSentinelModel:
+    def test_model_field(self):
+        assert gw._sentinel_model({"model": "gpt-4"}, "claude") == "gpt-4"
+
+    def test_runtime_specific_field(self):
+        assert gw._sentinel_model({"claude_model": "claude-3"}, "claude") == "claude-3"
+
+    def test_none_when_unset(self):
+        assert gw._sentinel_model({}, "claude") is None
+
+
+class TestSentinelRuntimeName:
+    def test_default_claude(self):
+        assert gw._sentinel_runtime_name({}) == "claude"
+
+    def test_codex_cli_runtime_type(self):
+        assert gw._sentinel_runtime_name({"runtime_type": "codex_cli"}) == "codex"
+
+    def test_configured_codex(self):
+        assert gw._sentinel_runtime_name({"sentinel_runtime": "codex_cli"}) == "codex"
+
+    def test_configured_claude(self):
+        assert gw._sentinel_runtime_name({"sentinel_runtime": "claude_cli"}) == "claude"
+
+
+class TestSentinelSessionKey:
+    def test_agent_scope(self):
+        entry = {"space_id": "s1", "name": "bot"}
+        key = gw._sentinel_session_key(entry, None, "msg-1")
+        assert "s1" in key and "bot" in key
+
+    def test_message_scope(self):
+        entry = {"sentinel_session_scope": "message"}
+        key = gw._sentinel_session_key(entry, None, "msg-42")
+        assert key == "msg-42"
+
+    def test_thread_scope_with_parent(self):
+        entry = {"sentinel_session_scope": "thread"}
+        data = {"parent_id": "thread-1"}
+        key = gw._sentinel_session_key(entry, data, "msg-42")
+        assert key == "thread-1"
+
+    def test_thread_scope_no_parent(self):
+        entry = {"sentinel_session_scope": "thread"}
+        key = gw._sentinel_session_key(entry, {}, "msg-42")
+        assert key == "msg-42"
+
+
+class TestSentinelSessionScope:
+    def test_default_agent(self):
+        assert gw._sentinel_session_scope({}) == "agent"
+
+    def test_thread_scope(self):
+        assert gw._sentinel_session_scope({"sentinel_session_scope": "thread"}) == "thread"
+
+    def test_message_scope(self):
+        assert gw._sentinel_session_scope({"session_scope": "message"}) == "message"
+
+    def test_invalid_scope_defaults_to_agent(self):
+        assert gw._sentinel_session_scope({"sentinel_session_scope": "invalid"}) == "agent"
+
+
+class TestSentinelToolSummary:
+    def test_read_file(self):
+        assert "Reading" in gw._sentinel_tool_summary("read", {"file_path": "/tmp/test.py"})
+
+    def test_write_file(self):
+        assert "Writing" in gw._sentinel_tool_summary("write", {"file_path": "/tmp/out.py"})
+
+    def test_edit_file(self):
+        assert "Editing" in gw._sentinel_tool_summary("edit", {"file_path": "/tmp/fix.py"})
+
+    def test_bash(self):
+        assert "Running" in gw._sentinel_tool_summary("bash", {"command": "ls -la"})
+
+    def test_grep(self):
+        assert "Searching" in gw._sentinel_tool_summary("grep", {"pattern": "TODO"})
+
+    def test_glob(self):
+        assert "Finding" in gw._sentinel_tool_summary("glob", {"pattern": "*.py"})
+
+    def test_unknown_tool(self):
+        assert "Using my_tool" in gw._sentinel_tool_summary("my_tool", {})
+
+    def test_read_no_path(self):
+        assert "Reading file" in gw._sentinel_tool_summary("read", {})
+
+    def test_bash_no_command(self):
+        assert "Running command" in gw._sentinel_tool_summary("bash", {})
+
+
+class TestSpaceNameFromCache:
+    def test_found(self):
+        spaces = [{"space_id": "s1", "name": "My Space"}]
+        assert gw._space_name_from_cache(spaces, "s1") == "My Space"
+
+    def test_not_found(self):
+        spaces = [{"space_id": "s1", "name": "My Space"}]
+        assert gw._space_name_from_cache(spaces, "s2") is None
+
+    def test_empty_space_id(self):
+        assert gw._space_name_from_cache([], None) is None
+        assert gw._space_name_from_cache([], "") is None
+
+
+class TestSummarizeSentinelCommand:
+    def test_apply_patch(self):
+        assert "Applying patch" in gw._summarize_sentinel_command("apply_patch file.diff")
+
+    def test_grep_command(self):
+        assert "Searching" in gw._summarize_sentinel_command("rg pattern src/")
+
+    def test_cat_command(self):
+        assert "Reading" in gw._summarize_sentinel_command("cat /tmp/file.txt")
+
+    def test_pytest_command(self):
+        assert "Running tests" in gw._summarize_sentinel_command("pytest tests/")
+
+    def test_uv_run(self):
+        assert "Running tests" in gw._summarize_sentinel_command("uv run pytest")
+
+    def test_generic_command(self):
+        result = gw._summarize_sentinel_command("echo hello")
+        assert "Running:" in result
+
+    def test_long_command_truncated(self):
+        long_cmd = "echo " + "a" * 200
+        result = gw._summarize_sentinel_command(long_cmd)
+        assert result.endswith("...")
+
+
+class TestUpstreamRateLimitedError:
+    def test_basic(self):
+        import httpx
+
+        request = httpx.Request("GET", "https://paxai.app/api/v1/spaces")
+        response = httpx.Response(429, request=request, headers={"retry-after": "30"})
+        exc = httpx.HTTPStatusError("429", request=request, response=response)
+        rate_err = gw_cmd.UpstreamRateLimitedError(exc, retries_attempted=3)
+        assert rate_err.retries_attempted == 3
+        assert rate_err.retry_after_seconds == 30
+        assert "3 retries" in str(rate_err)
+
+    def test_no_retry_after_header(self):
+        import httpx
+
+        request = httpx.Request("GET", "https://paxai.app")
+        response = httpx.Response(429, request=request)
+        exc = httpx.HTTPStatusError("429", request=request, response=response)
+        rate_err = gw_cmd.UpstreamRateLimitedError(exc, retries_attempted=2)
+        assert rate_err.retry_after_seconds is None
