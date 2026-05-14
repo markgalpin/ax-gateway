@@ -107,6 +107,7 @@ class TestTokenExchanger:
             from unittest.mock import MagicMock
 
             import httpx
+
             resp = MagicMock(spec=httpx.Response)
             resp.status_code = 200
             resp.json.return_value = {
@@ -117,6 +118,7 @@ class TestTokenExchanger:
             return resp
 
         import httpx
+
         monkeypatch.setattr(httpx, "post", make_response)
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".ax").mkdir()
@@ -156,8 +158,9 @@ class TestTokenExchanger:
         assert body["agent_id"] == "my-agent-uuid"
         assert body["requested_token_class"] == "agent_access"
 
-
-    def test_agent_name_ttl_and_resource_included_in_exchange(self, tmp_path, monkeypatch, sample_agent_pat, mock_exchange):
+    def test_agent_name_ttl_and_resource_included_in_exchange(
+        self, tmp_path, monkeypatch, sample_agent_pat, mock_exchange
+    ):
         mock_post = mock_exchange()
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".ax").mkdir()
@@ -235,9 +238,7 @@ class TestTokenExchanger:
         mode = cache_file.stat().st_mode & 0o777
         assert mode == 0o600
 
-    def test_invalidate_drops_in_memory_and_disk_entries(
-        self, tmp_path, monkeypatch, sample_pat, mock_exchange
-    ):
+    def test_invalidate_drops_in_memory_and_disk_entries(self, tmp_path, monkeypatch, sample_pat, mock_exchange):
         """invalidate() removes every cached JWT minted from the same PAT."""
         mock_post = mock_exchange()
         monkeypatch.chdir(tmp_path)
@@ -269,9 +270,7 @@ class TestTokenExchanger:
         exchanger.get_token("user_access", scope="messages")
         assert mock_post.call_count == prior_calls + 1
 
-    def test_invalidate_keeps_other_pats_entries(
-        self, tmp_path, monkeypatch, mock_exchange
-    ):
+    def test_invalidate_keeps_other_pats_entries(self, tmp_path, monkeypatch, mock_exchange):
         """invalidate() must not drop entries belonging to other PATs."""
         mock_exchange()
         monkeypatch.chdir(tmp_path)
@@ -296,9 +295,7 @@ class TestTokenExchanger:
         remaining_pats = {entry["pat_key_id"] for entry in after.values()}
         assert remaining_pats == {"KeyBeta"}
 
-    def test_disk_cache_loads_on_windows_despite_loose_mode(
-        self, tmp_path, monkeypatch, sample_pat, mock_exchange
-    ):
+    def test_disk_cache_loads_on_windows_despite_loose_mode(self, tmp_path, monkeypatch, sample_pat, mock_exchange):
         """Regression: on Windows the cache file reports 0o666 via stat() and was
         being deleted on every CLI invocation. With sys.platform == 'win32' the
         loader must skip the mode check entirely and reuse the cache."""

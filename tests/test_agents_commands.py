@@ -305,7 +305,6 @@ def test_agents_discover_with_ping_classifies_listener(monkeypatch):
     assert row["next_step"] == "handoff_now"
     assert row["commands"]["ping"] == "axctl agents ping @backend_sentinel --timeout 10 --space-id space-1"
     assert any(
-        "Live-listener fast path" in item and "--space-id space-1" in item
-        for item in data["coordination_checklist"]
+        "Live-listener fast path" in item and "--space-id space-1" in item for item in data["coordination_checklist"]
     )
     assert calls["messages"][0]["content"].startswith("@backend_sentinel Contact-mode ping")

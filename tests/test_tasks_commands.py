@@ -2,6 +2,18 @@ import json
 
 from typer.testing import CliRunner
 
+from ax_cli.commands.tasks import (
+    _agent_items as task_agent_items,
+)
+from ax_cli.commands.tasks import (
+    _agent_names,
+    _annotate_task_space,
+    _resolve_assignee_id,
+    _space_summary,
+)
+from ax_cli.commands.tasks import (
+    _space_items as task_space_items,
+)
 from ax_cli.main import app
 
 runner = CliRunner()
@@ -438,3 +450,130 @@ def test_tasks_update_requires_at_least_one_field(monkeypatch):
     assert "--priority" in result.output
     assert "--status" in result.output
     assert "--assign-to" in result.output
+
+
+# ---- Task helper functions ----
+
+
+def test_task_agent_items_list():
+    assert task_agent_items([{"name": "a"}, {"name": "b"}]) == [{"name": "a"}, {"name": "b"}]
+
+
+def test_task_agent_items_dict():
+    assert task_agent_items({"agents": [{"name": "a"}]}) == [{"name": "a"}]
+
+
+def test_task_agent_items_non_dict():
+    assert task_agent_items("string") == []
+
+
+def test_task_agent_items_filters_non_dicts():
+    assert task_agent_items([{"name": "a"}, "not-dict", 42]) == [{"name": "a"}]
+
+
+def test_agent_names_all_fields():
+    agent = {"name": "Alice", "username": "alice_bot", "handle": "@Alice", "display_name": "Alice B"}
+    names = _agent_names(agent)
+    assert "alice" in names
+    assert "alice_bot" in names
+    assert "alice b" in names
+
+
+def test_agent_names_empty():
+    assert _agent_names({}) == set()
+
+
+def test_agent_names_strips_at():
+    assert "bob" in _agent_names({"handle": "@bob"})
+
+
+def test_task_space_items_list():
+    assert task_space_items([{"id": "s1"}]) == [{"id": "s1"}]
+
+
+def test_task_space_items_dict():
+    assert task_space_items({"spaces": [{"id": "s1"}]}) == [{"id": "s1"}]
+
+
+def test_annotate_task_space_basic():
+    task = {"title": "test"}
+    space = {"id": "s1", "label": "my-space", "slug": "my-space", "name": "My Space"}
+    result = _annotate_task_space(task, space)
+    assert result["space_id"] == "s1"
+    assert result["space_slug"] == "my-space"
+    assert result["space_name"] == "My Space"
+
+
+def test_annotate_task_space_no_slug():
+    task = {"title": "test"}
+    space = {"id": "s1", "label": "s1"}
+    result = _annotate_task_space(task, space)
+    assert result["space_id"] == "s1"
+    assert "space_slug" not in result
+
+
+def test_space_summary_found():
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    client.list_spaces.return_value = [{"id": "s1", "slug": "my-space", "name": "My Space"}]
+    result = _space_summary(client, "s1")
+    assert result["id"] == "s1"
+    assert result["slug"] == "my-space"
+    assert result["label"] == "my-space"
+
+
+def test_space_summary_not_found():
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    client.list_spaces.return_value = [{"id": "s2"}]
+    result = _space_summary(client, "s1")
+    assert result["id"] == "s1"
+    assert result["label"] == "s1"
+
+
+def test_space_summary_exception():
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    client.list_spaces.side_effect = Exception("network error")
+    result = _space_summary(client, "s1")
+    assert result["id"] == "s1"
+
+
+def test_resolve_assignee_id_none():
+    assert _resolve_assignee_id(None, None, space_id="s1") is None
+
+
+def test_resolve_assignee_id_empty():
+    assert _resolve_assignee_id(None, "  ", space_id="s1") is None
+
+
+def test_resolve_assignee_id_uuid():
+    result = _resolve_assignee_id(None, "12345678-1234-1234-1234-123456789abc", space_id="s1")
+    assert result == "12345678-1234-1234-1234-123456789abc"
+
+
+def test_resolve_assignee_id_by_name():
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    client.list_agents.return_value = [
+        {"id": "agent-1", "name": "alice"},
+        {"id": "agent-2", "name": "bob"},
+    ]
+    result = _resolve_assignee_id(client, "@alice", space_id="s1")
+    assert result == "agent-1"
+
+
+def test_resolve_assignee_id_not_found():
+    from unittest.mock import MagicMock
+
+    import pytest
+    from click.exceptions import Exit
+
+    client = MagicMock()
+    client.list_agents.return_value = [{"id": "agent-1", "name": "alice"}]
+    with pytest.raises(Exit):
+        _resolve_assignee_id(client, "ghost", space_id="s1")

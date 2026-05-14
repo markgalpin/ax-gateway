@@ -21,14 +21,7 @@ def test_merge_explicit_mentions_metadata_preserves_existing_values():
 
 
 def test_extract_skips_mentions_inside_fenced_code_blocks():
-    content = (
-        "Heads up @real_agent, here's the fix:\n"
-        "```python\n"
-        "@decorator\n"
-        "def handler(): pass\n"
-        "```\n"
-        "let me know."
-    )
+    content = "Heads up @real_agent, here's the fix:\n```python\n@decorator\ndef handler(): pass\n```\nlet me know."
     assert extract_explicit_mentions(content) == ["real_agent"]
 
 
@@ -50,22 +43,12 @@ def test_extract_handles_unclosed_fence_conservatively():
 
 
 def test_extract_keeps_mention_when_fence_closes_before_it():
-    content = (
-        "```python\n"
-        "@decorator\n"
-        "```\n"
-        "@real_agent please review"
-    )
+    content = "```python\n@decorator\n```\n@real_agent please review"
     assert extract_explicit_mentions(content) == ["real_agent"]
 
 
 def test_merge_metadata_drops_code_block_mentions():
     metadata = {"routing": {"mode": "reply_target"}}
-    content = (
-        "Pinging @nemotron — here's the snippet:\n"
-        "```python\n"
-        "@decorator\n"
-        "```\n"
-    )
+    content = "Pinging @nemotron — here's the snippet:\n```python\n@decorator\n```\n"
     merged = merge_explicit_mentions_metadata(metadata, content)
     assert merged == {"routing": {"mode": "reply_target"}, "mentions": ["nemotron"]}

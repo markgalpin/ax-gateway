@@ -91,7 +91,7 @@ def test_warning_detects_value_mismatch():
     assert dropped == ["--bio"]
 
 
-# ── integration tests: `ax agents update` command ──────────────────────────
+# ── command-path tests: `ax agents update` (mocked client) ─────────────────
 
 
 def test_update_no_warning_when_server_echoes(monkeypatch):
@@ -142,7 +142,7 @@ def test_update_no_warning_when_description_only(monkeypatch):
     assert "Warning" not in result.stderr
 
 
-# ── integration tests: bootstrap _polish_metadata ───────────────────────────
+# ── bootstrap helper tests (mocked client) ──────────────────────────────────
 
 
 def test_polish_metadata_warns_when_server_drops(capsys):

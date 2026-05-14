@@ -244,9 +244,7 @@ def test_scaffold_appends_ax_platform_alongside_existing_enabled_plugins(tmp_pat
     fake_home = tmp_path / "operator-home"
     operator_hermes = fake_home / ".hermes"
     operator_hermes.mkdir(parents=True)
-    (operator_hermes / "config.yaml").write_text(
-        yaml.safe_dump({"plugins": {"enabled": ["disk-cleanup", "spotify"]}})
-    )
+    (operator_hermes / "config.yaml").write_text(yaml.safe_dump({"plugins": {"enabled": ["disk-cleanup", "spotify"]}}))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
 
     entry = _base_entry(tmp_path)
