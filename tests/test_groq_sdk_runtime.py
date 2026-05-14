@@ -21,7 +21,9 @@ import pytest  # noqa: F401  (pytest is the test runner; import keeps tooling ha
 # Replicate that here so the same import path resolves under pytest.
 _HERMES_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "ax_cli", "runtimes", "hermes",
+    "ax_cli",
+    "runtimes",
+    "hermes",
 )
 if _HERMES_DIR not in sys.path:
     sys.path.insert(0, _HERMES_DIR)
@@ -32,8 +34,8 @@ if _HERMES_DIR not in sys.path:
 # REGISTRY is fully empty).
 from ax_cli.runtimes.hermes.runtimes import groq_sdk  # noqa: F401, E402
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────
+
 
 def _fake_chunk(content: str | None):
     """Build a duck-typed chat.completions chunk holding a single delta."""
@@ -94,6 +96,7 @@ class _RecordingCallback:
 
 # ── Tests ──────────────────────────────────────────────────────────────────
 
+
 def test_groq_sdk_registers_under_expected_name():
     from ax_cli.runtimes.hermes.runtimes import get_runtime
 
@@ -122,10 +125,12 @@ def test_groq_sdk_streams_chunks_and_accumulates_history(monkeypatch):
 
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
     fake_client = MagicMock()
-    fake_client.chat.completions.create.return_value = iter([
-        _fake_chunk("Hello "),
-        _fake_chunk("world."),
-    ])
+    fake_client.chat.completions.create.return_value = iter(
+        [
+            _fake_chunk("Hello "),
+            _fake_chunk("world."),
+        ]
+    )
     _install_fake_groq(monkeypatch, fake_client)
 
     rt = get_runtime("groq_sdk")
@@ -180,25 +185,32 @@ def test_groq_sdk_threads_system_prompt_into_messages(monkeypatch):
 def test_groq_sdk_dispatches_tool_call_and_continues_to_final_answer(monkeypatch):
     """Model emits a tool_call streamed across chunks; runtime executes it, threads
     the result into history with role=tool, and finalizes on the next turn."""
-    from ax_cli.runtimes.hermes.runtimes import get_runtime
     # Production code imports `from tools import ...` (absolute) because the
     # hermes sentinel puts ax_cli/runtimes/hermes on sys.path. We do the same
     # in module setup above, so this import lands on the same module object
     # that the runtime will read.
     import tools as tools_mod
 
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
+
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
 
     # Turn 1: tool_call streamed across two chunks. First chunk carries
     # id + name; second chunk only accumulates arguments.
-    turn1 = iter([
-        _fake_chunk_with_tool_calls([
-            _fake_tool_call_delta(0, call_id="call_abc", name="read_file", arguments=""),
-        ]),
-        _fake_chunk_with_tool_calls([
-            _fake_tool_call_delta(0, arguments='{"path": "/etc/hostname"}'),
-        ]),
-    ])
+    turn1 = iter(
+        [
+            _fake_chunk_with_tool_calls(
+                [
+                    _fake_tool_call_delta(0, call_id="call_abc", name="read_file", arguments=""),
+                ]
+            ),
+            _fake_chunk_with_tool_calls(
+                [
+                    _fake_tool_call_delta(0, arguments='{"path": "/etc/hostname"}'),
+                ]
+            ),
+        ]
+    )
     # Turn 2: plain text finalization.
     turn2 = iter([_fake_chunk("The hostname is foo.")])
 
@@ -263,10 +275,7 @@ def test_groq_sdk_preserves_partial_text_on_mid_stream_error(monkeypatch):
     # Partial text preserved in both the RuntimeResult and history.
     assert result.text == "Partial reply"
     assert result.exit_reason == "crashed"
-    assert any(
-        h.get("role") == "assistant" and h.get("content") == "Partial reply"
-        for h in result.history
-    )
+    assert any(h.get("role") == "assistant" and h.get("content") == "Partial reply" for h in result.history)
     # Text is buffered locally during the stream and is never emitted as
     # incremental deltas, so the callback sees no on_text_delta calls even
     # though the partial text is preserved in result.text and history.
@@ -298,9 +307,10 @@ def test_groq_sdk_clamps_tool_timeout_to_remaining_budget(monkeypatch):
     listener past the operator's --timeout."""
     from itertools import chain, repeat
 
+    import tools as tools_mod
+
     from ax_cli.runtimes.hermes.runtimes import get_runtime
     from ax_cli.runtimes.hermes.runtimes import groq_sdk as groq_mod
-    import tools as tools_mod
 
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
 
@@ -311,16 +321,20 @@ def test_groq_sdk_clamps_tool_timeout_to_remaining_budget(monkeypatch):
     monkeypatch.setattr(groq_mod.time, "time", lambda: next(clock))
 
     # Turn 1: one bash tool call asking for a 600-second budget.
-    turn1 = iter([
-        _fake_chunk_with_tool_calls([
-            _fake_tool_call_delta(
-                0,
-                call_id="call_bash",
-                name="bash",
-                arguments='{"command":"sleep 999","timeout":600}',
+    turn1 = iter(
+        [
+            _fake_chunk_with_tool_calls(
+                [
+                    _fake_tool_call_delta(
+                        0,
+                        call_id="call_bash",
+                        name="bash",
+                        arguments='{"command":"sleep 999","timeout":600}',
+                    ),
+                ]
             ),
-        ]),
-    ])
+        ]
+    )
     # Turn 2: text-only finalization so the runtime exits cleanly.
     turn2 = iter([_fake_chunk("ok")])
 
@@ -381,8 +395,9 @@ def test_groq_sdk_returns_timeout_when_deadline_exceeded(monkeypatch):
 def test_groq_sdk_returns_iteration_limit_when_max_turns_exhausted(monkeypatch):
     """If the model keeps producing tool calls and never finalizes, the runtime
     should exit with exit_reason='iteration_limit' rather than a misleading 'done'."""
-    from ax_cli.runtimes.hermes.runtimes import get_runtime
     import tools as tools_mod
+
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
     from ax_cli.runtimes.hermes.runtimes.groq_sdk import MAX_TURNS
 
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
@@ -391,16 +406,20 @@ def test_groq_sdk_returns_iteration_limit_when_max_turns_exhausted(monkeypatch):
 
     def one_turn_with_tool_call(*_args, **_kwargs):
         counter["n"] += 1
-        return iter([
-            _fake_chunk_with_tool_calls([
-                _fake_tool_call_delta(
-                    0,
-                    call_id=f"call_{counter['n']}",
-                    name="bash",
-                    arguments='{"command":"ls"}',
+        return iter(
+            [
+                _fake_chunk_with_tool_calls(
+                    [
+                        _fake_tool_call_delta(
+                            0,
+                            call_id=f"call_{counter['n']}",
+                            name="bash",
+                            arguments='{"command":"ls"}',
+                        ),
+                    ]
                 ),
-            ]),
-        ])
+            ]
+        )
 
     fake_client = MagicMock()
     fake_client.chat.completions.create.side_effect = one_turn_with_tool_call
@@ -419,3 +438,89 @@ def test_groq_sdk_returns_iteration_limit_when_max_turns_exhausted(monkeypatch):
     assert fake_client.chat.completions.create.call_count == MAX_TURNS
     # User-visible message should reflect the bounded-loop exit.
     assert "turn limit" in result.text.lower()
+
+
+@pytest.mark.parametrize(
+    "exception_message, expected_exit_reason, expected_text_substring",
+    [
+        ("HTTP 429: rate limit exceeded", "rate_limited", ""),
+        ("Connection timed out after 60s", "timeout", "timed out"),
+        ("Server returned malformed response", "crashed", "api error"),
+    ],
+)
+def test_groq_sdk_classifies_api_open_error_by_message(
+    monkeypatch,
+    exception_message,
+    expected_exit_reason,
+    expected_text_substring,
+):
+    """When chat.completions.create itself raises before any chunk is yielded,
+    the runtime classifies the error string and returns the matching exit_reason."""
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = RuntimeError(exception_message)
+    _install_fake_groq(monkeypatch, fake_client)
+
+    rt = get_runtime("groq_sdk")
+    result = rt.execute("test prompt", workdir="/tmp")
+
+    assert result.exit_reason == expected_exit_reason
+    if expected_text_substring:
+        assert expected_text_substring in result.text.lower()
+    else:
+        assert result.text == ""
+
+
+def test_groq_sdk_per_tool_deadline_aborts_remaining_tools(monkeypatch):
+    """If wall-clock passes the deadline between tool dispatches, the runtime
+    should stop before executing the next tool and return exit_reason='timeout'.
+    Prevents one slow tool from cascading the budget overrun across the rest."""
+    from itertools import chain, repeat
+
+    import tools as tools_mod
+
+    from ax_cli.runtimes.hermes.runtimes import get_runtime
+    from ax_cli.runtimes.hermes.runtimes import groq_sdk as groq_mod
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+
+    # Fake clock: start=0, top-of-loop=1, tool 1=5 (within 30s budget),
+    # tool 2=35 (past deadline → triggers per-tool timeout return).
+    clock = chain([0.0, 1.0, 5.0, 35.0], repeat(35.0))
+    monkeypatch.setattr(groq_mod.time, "time", lambda: next(clock))
+
+    # Single turn with two tool calls. Runtime should execute the first but
+    # bail before the second.
+    turn1 = iter(
+        [
+            _fake_chunk_with_tool_calls(
+                [
+                    _fake_tool_call_delta(0, call_id="call_1", name="bash", arguments='{"command":"ls"}'),
+                    _fake_tool_call_delta(1, call_id="call_2", name="bash", arguments='{"command":"pwd"}'),
+                ]
+            ),
+        ]
+    )
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = turn1
+    _install_fake_groq(monkeypatch, fake_client)
+
+    executed: list[str] = []
+
+    def recording_execute_tool(name, args, workdir):
+        executed.append(args.get("command", name))
+        return tools_mod.ToolResult(output="stubbed")
+
+    monkeypatch.setattr(tools_mod, "execute_tool", recording_execute_tool)
+
+    rt = get_runtime("groq_sdk")
+    result = rt.execute("run two tools", workdir="/tmp", timeout=30)
+
+    # Only the first tool should have run; second was blocked by deadline check.
+    assert executed == ["ls"]
+    assert result.exit_reason == "timeout"
+    assert result.tool_count == 1
