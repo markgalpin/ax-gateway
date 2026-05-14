@@ -63,25 +63,51 @@ def _fake_chunk_with_tool_calls(tool_call_deltas):
 
 
 def _install_fake_groq(monkeypatch, fake_client):
-    """Swap `groq` in sys.modules so `from groq import Groq, ...` returns
-    our mock for the client and the REAL classes for the typed exception
-    hierarchy. The runtime catches Groq SDK exceptions by class, so the
-    typed exception classes must remain the real ones imported from the
-    installed `groq` package, otherwise the `except RateLimitError as e:`
-    catches would never fire."""
-    import groq as real_groq
+    """Swap `groq` in sys.modules with a stub module so the runtime's
+    `from groq import Groq, RateLimitError, ...` resolves cleanly without
+    requiring the real `groq` package to be installed. groq is an optional
+    dependency; CI runs `pip install .` which does not pull it in.
+
+    The stub exception classes mirror the slice of the real Groq SDK's
+    exception hierarchy that the runtime catches by name. Class identity
+    matches between the runtime's `except RateLimitError as e:` and the
+    instance the mock client raises, because both resolve through this
+    same stubbed sys.modules entry.
+    """
+
+    class _GroqError(Exception):
+        pass
+
+    class APIStatusError(_GroqError):
+        def __init__(self, message="", *, status_code=0, **_kwargs):
+            super().__init__(message)
+            self.message = message
+            self.status_code = status_code
+
+    class RateLimitError(APIStatusError):
+        pass
+
+    class AuthenticationError(APIStatusError):
+        pass
+
+    class PermissionDeniedError(APIStatusError):
+        pass
+
+    class InternalServerError(APIStatusError):
+        pass
+
+    class APITimeoutError(_GroqError):
+        def __init__(self, *, request=None):
+            super().__init__("API timeout")
 
     fake_module = types.ModuleType("groq")
     fake_module.Groq = MagicMock(return_value=fake_client)
-    # Re-export the typed exception classes that the runtime imports for its
-    # error-classification catch chain. Keeping the real classes means tests
-    # can raise actual Groq exceptions and exercise the matching catch arms.
-    fake_module.RateLimitError = real_groq.RateLimitError
-    fake_module.APITimeoutError = real_groq.APITimeoutError
-    fake_module.AuthenticationError = real_groq.AuthenticationError
-    fake_module.PermissionDeniedError = real_groq.PermissionDeniedError
-    fake_module.InternalServerError = real_groq.InternalServerError
-    fake_module.APIStatusError = real_groq.APIStatusError
+    fake_module.RateLimitError = RateLimitError
+    fake_module.APITimeoutError = APITimeoutError
+    fake_module.AuthenticationError = AuthenticationError
+    fake_module.PermissionDeniedError = PermissionDeniedError
+    fake_module.InternalServerError = InternalServerError
+    fake_module.APIStatusError = APIStatusError
     monkeypatch.setitem(sys.modules, "groq", fake_module)
     return fake_module
 
@@ -487,40 +513,28 @@ def test_groq_sdk_classifies_api_open_error_by_exception_type(
       - APIStatusError      → exit_reason="api_error"  (other 4xx)
       - Catch-all Exception → exit_reason="crashed"   (non-SDK errors)
     """
-    import httpx
-    from groq import (
-        APIStatusError,
-        APITimeoutError,
-        AuthenticationError,
-        InternalServerError,
-        PermissionDeniedError,
-        RateLimitError,
-    )
-
     from ax_cli.runtimes.hermes.runtimes import get_runtime
 
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
 
-    # Helper to construct a Groq APIStatusError-family instance with a
-    # synthetic httpx.Response carrying the requested status code.
-    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
-
-    def _status_err(cls, code, msg):
-        return cls(msg, response=httpx.Response(code, request=request), body=None)
+    fake_client = MagicMock()
+    # Install the stub `groq` module first so the exception classes used
+    # by the factories below are the same class identity that the runtime's
+    # `from groq import RateLimitError, ...` will resolve to. This is what
+    # makes the runtime's `except RateLimitError as e:` actually catch the
+    # instance we raise here.
+    fake_module = _install_fake_groq(monkeypatch, fake_client)
 
     factories = {
-        "rate_limit_429": lambda: _status_err(RateLimitError, 429, "rate limited"),
-        "api_timeout": lambda: APITimeoutError(request=request),
-        "auth_401": lambda: _status_err(AuthenticationError, 401, "invalid api key"),
-        "permission_403": lambda: _status_err(PermissionDeniedError, 403, "forbidden"),
-        "server_500": lambda: _status_err(InternalServerError, 500, "server failed"),
-        "api_status_400": lambda: _status_err(APIStatusError, 400, "bad request"),
+        "rate_limit_429": lambda: fake_module.RateLimitError("rate limited", status_code=429),
+        "api_timeout": lambda: fake_module.APITimeoutError(request=None),
+        "auth_401": lambda: fake_module.AuthenticationError("invalid api key", status_code=401),
+        "permission_403": lambda: fake_module.PermissionDeniedError("forbidden", status_code=403),
+        "server_500": lambda: fake_module.InternalServerError("server failed", status_code=500),
+        "api_status_400": lambda: fake_module.APIStatusError("bad request", status_code=400),
         "generic_runtime_error": lambda: RuntimeError("network adapter exploded"),
     }
-
-    fake_client = MagicMock()
     fake_client.chat.completions.create.side_effect = factories[exc_kind]()
-    _install_fake_groq(monkeypatch, fake_client)
 
     rt = get_runtime("groq_sdk")
     result = rt.execute("test prompt", workdir="/tmp")
