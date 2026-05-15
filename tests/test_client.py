@@ -1060,11 +1060,17 @@ class TestRetryOnAuthClient:
         assert r.status_code == 204
 
     def test_stream_delegates_directly(self):
+        from contextlib import contextmanager
         inner = self._mock_inner()
-        inner.stream.return_value = "stream-obj"
+        response = MagicMock()
+        response.headers = {}
+        @contextmanager
+        def _fake_stream(*args, **kwargs):
+            yield response
+        inner.stream = _fake_stream
         client = _RetryOnAuthClient(inner, None)
-        result = client.stream("GET", "/sse")
-        assert result == "stream-obj"
+        with client.stream("GET", "/sse") as result:
+            assert result is response
 
     def test_close_delegates(self):
         inner = self._mock_inner()
@@ -2342,3 +2348,77 @@ class TestRateLimitState:
         )
         client.get("/api/v1/agents")
         assert calls == [None]
+
+
+# ---------------------------------------------------------------------------
+# _RetryOnAuthClient — proactive rate-limit behaviour
+# ---------------------------------------------------------------------------
+
+
+def _rl_response(remaining: int, reset_at: float, status: int = 200) -> httpx.Response:
+    request = httpx.Request("GET", "https://paxai.app/api/v1/agents")
+    return httpx.Response(
+        status,
+        headers={"x-ratelimit-remaining": str(remaining), "x-ratelimit-reset": str(reset_at)},
+        request=request,
+    )
+
+
+class TestRetryOnAuthClientRateLimiting:
+    """_RetryOnAuthClient proactive rate-limit sleep and preemption."""
+
+    def test_no_wait_when_remaining_positive(self, monkeypatch):
+        import time as _time
+        sleeps = []
+        monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+        inner = MagicMock()
+        inner.get.return_value = _rl_response(remaining=5, reset_at=_time.time() + 60)
+        client = _RetryOnAuthClient(inner, get_fresh_jwt=None)
+        client.get("/api/v1/agents")
+        assert sleeps == []
+
+    def test_waits_when_exhausted(self, monkeypatch):
+        import time as _time
+        sleeps = []
+        monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+        reset_at = _time.time() + 30
+        inner = MagicMock()
+        inner.get.return_value = _rl_response(remaining=0, reset_at=reset_at)
+        client = _RetryOnAuthClient(inner, get_fresh_jwt=None)
+        client.get("/api/v1/agents")  # records exhaustion
+        client.get("/api/v1/agents")  # should sleep before this request
+        assert len(sleeps) == 1
+        assert sleeps[0] > 0
+
+    def test_calls_callback_on_wait(self, monkeypatch):
+        import time as _time
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+        reset_at = _time.time() + 30
+        calls = []
+        inner = MagicMock()
+        inner.get.return_value = _rl_response(remaining=0, reset_at=reset_at)
+        client = _RetryOnAuthClient(
+            inner, get_fresh_jwt=None,
+            on_rate_limit_wait=lambda w, r: calls.append((w, r)),
+        )
+        client.get("/api/v1/agents")
+        client.get("/api/v1/agents")
+        assert len(calls) == 1
+        wait, reset = calls[0]
+        assert wait > 0
+        assert reset == reset_at
+
+    def test_raises_preempted_when_wait_exceeds_max(self, monkeypatch):
+        import time as _time
+        sleeps = []
+        monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+        reset_at = _time.time() + 999
+        inner = MagicMock()
+        inner.get.return_value = _rl_response(remaining=0, reset_at=reset_at)
+        client = _RetryOnAuthClient(inner, get_fresh_jwt=None, max_rate_limit_wait=30.0)
+        client.get("/api/v1/agents")  # records exhaustion
+        with pytest.raises(RateLimitPreemptedError) as exc_info:
+            client.get("/api/v1/agents")
+        assert sleeps == []
+        assert exc_info.value.retry_after_seconds > 0
+        assert "try again after" in str(exc_info.value)
