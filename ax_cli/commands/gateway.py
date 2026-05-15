@@ -5714,6 +5714,7 @@ def _render_gateway_ui_page(*, refresh_ms: int) -> str:
 </html>
 """
     from ax_cli import __version__
+
     return template.replace("__REFRESH_MS__", str(refresh_ms)).replace("__VERSION__", __version__)
 
 
@@ -5745,6 +5746,7 @@ _GATEWAY_FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4
 
 def _render_gateway_demo_page(*, refresh_ms: int) -> str:
     from ax_cli import __version__
+
     body = _DEMO_HTML_PATH.read_text(encoding="utf-8")
     inject = (
         f"<script>window.__GATEWAY_DEMO_REFRESH_MS__ = {int(refresh_ms)};"
