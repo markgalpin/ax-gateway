@@ -146,7 +146,7 @@ def _check_honeypot(token: str, base_url: str) -> None:
 
 
 RATE_LIMIT_MAX_WAIT = 120.0  # shared cap for proactive and reactive rate-limit waits
-RATE_LIMIT_LOW_WATER = 10   # daemon/UI: start waiting when remaining drops to this level
+RATE_LIMIT_LOW_WATER = 10  # daemon/UI: start waiting when remaining drops to this level
 RATE_LIMIT_CLI_LOW_WATER = 2  # CLI: only back off when nearly empty — leaves headroom for interactive ops
 
 
@@ -161,6 +161,7 @@ class _RateLimitState:
 
     def __init__(self, low_water: int = RATE_LIMIT_LOW_WATER) -> None:
         import threading
+
         self._lock = threading.Lock()
         self._low_water = low_water
         self.exhausted: bool = False
@@ -169,6 +170,7 @@ class _RateLimitState:
 
     def record(self, remaining: int, reset_at: float) -> None:
         import time as _time
+
         with self._lock:
             self.remaining = remaining
             self.exhausted = remaining <= self._low_water
@@ -199,6 +201,7 @@ class _RateLimitState:
         if not self.exhausted:
             return
         import time as _time
+
         reset_at = self.reset_at
         wait = max(0.0, reset_at - _time.time() + 0.5)
         if wait == 0.0:
@@ -230,11 +233,9 @@ class RateLimitPreemptedError(RuntimeError):
         self.retry_after_seconds = wait_seconds
         self.reset_at = reset_at
         import datetime
+
         reset_str = datetime.datetime.fromtimestamp(reset_at).strftime("%H:%M:%S")
-        super().__init__(
-            f"Rate limit window ({wait_seconds:.0f}s) exceeds maximum wait — "
-            f"try again after {reset_str}."
-        )
+        super().__init__(f"Rate limit window ({wait_seconds:.0f}s) exceeds maximum wait — try again after {reset_str}.")
 
 
 class _RetryOnAuthClient:

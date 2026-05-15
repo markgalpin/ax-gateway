@@ -2923,14 +2923,28 @@ class _RequestLogger:
 
     def __init__(self, role: str) -> None:
         import threading
+
         self.role = role
         self._lock = threading.Lock()
         self._enabled = os.environ.get("AX_LOG_API_REQUESTS", "").lower() in {"1", "true", "yes"}
 
     def make_callback(self, *, agent_name: str | None = None, agent_id: str | None = None):
         """Return an on_request_complete callback capturing this logger's identity."""
-        def _cb(method: str, path: str, status: int, remaining: int | None, reset_at: float | None, content_type: str = "") -> None:
-            self._write(method, path, status, remaining, reset_at, agent_name=agent_name, agent_id=agent_id, content_type=content_type)
+
+        def _cb(
+            method: str, path: str, status: int, remaining: int | None, reset_at: float | None, content_type: str = ""
+        ) -> None:
+            self._write(
+                method,
+                path,
+                status,
+                remaining,
+                reset_at,
+                agent_name=agent_name,
+                agent_id=agent_id,
+                content_type=content_type,
+            )
+
         return _cb
 
     def _write(
@@ -2949,6 +2963,7 @@ class _RequestLogger:
             return
         import json as _json
         from datetime import datetime, timezone
+
         record: dict = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "pid": os.getpid(),
@@ -2970,6 +2985,7 @@ class _RequestLogger:
                     f.write(line)
         except OSError as exc:
             import sys
+
             print(f"[ax-gateway] WARNING: api-requests.log write failed: {exc}", file=sys.stderr)
 
 
@@ -6675,7 +6691,12 @@ class GatewayDaemon:
                     self._runtimes.pop(name, None)
                     runtime = None
             if runtime is None:
-                runtime = ManagedAgentRuntime(entry, client_factory=self.client_factory, logger=self.logger, rate_limit_state=self._rate_limit_state)
+                runtime = ManagedAgentRuntime(
+                    entry,
+                    client_factory=self.client_factory,
+                    logger=self.logger,
+                    rate_limit_state=self._rate_limit_state,
+                )
                 self._runtimes[name] = runtime
                 runtime.start()
             else:
