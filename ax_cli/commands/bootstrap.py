@@ -112,6 +112,7 @@ def _html_response_diag(r: httpx.Response) -> str:
     with a debugger.
     """
     import re as _re
+
     html = r.text or ""
     title_match = _re.search(r"<title[^>]*>([^<]+)</title>", html, _re.IGNORECASE)
     title = title_match.group(1).strip() if title_match else None
