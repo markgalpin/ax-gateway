@@ -52,11 +52,36 @@ python -m build
 Use `pipx install axctl` for normal CLI use. Use editable installs only for
 local development.
 
-## Branches
+## Branching
 
-- `main` is the integration and release branch. Branch all new work from `main`.
-- `dev/staging` is dormant as of 2026-05-07 and far behind `main`. Do not branch
-  from it — PRs cut from `dev/staging` will silently revert recent work.
+Trunk-based development. Everything branches off `main`, merges back to `main`. No long-lived branches.
+
+```
+main (protected)
+  ├── feat/FUL-42/credential-unification
+  ├── fix/FUL-55/retry-storm-backoff
+  ├── docs/scenario-rotate-pat
+  └── chore/ruff-format-precommit
+```
+
+Branch naming: `<type>/<jira-id>/<short-description>` when there is a Jira story, otherwise `<type>/<short-description>`. Types: `feat`, `fix`, `docs`, `chore`, `test`, `ci`.
+
+Feature branches should stay under a week old. If something ages past 5 days, rebase or split it.
+
+**Note:** `dev/staging` is dormant as of 2026-05-07 and far behind `main`. Do not branch from it - PRs cut from `dev/staging` will silently revert recent work.
+
+### Keeping Your Fork in Sync
+
+If you are working from a fork, pull upstream changes before starting new work:
+
+```bash
+git fetch upstream
+git checkout main
+git merge upstream/main
+git push origin main
+```
+
+Same goes for upstream dependencies like hermes-agent - pull fresh before starting work.
 
 ## Commit Style
 
@@ -84,14 +109,42 @@ Treat identity boundaries as part of the product contract:
 
 ## Pull Request Guidelines
 
-Before submitting:
+### Before Opening a PR
 
-- Code runs without errors
-- `pytest tests/ -v --tb=short` passes
-- `ruff check ax_cli/` and `ruff format --check ax_cli/` pass
-- `python -m build` succeeds
-- No sensitive data committed
-- Branch is up to date with target branch
+1. `pytest tests/ -v --tb=short` - all green
+2. `ruff check ax_cli/` - no lint errors
+3. `ruff format --check ax_cli/` - no format issues
+4. `python -m build && twine check dist/*` - package builds clean
+5. New code has unit tests
+6. Unit test coverage at 80%+ for changed files
+7. Reference any issue or bug the PR closes in the commit message
+8. No sensitive data committed
+9. Branch is up to date with target branch
+
+Use the PR template. One approving review minimum.
+
+### Merge Strategy
+
+- **Squash-and-merge** for single-commit PRs
+- **Regular merge** for multi-commit PRs where the commit history tells a useful story
+
+Delete the branch after merge.
+
+### Before Starting New Work
+
+Check outstanding issues and PRs for related or conflicting code. If your work touches the same files as an open PR, coordinate with the author to avoid painful rebases.
+
+## Definition of Done
+
+A contribution is complete when:
+
+- New code has unit tests, 80%+ coverage on changed files
+- All CI passes (tests, lint, format, build)
+- PR reviewed and approved
+- Merged to main
+- GitHub issue closed (if applicable)
+- Docs updated if the change is user-facing
+- Conventional commit message for changelog
 
 ## Release Process
 
