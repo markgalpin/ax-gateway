@@ -52,6 +52,7 @@ DEFAULT_ACTIVITY_LIMIT = 10
 DEFAULT_HANDLER_TIMEOUT_SECONDS = 900
 MIN_HANDLER_TIMEOUT_SECONDS = 1
 SSE_IDLE_TIMEOUT_SECONDS = 45.0
+RUNTIME_HEARTBEAT_INTERVAL_SECONDS = 30.0
 RUNTIME_STALE_AFTER_SECONDS = 75.0
 RUNTIME_HIDDEN_AFTER_SECONDS = 15 * 60.0  # default: hide stale agents after 15 min
 SETUP_ERROR_BACKOFF_SECONDS = 30.0  # silence retry storm after a runtime setup error
@@ -3781,35 +3782,6 @@ def _apply_placement_event(
     }
 
 
-def _post_lifecycle_signal(
-    client: Any,
-    entry: dict[str, Any],
-    *,
-    phase: str,
-    note: str | None = None,
-) -> bool:
-    """Best-effort POST /api/v1/agents/heartbeat with status=<phase>.
-
-    Used to inform the aX platform when a gateway-managed agent crosses a
-    lifecycle threshold (connected/stale/offline/setup_error). 404 means the
-    platform has no record of this agent_id — treat as success so we don't
-    retry forever. Returns True iff a signal was sent (or 404'd).
-    """
-    if client is None:
-        return False
-    agent_id = str(entry.get("agent_id") or "").strip()
-    if not agent_id:
-        return False
-    try:
-        client.send_heartbeat(agent_id=agent_id, status=phase, note=note)
-        return True
-    except Exception as exc:  # noqa: BLE001
-        status_code = getattr(getattr(exc, "response", None), "status_code", None)
-        if status_code == 404:
-            return True
-        return False
-
-
 def _post_placement_ack(
     client: Any,
     entry: dict[str, Any],
@@ -4742,6 +4714,7 @@ class ManagedAgentRuntime:
         self.stop_event = threading.Event()
         self._listener_thread: threading.Thread | None = None
         self._worker_thread: threading.Thread | None = None
+        self._stale_signaled: bool = False
         self._queue: queue.Queue = queue.Queue(maxsize=int(entry.get("queue_size") or DEFAULT_QUEUE_SIZE))
         self._reply_anchor_ids: set[str] = set()
         self._seen_ids: set[str] = set()
@@ -4812,9 +4785,28 @@ class ManagedAgentRuntime:
             agent_id=self.agent_id,
         )
 
+    def _send_heartbeat_best_effort(self, status: str) -> None:
+        """Create a short-lived client, send one heartbeat, always close it."""
+        client = None
+        try:
+            client = self._new_client()
+            client.send_heartbeat(status=status)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
     def _update_state(self, **fields: Any) -> None:
         with self._state_lock:
+            prev = self._state.get("effective_state")
             self._state.update(fields)
+            new = self._state.get("effective_state")
+        if new == "error" and prev != "error":
+            self._send_heartbeat_best_effort("setup_error")
 
     def _bump(self, field: str, amount: int = 1) -> None:
         with self._state_lock:
@@ -5035,6 +5027,7 @@ class ManagedAgentRuntime:
             current_tool=None,
             current_tool_call_id=None,
         )
+        self._send_heartbeat_best_effort("offline")
         record_gateway_activity("runtime_stopped", entry=self.entry)
         self._log("stopped")
 
@@ -6221,6 +6214,7 @@ class ManagedAgentRuntime:
                     self._stream_response = response
                     if response.status_code != 200:
                         raise ConnectionError(f"SSE failed: {response.status_code}")
+                    self._stale_signaled = False
                     self._update_state(
                         effective_state="running",
                         current_status=None,
@@ -6232,9 +6226,19 @@ class ManagedAgentRuntime:
                     )
                     record_gateway_activity("listener_connected", entry=self.entry, reconnected=reconnected)
                     backoff = 1.0
+                    import time as _time
+
+                    _last_heartbeat = _time.monotonic() - RUNTIME_HEARTBEAT_INTERVAL_SECONDS
                     for event_type, data in _iter_sse(response):
                         if self.stop_event.is_set():
                             break
+                        _now = _time.monotonic()
+                        if _now - _last_heartbeat >= RUNTIME_HEARTBEAT_INTERVAL_SECONDS:
+                            try:
+                                self._send_client.send_heartbeat(status="connected")
+                            except Exception:  # noqa: BLE001
+                                pass
+                            _last_heartbeat = _now
                         if event_type in {"bootstrap", "heartbeat", "ping", "identity_bootstrap", "connected"}:
                             self._update_state(last_seen_at=_now_iso())
                             continue
@@ -6351,6 +6355,15 @@ class ManagedAgentRuntime:
                     last_listener_error_at=_now_iso(),
                     reconnect_backoff_seconds=int(backoff),
                 )
+                if not self._stale_signaled:
+                    if self._send_client is not None:
+                        try:
+                            self._send_client.send_heartbeat(status="stale")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    else:
+                        self._send_heartbeat_best_effort("stale")
+                    self._stale_signaled = True
                 record_gateway_activity(
                     event_name, entry=self.entry, error=error_text, reconnect_in_seconds=int(backoff)
                 )
@@ -6751,29 +6764,28 @@ class GatewayDaemon:
         *,
         session: dict[str, Any] | None,
     ) -> None:
-        """Per-tick sweep: signal liveness transitions upstream.
+        """Per-tick sweep: observe liveness and skip non-roster agents.
 
-        Hide and restore are operator-driven only. The sweep observes liveness
-        and signals deltas upstream; it never mutates ``lifecycle_phase``. Use
-        ``ax gateway agents hide`` / ``unhide`` (or the Cleanup UI) to change
-        lifecycle phase.
+        Hide and restore are operator-driven only. The sweep never mutates
+        ``lifecycle_phase``. Use ``ax gateway agents hide`` / ``unhide``
+        (or the Cleanup UI) to change lifecycle phase.
 
-        - Skips system agents (switchboards, service accounts).
-        - Skips archived entries entirely (no upstream signaling either —
-          archive already signaled).
-        - On any liveness delta vs last_lifecycle_signal.phase, calls
-          send_heartbeat upstream best-effort. 404 counts as success.
+        Upstream liveness signaling (heartbeats) is intentionally absent here:
+        the heartbeat endpoint requires an agent-bound token; the sweep's
+        user token is always rejected (400 "Not a bound agent session").
+        Connected heartbeats are sent from _listener_loop using the agent's
+        own bound client. Offline is signaled from stop(). Stale/setup_error
+        require a management endpoint that accepts user-admin tokens — not
+        yet available.
         """
         agents = registry.get("agents") or []
         if not agents:
             return
-        client = self._sweep_client(session)
         for entry in agents:
             if not isinstance(entry, dict):
                 continue
             if _is_system_agent(entry):
                 continue
-            liveness = str(entry.get("liveness") or "").strip().lower()
             phase = str(entry.get("lifecycle_phase") or "active").strip().lower()
             if phase not in _LIFECYCLE_PHASES:
                 phase = "active"
@@ -6786,20 +6798,9 @@ class GatewayDaemon:
             if phase in {"archived", "hidden"}:
                 continue
 
-            # Upstream signal on liveness delta. Sticky liveness rate-limits.
-            if liveness in {"connected", "stale", "offline", "setup_error"}:
-                last_signal = entry.get("last_lifecycle_signal") or {}
-                if not isinstance(last_signal, dict):
-                    last_signal = {}
-                prev_phase = str(last_signal.get("phase") or "").strip().lower()
-                if liveness != prev_phase:
-                    sent = _post_lifecycle_signal(client, entry, phase=liveness)
-                    if sent:
-                        entry["last_lifecycle_signal"] = {
-                            "phase": liveness,
-                            "at": _now_iso(),
-                            "agent_id": str(entry.get("agent_id") or ""),
-                        }
+            # Placeholder: the sweep loop is retained for future per-tick
+            # registry maintenance (e.g. auto-hide long-stale agents, clean
+            # up orphaned entries). Nothing to act on here yet.
 
     def run(self, *, once: bool = False) -> None:
         session = load_gateway_session()
