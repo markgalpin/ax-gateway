@@ -3248,7 +3248,7 @@ def _send_gateway_test_to_managed_agent(
     if reachability == "sse_disconnected":
         raise ValueError(
             f"@{name} is attached but the platform SSE subscription is down — "
-            "messages will not be delivered. Reload the MCP server or restart the gateway to reconnect."
+            "messages will not be delivered. Reconnect the ax-channel MCP server. If that does not help, the agent token may need to be re-minted."
         )
     if reachability == "attach_required":
         workdir = str(snapshot.get("workdir") or stored.get("workdir") or "").strip()
@@ -3518,7 +3518,7 @@ def _run_gateway_doctor(name: str, *, send_test: bool = False) -> dict:
                         "channel_sse",
                         "failed",
                         "Claude Code is attached but the platform SSE subscription is down — "
-                        "messages will not be delivered. Reload the MCP server or restart the gateway to reconnect.",
+                        "messages will not be delivered. Reconnect the ax-channel MCP server. If that does not help, the agent token may need to be re-minted.",
                     )
                 elif reachability_val == "attach_required":
                     add_check("claude_code_session", "warning", "Start Claude Code before sending.")

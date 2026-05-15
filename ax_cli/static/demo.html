@@ -893,6 +893,13 @@
         }
         return { label: "Inbox", tone: "muted", detail: detail || "Mailbox is available. It is not a live listener." };
       }
+      if (isAttachedRuntime(agent) && String(agent.reachability || "").toLowerCase() === "sse_disconnected") {
+        return {
+          label: "SSE down",
+          tone: "error",
+          detail: detail || "Claude Code is attached but the platform SSE subscription is down — messages will not be delivered. Reconnect the ax-channel MCP server.",
+        };
+      }
       if (isAttachedRuntime(agent) && presence === "STALE") {
         return {
           label: "Stopped",
@@ -943,7 +950,7 @@
       const presence = String(agent.presence || "").toUpperCase();
       const reachability = String(agent.reachability || "").toLowerCase();
       if (isAttachedRuntime(agent) && reachability === "sse_disconnected") {
-        return { disabled: true, reason: "Claude Code is attached but the SSE subscription is down. Reload the MCP server or restart the gateway." };
+        return { disabled: true, reason: "Claude Code is attached but the SSE subscription is down. Reconnect the ax-channel MCP server." };
       }
       if (isAttachedRuntime(agent) && (presence === "STALE" || reachability === "attach_required")) {
         return { disabled: true, reason: "Start this Claude Code session before sending." };

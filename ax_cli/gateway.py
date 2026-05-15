@@ -2720,9 +2720,12 @@ def annotate_runtime_health(
         if local_pid_alive or manual_attached:
             attached_session_alive = True
             if liveness in {"stale", "offline"}:
-                liveness = "connected"
-                connected = True
-                state = "running"
+                # Don't restore to connected if the channel's SSE subscription is
+                # explicitly broken — a live process with a dead SSE can't receive messages.
+                if enriched.get("sse_connected") is not False:
+                    liveness = "connected"
+                    connected = True
+                    state = "running"
             if manual_attached and not local_pid_alive:
                 enriched["local_attach_state"] = "manual_attached"
                 enriched["local_attach_detail"] = "Operator marked this Claude Code session as manually attached."
