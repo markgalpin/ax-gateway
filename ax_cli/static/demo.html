@@ -942,6 +942,9 @@
       }
       const presence = String(agent.presence || "").toUpperCase();
       const reachability = String(agent.reachability || "").toLowerCase();
+      if (isAttachedRuntime(agent) && reachability === "sse_disconnected") {
+        return { disabled: true, reason: "Claude Code is attached but the SSE subscription is down. Reload the MCP server or restart the gateway." };
+      }
       if (isAttachedRuntime(agent) && (presence === "STALE" || reachability === "attach_required")) {
         return { disabled: true, reason: "Start this Claude Code session before sending." };
       }
@@ -1514,6 +1517,9 @@
       if (currentTool) return relativeActivity(`Tool: ${currentTool}`, agent.last_seen_at || agent.last_work_received_at || agent.added_at);
       const currentActivity = String(agent.current_activity || "").trim();
       if (currentActivity) return relativeActivity(currentActivity, agent.last_seen_at || agent.last_work_received_at || agent.added_at);
+      if (isAttachedRuntime(agent) && String(agent.reachability || "").toLowerCase() === "sse_disconnected") {
+        return relativeActivity("SSE disconnected", agent.last_channel_heartbeat_at || agent.last_seen_at || agent.added_at);
+      }
       if (isAttachedRuntime(agent) && String(agent.reachability || "").toLowerCase() === "attach_required") {
         return relativeActivity("Start required", agent.last_seen_at || agent.last_started_at || agent.added_at);
       }
@@ -2347,7 +2353,8 @@
         !agent.connected &&
         (String(agent.presence || "").toUpperCase() === "STALE" ||
           String(agent.presence || "").toUpperCase() === "OFFLINE" ||
-          String(agent.reachability || "").toLowerCase() === "attach_required");
+          String(agent.reachability || "").toLowerCase() === "attach_required" ||
+          String(agent.reachability || "").toLowerCase() === "sse_disconnected");
       const actions = makeEl("div", { class: "drawer-actions" });
       if (needsApproval) {
         actions.appendChild(makeEl("div", { class: "approval-actions" }, [

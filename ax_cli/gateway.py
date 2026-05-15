@@ -168,12 +168,20 @@ _CONTROLLED_MODES = {"LIVE", "ON-DEMAND", "INBOX"}
 _CONTROLLED_PRESENCE = {"IDLE", "QUEUED", "WORKING", "BLOCKED", "STALE", "OFFLINE", "ERROR"}
 _CONTROLLED_REPLY = {"REPLY", "SUMMARY", "SILENT"}
 _CONTROLLED_CONFIDENCE = {"HIGH", "MEDIUM", "LOW", "BLOCKED"}
-_CONTROLLED_REACHABILITY = {"live_now", "queue_available", "launch_available", "attach_required", "unavailable"}
+_CONTROLLED_REACHABILITY = {
+    "live_now",
+    "queue_available",
+    "launch_available",
+    "attach_required",
+    "sse_disconnected",
+    "unavailable",
+}
 _CONTROLLED_CONFIDENCE_REASONS = {
     "live_now",
     "queue_available",
     "launch_available",
     "attach_required",
+    "sse_disconnected",
     "unavailable",
     "setup_blocked",
     "recent_test_failed",
@@ -1043,6 +1051,11 @@ def _derive_liveness(snapshot: dict[str, Any], *, raw_state: str, last_seen_age:
     if raw_state == "running":
         if last_seen_age is None or last_seen_age > RUNTIME_STALE_AFTER_SECONDS:
             return "stale", False
+        # Channel agents report SSE subscription health separately from process
+        # liveness. A running process with a dead SSE stream can't receive messages.
+        sse_connected = snapshot.get("sse_connected")
+        if sse_connected is False:
+            return "stale", False
         return "connected", True
     if raw_state in {"starting", "reconnecting", "stale"}:
         return "stale", False
@@ -1204,6 +1217,8 @@ def _derive_reachability(*, snapshot: dict[str, Any], mode: str, liveness: str, 
     if mode == "INBOX":
         return "queue_available"
     if activation == "attach_only" and liveness in {"stale", "offline"}:
+        if snapshot.get("sse_connected") is False:
+            return "sse_disconnected"
         return "attach_required"
     if mode == "LIVE" and liveness == "connected":
         return "live_now"
@@ -1322,6 +1337,13 @@ def _derive_confidence(
     if mode == "ON-DEMAND" and reachability == "launch_available":
         return ("MEDIUM", "launch_available", "Gateway can launch this runtime on send. Cold start possible.")
     if liveness in {"offline", "stale"}:
+        if reachability == "sse_disconnected":
+            return (
+                "LOW",
+                "sse_disconnected",
+                "Claude Code is attached but the platform SSE subscription is down — "
+                "messages will not be delivered until it reconnects.",
+            )
         if reachability == "attach_required":
             return ("LOW", "attach_required", "Start Claude Code before sending.")
         return ("LOW", "unavailable", "Gateway does not currently have a healthy live path.")
