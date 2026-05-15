@@ -3782,8 +3782,6 @@ def _apply_placement_event(
     }
 
 
-
-
 def _post_placement_ack(
     client: Any,
     entry: dict[str, Any],
@@ -6229,6 +6227,7 @@ class ManagedAgentRuntime:
                     record_gateway_activity("listener_connected", entry=self.entry, reconnected=reconnected)
                     backoff = 1.0
                     import time as _time
+
                     _last_heartbeat = _time.monotonic() - RUNTIME_HEARTBEAT_INTERVAL_SECONDS
                     for event_type, data in _iter_sse(response):
                         if self.stop_event.is_set():
@@ -6802,7 +6801,6 @@ class GatewayDaemon:
             # Placeholder: the sweep loop is retained for future per-tick
             # registry maintenance (e.g. auto-hide long-stale agents, clean
             # up orphaned entries). Nothing to act on here yet.
-
 
     def run(self, *, once: bool = False) -> None:
         session = load_gateway_session()
