@@ -30,12 +30,14 @@ AxAdapter = _MODULE.AxAdapter
 
 def _adapter() -> AxAdapter:
     from collections import OrderedDict
+
     adapter = AxAdapter.__new__(AxAdapter)
     adapter.agent_name = "nova"
     adapter.agent_id = "agent-123"
     adapter.space_id = "space-123"
     adapter.local_gateway_url = "http://127.0.0.1:8765"
     import re as _re
+
     adapter._mention_pattern = _re.compile(
         rf"(?<!\w)@{_re.escape(adapter.agent_name)}(?!\w)",
         _re.IGNORECASE,
@@ -117,6 +119,7 @@ def test_dispatch_inbound_uses_stable_thread_chat_type(monkeypatch):
     "channel"-then-"thread" flip would split one logical thread into two
     Hermes sessions and break continuity / the active-session guard."""
     from types import SimpleNamespace
+
     adapter = _adapter()
     # SessionSource.platform.value is the only platform attribute touched on
     # the dispatch path; a duck-typed stub avoids depending on hermes-agent's
@@ -161,6 +164,7 @@ def test_dispatch_inbound_dedupes_double_event(monkeypatch):
     template even though the agent is idle. Dedup must let the first
     through and silently drop the second."""
     from types import SimpleNamespace
+
     adapter = _adapter()
     adapter.platform = SimpleNamespace(value="ax")
     captured: list = []
@@ -189,6 +193,7 @@ def test_dispatch_inbound_strips_leading_agent_mention_before_command(monkeypatc
     command detection is text.startswith('/'), so leaving the leading mention
     would route control commands through the normal busy/interrupt path."""
     from types import SimpleNamespace
+
     adapter = _adapter()
     adapter.platform = SimpleNamespace(value="ax")
     captured: list = []
