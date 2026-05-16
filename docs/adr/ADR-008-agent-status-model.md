@@ -111,6 +111,17 @@ and discussion of a possible future improvement is documented in
 
 ## Notes
 
+### "Attached session" in UI messages
+
+UI labels and detail strings use the term "attached session" rather than naming
+a specific runtime (e.g. "Claude Code"). This refers to the **Attached Session**
+agent class defined in ADR-007 — currently `claude_code_channel`, but
+intentionally generic to accommodate future agent types in that class. Operators
+who see "The attached session is not running" should consult the Gateway UI or
+`ax gateway agents doctor` to identify which specific runtime is affected.
+
+### `sse_connected` and SSE subscription health
+
 The `sse_connected` field introduced for `claude_code_channel` is a specialised
 extension of this model: it allows an attached session to report SSE
 subscription health separately from process liveness, surfacing `sse_disconnected`
@@ -139,7 +150,7 @@ ADR-007 for details.
 | Attach in progress | `current_status`, `connected` | generic | "Starting" | yellow | "Starting" | yellow | Unchanged |
 | Mailbox with pending work | `backlog_depth` / `queue_depth` | `isMailboxRuntime` (uses `mode=INBOX`) | "N messages" | yellow | "N messages" | yellow | Unchanged |
 | Mailbox idle | *(no specific signal)* | `isMailboxRuntime` (uses `mode=INBOX`) | "Inbox" | gray | "Inbox" | green | Green — healthy passive state |
-| Attached + SSE disconnected | `reachability=sse_disconnected` | `isAttachedRuntime` *(gap)* | "SSE down" | red | "SSE down" | red | Unchanged (see companion PR #32) |
+| Attached + SSE disconnected | `reachability=sse_disconnected` | generic | "SSE down" | red | "SSE down" | red | Unchanged |
 | Attached runtime + `presence=STALE` | `reachability=attach_required` | generic | "Stopped" | gray | "Not running" | red | Red — process gone, new label |
 | `presence=STALE` (other runtimes) | `presence` (from `liveness`) | generic | "Stale" | yellow | "Stale" | yellow | Unchanged |
 | `presence=OFFLINE` | `presence` (from `liveness`) | generic | "Offline" | gray | "Offline" | red | Red — desired=running but unreachable |
