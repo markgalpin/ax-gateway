@@ -21,6 +21,23 @@ responsible for reporting to the Gateway registry.
 [ADR-008](ADR-008-agent-status-model.md) defines the right boundary: how the
 daemon translates those signals into operator-visible status.
 
+### Relationship to other specs
+
+The five classes in this ADR are **signaling contract categories** — they
+describe who owns the process lifecycle and how the agent reports health to the
+local Gateway registry. They are distinct from the **asset taxonomy** defined in
+[GATEWAY-ASSET-TAXONOMY-001](../../specs/GATEWAY-ASSET-TAXONOMY-001/spec.md),
+which describes what kind of thing an asset is (`asset_class`) and how work
+enters it (`intake_model`). Multiple signaling classes can share the same asset
+class, and the same template can serve different asset classes depending on
+deployment.
+
+The registry entry model (including `template_id`, `runtime_type`, and
+`capabilities`) is defined in
+[GATEWAY-AGENT-REGISTRY-001](../../specs/GATEWAY-AGENT-REGISTRY-001/spec.md).
+The polling mailbox pattern is specified in detail in
+[GATEWAY-PASS-THROUGH-MAILBOX-001](../../specs/GATEWAY-PASS-THROUGH-MAILBOX-001/spec.md).
+
 ## Decision
 
 ### Agent Classes
@@ -58,18 +75,20 @@ to set it directly.
 
 ### Current Templates and Runtime Types by Class
 
-| Class | Template ID | Runtime type(s) | Notes |
-|---|---|---|---|
-| **Daemon-managed** | `echo_test` | `echo` | Built-in test runtime; echoes messages back |
-| **Daemon-managed** | `hermes` | `hermes_sentinel` | Hermes sentinel process supervised by daemon; sub-runtimes: `claude_cli`, `openai_sdk`, `codex_cli`, `hermes_sdk`, `groq_sdk` *(not yet vendored)*, `mistral_sdk` *(in progress)* |
-| **Daemon-managed** | `sentinel_cli` | `sentinel_cli` | Direct CLI sentinel subprocess |
-| **Daemon-managed** | *(exec template)* | `exec` | Generic subprocess launcher; fallback for unknown templates |
-| **Attached session** | `claude_code_channel` | `claude_code_channel` | MCP stdio bridge; attached by Claude Code or compatible client |
-| **Polling mailbox** | `pass_through` | `inbox` | Polling mailbox for pass-through agents |
-| **Polling mailbox** | `inbox` | `inbox` | System inbox; used for switchboard and notification agents |
-| **Polling mailbox** | `service_account` | *(no runtime)* | Outbound-only service account; no runtime process |
-| **External plugin** | `hermes` | `hermes_plugin` | Hermes plugin process managed outside the daemon |
-| **On-demand** | `ollama` | `hermes_sentinel` (via hermes) | Ollama bridge; launched on send, exits when done |
+`asset_class` and `intake_model` values follow [GATEWAY-ASSET-TAXONOMY-001](../../specs/GATEWAY-ASSET-TAXONOMY-001/spec.md).
+
+| Signaling class | Template ID | Runtime type(s) | `asset_class` | `intake_model` | Notes |
+|---|---|---|---|---|---|
+| **Daemon-managed** | `echo_test` | `echo` | `interactive_agent` | `live_listener` | Built-in test runtime; echoes messages back |
+| **Daemon-managed** | `hermes` | `hermes_sentinel` | `interactive_agent` | `live_listener` | Hermes sentinel; sub-runtimes: `claude_cli`, `openai_sdk`, `codex_cli`, `hermes_sdk`, `groq_sdk` *(not yet vendored)*, `mistral_sdk` *(in progress)* |
+| **Daemon-managed** | `sentinel_cli` | `sentinel_cli` | `interactive_agent` | `live_listener` | Direct CLI sentinel subprocess |
+| **Daemon-managed** | *(exec template)* | `exec` | `interactive_agent` | `live_listener` | Generic subprocess launcher; fallback for unknown templates |
+| **Attached session** | `claude_code_channel` | `claude_code_channel` | `interactive_agent` | `live_listener` | MCP stdio bridge; attached by Claude Code or compatible client |
+| **Polling mailbox** | `pass_through` | `inbox` | `interactive_agent` | `polling_mailbox` | Agent polls and replies interactively; see GATEWAY-PASS-THROUGH-MAILBOX-001 |
+| **Polling mailbox** | `inbox` | `inbox` | `background_worker` | `queue_accept` | Queue worker; drains jobs and may summarize rather than reply inline |
+| **Polling mailbox** | `service_account` | *(no runtime)* | `service_account` | `notification_source` | Outbound-only; no runtime process |
+| **External plugin** | `hermes` | `hermes_plugin` | `interactive_agent` | `live_listener` | Hermes plugin process managed outside the daemon |
+| **On-demand** | `ollama` | `hermes_sentinel` (via hermes) | `interactive_agent` | `launch_on_send` | Ollama bridge; launched on send, exits when done |
 
 ### Signaling Contract
 

@@ -4,6 +4,8 @@
 
 **See also:** [ADR-007](ADR-007-agent-classes-and-signals.md) — Gateway registry signals (distinct from platform heartbeats)
 
+**Related spec:** [HEARTBEAT-001](../../specs/HEARTBEAT-001/README.md) — CLI-level heartbeat implementation; ADR-009 defines the platform-level protocol that HEARTBEAT-001 implements
+
 ## Context
 
 ![Gateway heartbeat channels](../images/gateway-heartbeat-channels.svg)
