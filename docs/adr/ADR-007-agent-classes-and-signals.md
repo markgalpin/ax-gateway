@@ -119,8 +119,9 @@ queue availability, not heartbeat freshness, determines their health.
 | `last_seen_at` | Updated on each heartbeat | Continuously |
 
 A gap in plugin heartbeats causes `liveness=stale`, then `liveness=offline`
-after the escalation threshold. The Gateway derives `reachability=plugin_not_attached`
-when an external plugin is desired=running and has gone stale or offline.
+after the escalation threshold. The Gateway derives `reachability=unavailable`
+for external plugins that have gone stale or offline (see Known Gaps for a
+possible future improvement).
 
 #### On-demand
 
@@ -170,25 +171,17 @@ that would allow the UI to operate without class-specific knowledge. As a
 consequence, the UI currently contains type-specific checks that compensate
 (documented in [ADR-008](ADR-008-agent-status-model.md)):
 
-- **External plugin not attached**: when an external plugin is desired=running
-  and has not sent a fresh heartbeat, the UI currently checks
-  `externalManaged && !connected` directly. The Gateway should derive
-  `reachability=plugin_not_attached` in `_derive_reachability()` so the UI
-  can read a generic field instead. The `plugin_not_attached` reachability
-  value was added in `fix/gateway-agent-status-colors`, but the UI type check
-  was retained because: (1) `external_runtime_managed` is itself a
-  gateway-provided flag rather than agent-class knowledge inferred by the UI;
-  (2) the UI still needs to combine with `presence` to differentiate stale
-  (yellow, may self-reconnect) from offline (red, persistent failure) — the
-  reachability value alone does not eliminate that check. The boundary
-  improvement was marginal enough to defer to a follow-up PR.
-
-- **Attached runtime stale vs generic stale**: the UI checks `isAttachedRuntime`
-  to show "Not running" (red) for a stale attached session instead of generic
-  "Stale" (yellow). The `reachability=attach_required` field already encodes
-  this distinction and could replace the type check. Retained in the current
-  PR to keep scope focused on the status model changes; the ADR documents the
-  desired end state and the cleanup is deferred.
+- **External plugin not attached**: the UI checks `externalManaged && !connected`
+  directly rather than a gateway-computed reachability value. This is a known
+  violation of the principle that all health logic is computed by the gateway.
+  A `reachability=plugin_not_attached` value was explored but reverted: the UI
+  still needs to combine with `presence` to differentiate stale (yellow, may
+  self-reconnect) from offline (red, persistent failure), and
+  `external_runtime_managed` is itself a gateway-provided flag rather than
+  type-specific logic inferred by the UI. The added complexity of a new
+  reachability value did not justify the marginal boundary improvement. The
+  correct long-term fix is for the gateway to emit a richer reachability value
+  that encodes both the class and the severity, eliminating both checks.
 
 
 ## Consequences

@@ -841,6 +841,7 @@
       const unread = counts.messages;
       const tasks = counts.tasks;
       const lifecyclePhase = String(agent.lifecycle_phase || "").toLowerCase();
+      const reachability = String(agent.reachability || "").toLowerCase();
 
       // Operator intent — evaluated before any health signal.
       // Hidden and archived override everything: the operator explicitly removed
@@ -910,7 +911,7 @@
           detail: detail || "Claude Code is attached but the platform SSE subscription is down — messages will not be delivered. Reconnect the ax-channel MCP server.",
         };
       }
-      if (isAttachedRuntime(agent) && presence === "STALE") {
+      if (reachability === "attach_required") {
         return {
           label: "Not running",
           tone: "error",

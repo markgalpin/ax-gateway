@@ -86,10 +86,10 @@ follow the signaling contract in ADR-007.
 
 ## Known Gaps
 
-Three cases in the status table currently require class-specific checks in the
-UI — marked *(gap)* in the table below. These are consequences of the Gateway
-not yet computing a fully generic semantic field for those cases. The root
-cause and remediation path for each is documented in
+One case in the status table currently requires a class-specific check in the
+UI — marked *(gap)* in the table below. This is a consequence of the Gateway
+not yet computing a fully generic semantic field for that case. The root cause
+and discussion of a possible future improvement is documented in
 [ADR-007 § Known Gaps](ADR-007-agent-classes-and-signals.md#known-gaps).
 
 ## Consequences
@@ -137,10 +137,10 @@ ADR-007 for details.
 | `BLOCKED` + binding drift | `confidence`, `confidence_reason` | generic | "Needs approval" | yellow | "Needs approval" | yellow | Unchanged |
 | `BLOCKED` (other) | `confidence` | generic | "Blocked" | yellow | "Blocked" | red | Red — gateway blocking = broken |
 | Attach in progress | `current_status`, `connected` | generic | "Starting" | yellow | "Starting" | yellow | Unchanged |
-| Mailbox with pending work | `backlog_depth` / `queue_depth` | `isMailboxRuntime` *(gap)* | "N messages" | yellow | "N messages" | yellow | Unchanged |
-| Mailbox idle | *(no specific signal)* | `isMailboxRuntime` *(gap)* | "Inbox" | gray | "Inbox" | green | Green — healthy passive state |
+| Mailbox with pending work | `backlog_depth` / `queue_depth` | `isMailboxRuntime` (uses `mode=INBOX`) | "N messages" | yellow | "N messages" | yellow | Unchanged |
+| Mailbox idle | *(no specific signal)* | `isMailboxRuntime` (uses `mode=INBOX`) | "Inbox" | gray | "Inbox" | green | Green — healthy passive state |
 | Attached + SSE disconnected | `reachability=sse_disconnected` | `isAttachedRuntime` *(gap)* | "SSE down" | red | "SSE down" | red | Unchanged (see companion PR #32) |
-| Attached runtime + `presence=STALE` | `presence` (from `liveness`) | `isAttachedRuntime` *(gap)* | "Stopped" | gray | "Not running" | red | Red — process gone, new label |
+| Attached runtime + `presence=STALE` | `reachability=attach_required` | generic | "Stopped" | gray | "Not running" | red | Red — process gone, new label |
 | `presence=STALE` (other runtimes) | `presence` (from `liveness`) | generic | "Stale" | yellow | "Stale" | yellow | Unchanged |
 | `presence=OFFLINE` | `presence` (from `liveness`) | generic | "Offline" | gray | "Offline" | red | Red — desired=running but unreachable |
 | `presence=ACTIVE/LIVE` or `connected=true` | `presence`, `connected` | generic | "Active" | green | "Active" | green | Unchanged |

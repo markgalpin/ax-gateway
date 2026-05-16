@@ -1232,10 +1232,7 @@ def _derive_reachability(*, snapshot: dict[str, Any], mode: str, liveness: str, 
         if snapshot.get("sse_connected") is False:
             return "sse_disconnected"
         return "attach_required"
-    # External plugin runtimes report their own state; a missing fresh heartbeat
-    # means the plugin process has not attached — distinct from a generic unavailable.
-    if snapshot.get("external_runtime_managed") and liveness in {"stale", "offline"}:
-        return "plugin_not_attached"
+
     if mode == "LIVE" and liveness == "connected":
         return "live_now"
     if mode == "ON-DEMAND" and liveness != "setup_error":
