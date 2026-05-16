@@ -28,6 +28,12 @@ model. This produced several problems:
 - Agent-type-specific branches in the UI accumulated over time, making it
   harder to reason about how new agent types would render.
 
+The canonical current status contract — operator intent priority, UI tones,
+liveness thresholds, and field mapping — is defined in
+[GATEWAY-CONNECTIVITY-001](../../specs/GATEWAY-CONNECTIVITY-001/spec.md)
+(Daemon-to-UI Status Contract section). This ADR records the decisions that
+shaped that contract.
+
 ## Decision
 
 ### 1. Operator intent is evaluated before any health signal
@@ -127,15 +133,12 @@ intentionally generic to accommodate future agent types in that class. Operators
 who see "The attached session is not running" should consult the Gateway UI or
 `ax gateway agents doctor` to identify which specific runtime is affected.
 
-### `sse_connected` and SSE subscription health
+### `sse_connected` field
 
-The `sse_connected` field introduced for `claude_code_channel` is a specialised
-extension of this model: it allows an attached session to report SSE
-subscription health separately from process liveness, surfacing `sse_disconnected`
-reachability when the MCP process is alive but the platform SSE stream is broken.
-This follows the same principle — Gateway computes health from agent-reported
-signals, UI reads the result. See the attached session signaling contract in
-ADR-007 for details.
+The `sse_connected` field and its role in health derivation are defined in
+[GATEWAY-AGENT-REGISTRY-001](../../specs/GATEWAY-AGENT-REGISTRY-001/spec.md).
+The decision to introduce it as a separate field (rather than using
+`effective_state`) is documented in ADR-007.
 
 ### Status mapping before and after this ADR
 
