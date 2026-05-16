@@ -14,6 +14,13 @@ bespoke handling in the daemon sweep, the health derivation logic, and the UI.
 This ADR defines the canonical agent classes and specifies what each class is
 responsible for reporting to the Gateway registry.
 
+![Gateway status architecture](../images/gateway-status-architecture.svg)
+
+This ADR (ADR-007) defines the left boundary: what each agent class is
+responsible for reporting to the Gateway registry.
+[ADR-008](ADR-008-agent-status-model.md) defines the right boundary: how the
+daemon translates those signals into operator-visible status.
+
 ## Decision
 
 ### Agent Classes

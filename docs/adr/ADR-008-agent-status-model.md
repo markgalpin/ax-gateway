@@ -4,6 +4,13 @@
 
 **Depends on:** [ADR-007: Agent Classes and Gateway Signaling Contract](ADR-007-agent-classes-and-signals.md)
 
+![Gateway status architecture](../images/gateway-status-architecture.svg)
+
+[ADR-007](ADR-007-agent-classes-and-signals.md) defines the left boundary:
+what each agent class is responsible for reporting to the Gateway registry.
+This ADR (ADR-008) defines the right boundary: how the daemon translates those
+signals into operator-visible status.
+
 ## Context
 
 The Gateway UI and CLI need to communicate agent health to operators clearly
