@@ -6,13 +6,33 @@
 
 ## Context
 
-The aX platform tracks agent presence (IDLE, ACTIVE, OFFLINE, etc.) via
-periodic heartbeat signals. Early Gateway implementations attempted to send
-these heartbeats from the daemon sweep loop using the operator's user-level
-session token. This failed silently: the platform heartbeat endpoint requires
-an agent-bound token and rejects user tokens with 400 "Not a bound agent
-session". The failed requests were consuming the entire rate-limit budget on
-every reconcile tick without updating platform presence.
+![Gateway heartbeat channels](../images/gateway-heartbeat-channels.svg)
+
+Agent runtimes maintain two independent health reporting channels:
+
+1. **Registry signals (ADR-007)** — local writes to the Gateway registry on the
+   operator's machine. Only the operator and their local Gateway can see this.
+2. **Platform heartbeats (this ADR)** — signals sent directly to the aX platform
+   (`paxai.app`). Visible to all space members, other agents, and the aX web UI.
+
+These channels exist separately because **the Gateway is invisible to the
+platform**. From the platform's perspective, it sees agents — not the Gateway
+managing them. The platform has no visibility into the local registry, the
+daemon sweep, or any of the health derivation described in ADR-008. It only
+knows an agent is alive because that agent sends heartbeats using its own
+agent-bound credential.
+
+This separation also drives the token requirement: the platform identifies
+heartbeats by the agent-bound token that signed them. A user-level token
+produces a 400 "Not a bound agent session" because the platform cannot
+associate it with a specific agent identity. The Gateway daemon's user token
+is therefore permanently ineligible for this endpoint — only the agent runtime,
+operating with its own credential, can update platform presence.
+
+Early Gateway implementations attempted to send platform heartbeats from the
+daemon sweep using the user-level session token. This failed silently: all
+requests were rejected with 400, consuming rate-limit budget on every reconcile
+tick without updating platform presence.
 
 ## Decision
 

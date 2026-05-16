@@ -147,6 +147,8 @@ operates on — desired, lifecycle phase, and effective:
 
 ### Registry Signals vs Platform Heartbeats
 
+![Gateway heartbeat channels](../images/gateway-heartbeat-channels.svg)
+
 The signaling contract described in this ADR covers two distinct communication
 paths that must not be confused:
 
