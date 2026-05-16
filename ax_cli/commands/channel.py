@@ -1133,6 +1133,7 @@ def _resolve_agent_id(client, agent_name: str | None) -> str | None:
 
 
 _SSE_RECONNECT_INTERVAL = 600  # reconnect every 10 min to refresh JWT before 15-min expiry
+_SSE_HEARTBEAT_INTERVAL = 30  # heartbeat to gateway every 30s independent of message activity
 
 # Defensive fallback for runtime progress messages that arrive without the
 # `metadata.streaming_reply.final=false` hint. Every branch is anchored with
@@ -1153,10 +1154,24 @@ _RUNTIME_PROGRESS_RE = re.compile(
 _LEADING_MENTION_RE = re.compile(r"^@[\w-]+\s*[-\u2014]?\s*")
 
 
+def _sse_heartbeat_loop(bridge: ChannelBridge, sse_connected: "list[bool]") -> None:
+    """Periodically write SSE health to the gateway registry, independent of message activity."""
+    while not bridge.shutdown.is_set():
+        bridge.shutdown.wait(timeout=_SSE_HEARTBEAT_INTERVAL)
+        if bridge.shutdown.is_set():
+            break
+        _touch_gateway_channel_entry(bridge.agent_name, sse_connected=sse_connected[0])
+
+
 def _sse_loop(bridge: ChannelBridge) -> None:
     seen_ids: set[str] = set()
     backoff = 1
     bridge.log(f"listening for @{bridge.agent_name} in {bridge.space_id}")
+    # Shared mutable flag so _sse_heartbeat_loop can read the current SSE state.
+    sse_connected: list[bool] = [False]
+
+    heartbeat = threading.Thread(target=_sse_heartbeat_loop, args=(bridge, sse_connected), daemon=True)
+    heartbeat.start()
 
     while not bridge.shutdown.is_set():
         try:
@@ -1165,6 +1180,8 @@ def _sse_loop(bridge: ChannelBridge) -> None:
                 if response.status_code != 200:
                     raise ConnectionError(f"SSE failed: {response.status_code}")
                 backoff = 1
+                sse_connected[0] = True
+                _touch_gateway_channel_entry(bridge.agent_name, sse_connected=True)
                 bridge.log(f"SSE connected (status {response.status_code})")
                 for event_type, data in _iter_sse(response):
                     if bridge.shutdown.is_set():
@@ -1346,10 +1363,14 @@ def _sse_loop(bridge: ChannelBridge) -> None:
                         break
         except (httpx.ConnectError, httpx.ReadTimeout, ConnectionError) as exc:
             bridge.log(f"SSE reconnect in {backoff}s after: {exc}")
+            sse_connected[0] = False
+            _touch_gateway_channel_entry(bridge.agent_name, sse_connected=False)
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
         except Exception as exc:  # pragma: no cover - live path
             bridge.log(f"unexpected SSE error: {exc}")
+            sse_connected[0] = False
+            _touch_gateway_channel_entry(bridge.agent_name, sse_connected=False)
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -1442,6 +1463,7 @@ def channel(
         current_status=None,
         current_activity=None,
         last_connected_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        sse_connected=False,
     )
 
     listener = threading.Thread(target=_sse_loop, args=(bridge,), daemon=True)

@@ -3245,6 +3245,11 @@ def _send_gateway_test_to_managed_agent(
     snapshot = annotate_runtime_health(stored, registry=registry)
     save_gateway_registry(registry)
     reachability = str(snapshot.get("reachability") or "").strip().lower()
+    if reachability == "sse_disconnected":
+        raise ValueError(
+            f"@{name} is attached but the platform SSE subscription is down — "
+            "messages will not be delivered. Reconnect the ax-channel MCP server. If that does not help, the agent token may need to be re-minted."
+        )
     if reachability == "attach_required":
         workdir = str(snapshot.get("workdir") or stored.get("workdir") or "").strip()
         suffix = f" Start Claude Code from {workdir}." if workdir else " Start Claude Code first."
@@ -3502,10 +3507,24 @@ def _run_gateway_doctor(name: str, *, send_test: bool = False) -> dict:
         runtime_type = str(entry.get("runtime_type") or "").strip().lower()
         if intake_model == "live_listener":
             if snapshot.get("activation") == "attach_only":
-                if str(snapshot.get("reachability") or "") == "attach_required":
+                reachability_val = str(snapshot.get("reachability") or "")
+                if reachability_val == "sse_disconnected":
+                    add_check(
+                        "claude_code_session",
+                        "passed",
+                        "Claude Code is attached to Gateway.",
+                    )
+                    add_check(
+                        "channel_sse",
+                        "failed",
+                        "Claude Code is attached but the platform SSE subscription is down — "
+                        "messages will not be delivered. Reconnect the ax-channel MCP server. If that does not help, the agent token may need to be re-minted.",
+                    )
+                elif reachability_val == "attach_required":
                     add_check("claude_code_session", "warning", "Start Claude Code before sending.")
                 elif bool(snapshot.get("connected")):
                     add_check("claude_code_session", "passed", "Claude Code is connected to Gateway.")
+                    add_check("channel_sse", "passed", "Platform SSE subscription is active.")
                 else:
                     add_check("claude_code_session", "failed", "Gateway does not currently have Claude Code running.")
             elif runtime_type != "echo":
@@ -3656,6 +3675,8 @@ def _run_gateway_doctor(name: str, *, send_test: bool = False) -> dict:
     if str(snapshot.get("mode") or "") == "LIVE":
         if str(snapshot.get("presence") or "") == "IDLE":
             add_check("live_path", "passed", "Live listener is connected.")
+        elif str(snapshot.get("reachability") or "") == "sse_disconnected":
+            pass  # channel_sse check covers this with a more specific message
         elif str(snapshot.get("reachability") or "") == "attach_required":
             add_check("live_path", "warning", "Start Claude Code before sending.")
         elif str(snapshot.get("presence") or "") in {"STALE", "OFFLINE"}:
@@ -3780,6 +3801,8 @@ def _reachability_copy(agent: dict) -> str:
         return "Gateway can safely queue work now."
     if reachability == "launch_available":
         return "Gateway can launch this runtime on send."
+    if reachability == "sse_disconnected":
+        return "Claude Code is attached but the SSE subscription is down — messages will not be delivered."
     if reachability == "attach_required":
         return "Start Claude Code before sending."
     if mode == "INBOX":

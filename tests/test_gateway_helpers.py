@@ -578,6 +578,27 @@ class TestDeriveLiveness:
         assert liveness == "stale"
         assert connected is False
 
+    def test_sse_disconnected_overrides_fresh_heartbeat(self):
+        from ax_cli.gateway import _derive_liveness
+
+        liveness, connected = _derive_liveness({"sse_connected": False}, raw_state="running", last_seen_age=5)
+        assert liveness == "stale"
+        assert connected is False
+
+    def test_sse_connected_true_does_not_affect_normal_logic(self):
+        from ax_cli.gateway import _derive_liveness
+
+        liveness, connected = _derive_liveness({"sse_connected": True}, raw_state="running", last_seen_age=5)
+        assert liveness == "connected"
+        assert connected is True
+
+    def test_sse_connected_none_does_not_affect_normal_logic(self):
+        from ax_cli.gateway import _derive_liveness
+
+        liveness, connected = _derive_liveness({"sse_connected": None}, raw_state="running", last_seen_age=5)
+        assert liveness == "connected"
+        assert connected is True
+
 
 class TestLooksLikeSetupError:
     """_looks_like_setup_error: detects setup errors from snapshot + state."""
@@ -717,6 +738,32 @@ class TestDeriveReachability:
             == "unavailable"
         )
 
+    def test_sse_disconnected_for_attach_only_with_broken_sse(self):
+        from ax_cli.gateway import _derive_reachability
+
+        snapshot = {"sse_connected": False}
+        assert (
+            _derive_reachability(snapshot=snapshot, mode="LIVE", liveness="stale", activation="attach_only")
+            == "sse_disconnected"
+        )
+
+    def test_attach_required_when_sse_connected_not_set(self):
+        from ax_cli.gateway import _derive_reachability
+
+        assert (
+            _derive_reachability(snapshot={}, mode="LIVE", liveness="stale", activation="attach_only")
+            == "attach_required"
+        )
+
+    def test_non_channel_agent_not_affected_by_sse_connected_false(self):
+        from ax_cli.gateway import _derive_reachability
+
+        snapshot = {"sse_connected": False}
+        assert (
+            _derive_reachability(snapshot=snapshot, mode="LIVE", liveness="connected", activation="persistent")
+            == "live_now"
+        )
+
 
 class TestDeriveWorkState:
     """_derive_work_state: maps liveness + current_status to work state."""
@@ -794,6 +841,25 @@ class TestDeriveConfidence:
         )
         assert level == "BLOCKED"
         assert reason == "identity_unbound"
+
+    def test_sse_disconnected_returns_low(self):
+        from ax_cli.gateway import _derive_confidence
+
+        level, reason, detail = _derive_confidence(
+            {}, mode="LIVE", liveness="stale", reachability="sse_disconnected"
+        )
+        assert level == "LOW"
+        assert reason == "sse_disconnected"
+        assert "SSE subscription is down" in detail
+
+    def test_attach_required_still_returns_low(self):
+        from ax_cli.gateway import _derive_confidence
+
+        level, reason, detail = _derive_confidence(
+            {}, mode="LIVE", liveness="stale", reachability="attach_required"
+        )
+        assert level == "LOW"
+        assert reason == "attach_required"
 
 
 # ---------------------------------------------------------------------------

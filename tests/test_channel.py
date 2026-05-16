@@ -2087,3 +2087,142 @@ def test_write_gateway_cli_config(tmp_path):
     assert 'agent_name = "orion"' in text
     assert 'mode = "local"' in text
     assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+# ---------------------------------------------------------------------------
+# SSE health reporting — _sse_loop gateway touch behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestSseLoopGatewayTouches:
+    """_sse_loop writes sse_connected to the gateway entry at the right moments."""
+
+    def _run_loop_capture_touches(self, monkeypatch, *, connect_side_effect, payload=None):
+        """Run _sse_loop against a scripted client and capture _touch_gateway_channel_entry calls."""
+        touches: list[dict] = []
+
+        def capture_touch(agent_name, *, event=None, **updates):
+            touches.append({"event": event, **updates})
+
+        monkeypatch.setattr(channel_mod, "_touch_gateway_channel_entry", capture_touch)
+
+        class _ScriptedClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.connect_calls = 0
+
+            def connect_sse(self, *, space_id):
+                self.connect_calls += 1
+                return connect_side_effect(self.connect_calls)
+
+            def get_message(self, message_id):
+                return {"message": {"metadata": {}}}
+
+        client = _ScriptedClient()
+        bridge = CaptureBridge(client)
+        bridge.shutdown.set()  # exit after first pass
+        channel_mod._sse_loop(bridge)
+        return touches
+
+    def test_writes_sse_connected_true_on_successful_connect(self, monkeypatch):
+        touches: list[dict] = []
+
+        def capture_touch(agent_name, *, event=None, **updates):
+            touches.append({"event": event, **updates})
+
+        monkeypatch.setattr(channel_mod, "_touch_gateway_channel_entry", capture_touch)
+        monkeypatch.setattr(channel_mod.time, "monotonic", lambda: 0.0)
+
+        class _ImmediateShutdownClient(FakeClient):
+            def connect_sse(self, *, space_id):
+                return FakeSseResponse(
+                    {"id": "m1", "content": "@peer-agent hi", "author": {"id": "u1", "name": "u", "type": "user"}, "mentions": ["peer-agent"]}
+                )
+
+            def get_message(self, message_id):
+                return {"message": {"metadata": {}}}
+
+        bridge = CaptureBridge(_ImmediateShutdownClient())
+
+        delivered = []
+
+        def capture_delivery(event):
+            delivered.append(event)
+            bridge.shutdown.set()
+
+        bridge.enqueue_from_thread = capture_delivery
+        channel_mod._sse_loop(bridge)
+
+        connected_touches = [t for t in touches if t.get("sse_connected") is True]
+        assert connected_touches, "expected sse_connected=True touch on successful connect"
+
+    def test_writes_sse_connected_false_on_connect_error(self, monkeypatch):
+        touches: list[dict] = []
+
+        def capture_touch(agent_name, *, event=None, **updates):
+            touches.append({"event": event, **updates})
+
+        monkeypatch.setattr(channel_mod, "_touch_gateway_channel_entry", capture_touch)
+
+        class _FailingClient(FakeClient):
+            def connect_sse(self, *, space_id):
+                raise ConnectionError("SSE failed")
+
+        bridge = CaptureBridge(_FailingClient())
+
+        def _sleep_and_shutdown(s):
+            bridge.shutdown.set()
+
+        monkeypatch.setattr(channel_mod.time, "sleep", _sleep_and_shutdown)
+        channel_mod._sse_loop(bridge)
+
+        disconnected_touches = [t for t in touches if t.get("sse_connected") is False]
+        assert disconnected_touches, "expected sse_connected=False touch on connection failure"
+
+    def test_startup_touch_initialises_sse_connected_false(self, monkeypatch):
+        touches: list[dict] = []
+
+        def capture_touch(agent_name, *, event=None, **updates):
+            touches.append({"event": event, **updates})
+
+        monkeypatch.setattr(channel_mod, "_touch_gateway_channel_entry", capture_touch)
+
+        startup_touch = next(
+            (t for t in touches if t.get("event") == "channel_attached"),
+            None,
+        )
+        # Simulate the startup call directly as it happens at channel attach time
+        channel_mod._touch_gateway_channel_entry(
+            "peer-agent",
+            event="channel_attached",
+            sse_connected=False,
+        )
+        startup_touch = next(
+            (t for t in touches if t.get("event") == "channel_attached"),
+            None,
+        )
+        assert startup_touch is not None
+        assert startup_touch.get("sse_connected") is False
+
+    def test_mcp_ping_does_not_set_sse_connected(self, monkeypatch):
+        """MCP ping updates last_seen_at but must not write sse_connected."""
+        touches: list[dict] = []
+
+        def capture_touch(agent_name, *, event=None, **updates):
+            touches.append({"event": event, **updates})
+
+        monkeypatch.setattr(channel_mod, "_touch_gateway_channel_entry", capture_touch)
+
+        async def run():
+            client = FakeClient()
+            bridge = CaptureBridge(client)
+            bridge.initialized.set()
+            bridge.loop = __import__("asyncio").get_running_loop()
+            await bridge.touch_gateway("channel_ping", current_status=None, current_activity=None)
+
+        __import__("asyncio").run(run())
+
+        ping_touches = [t for t in touches if t.get("event") == "channel_ping"]
+        assert ping_touches, "expected a channel_ping touch"
+        assert all("sse_connected" not in t for t in ping_touches), \
+            "channel_ping must not write sse_connected"

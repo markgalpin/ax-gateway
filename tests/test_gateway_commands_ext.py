@@ -27,6 +27,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from ax_cli import gateway as gateway_core
 from ax_cli.commands import gateway as gw_cmd
 from ax_cli.main import app
 
@@ -1007,6 +1008,75 @@ class TestAgentsDoctorCommand:
         )
         result = runner.invoke(app, ["gateway", "agents", "doctor", "nope"])
         assert result.exit_code != 0
+
+
+# ── channel_sse doctor check ─────────────────────────────────────────
+
+
+class TestChannelSseDoctorCheck:
+    """_run_gateway_doctor emits channel_sse check for claude_code_channel agents."""
+
+    def _make_channel_entry(self, tmp_path, *, sse_connected=None, connected=True):
+        token_file = tmp_path / "token"
+        token_file.write_text("axp_a_agent.secret")
+        entry = {
+            "name": "claude-channel",
+            "agent_id": "agent-cc",
+            "space_id": "space-1",
+            "base_url": "https://paxai.app",
+            "runtime_type": "claude_code_channel",
+            "template_id": "claude_code_channel",
+            "desired_state": "running",
+            "effective_state": "running",
+            "last_seen_at": gateway_core._now_iso(),
+            "token_file": str(token_file),
+            "transport": "gateway",
+            "credential_source": "gateway",
+        }
+        if sse_connected is not None:
+            entry["sse_connected"] = sse_connected
+        if connected:
+            entry["connected"] = True
+        return entry
+
+    def test_channel_sse_passed_when_connected(self, tmp_path):
+        gateway_core.save_gateway_session(
+            {"token": "axp_u_test.token", "base_url": "https://paxai.app", "space_id": "space-1", "username": "u"}
+        )
+        registry = gateway_core.load_gateway_registry()
+        registry["agents"] = [self._make_channel_entry(tmp_path, sse_connected=True, connected=True)]
+        gateway_core.save_gateway_registry(registry)
+
+        result = gw_cmd._run_gateway_doctor("claude-channel")
+        check_names = {c["name"]: c for c in result["checks"]}
+        assert "channel_sse" in check_names
+        assert check_names["channel_sse"]["status"] == "passed"
+
+    def test_channel_sse_failed_when_disconnected(self, tmp_path):
+        gateway_core.save_gateway_session(
+            {"token": "axp_u_test.token", "base_url": "https://paxai.app", "space_id": "space-1", "username": "u"}
+        )
+        registry = gateway_core.load_gateway_registry()
+        registry["agents"] = [self._make_channel_entry(tmp_path, sse_connected=False, connected=True)]
+        gateway_core.save_gateway_registry(registry)
+
+        result = gw_cmd._run_gateway_doctor("claude-channel")
+        check_names = {c["name"]: c for c in result["checks"]}
+        assert "channel_sse" in check_names
+        assert check_names["channel_sse"]["status"] == "failed"
+        assert "SSE subscription is down" in check_names["channel_sse"]["detail"]
+
+    def test_claude_code_session_passed_even_when_sse_disconnected(self, tmp_path):
+        gateway_core.save_gateway_session(
+            {"token": "axp_u_test.token", "base_url": "https://paxai.app", "space_id": "space-1", "username": "u"}
+        )
+        registry = gateway_core.load_gateway_registry()
+        registry["agents"] = [self._make_channel_entry(tmp_path, sse_connected=False, connected=True)]
+        gateway_core.save_gateway_registry(registry)
+
+        result = gw_cmd._run_gateway_doctor("claude-channel")
+        check_names = {c["name"]: c for c in result["checks"]}
+        assert check_names.get("claude_code_session", {}).get("status") == "passed"
 
 
 # ── CLI: gateway agents send ─────────────────────────────────────────

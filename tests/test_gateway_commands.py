@@ -3016,6 +3016,32 @@ def test_annotate_runtime_health_treats_managed_attached_session_as_connected(mo
     assert snapshot["local_attach_state"] == "connected"
 
 
+def test_channel_agent_shows_degraded_when_sse_broken_despite_process_running(monkeypatch, tmp_path):
+    """A claude-channel agent must show LOW confidence when the SSE subscription
+    is down, even if Claude Code is running and sending MCP pings.  This was a
+    production bug where the agent appeared ready but could not receive messages."""
+    monkeypatch.setattr(gateway_core, "_pid_is_alive", lambda pid: int(pid) == 1234)
+
+    snapshot = gateway_core.annotate_runtime_health(
+        {
+            "template_id": "claude_code_channel",
+            "placement": "attached",
+            "activation": "attach_only",
+            "reply_mode": "interactive",
+            "desired_state": "running",
+            "effective_state": "running",
+            "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            "attached_session_pid": 1234,
+            "sse_connected": False,
+        }
+    )
+
+    assert snapshot["connected"] is False
+    assert snapshot["liveness"] == "stale"
+    assert snapshot["reachability"] == "sse_disconnected"
+    assert snapshot["confidence"] == "LOW"
+
+
 def test_annotate_runtime_health_derives_identity_space_snapshot(monkeypatch, tmp_path):
     config_dir = tmp_path / "config"
     monkeypatch.setenv("AX_CONFIG_DIR", str(config_dir))
