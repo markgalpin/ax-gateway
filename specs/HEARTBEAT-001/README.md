@@ -3,6 +3,7 @@
 **Status:** v1 — CLI-first implementation landing in this PR
 **Owner:** @orion
 **Date:** 2026-04-25
+**Related:** GATEWAY-CONNECTIVITY-001 (derives staleness thresholds from this spec's 15s interval), GATEWAY-AGENT-REGISTRY-001 (agent class definitions), ADR-009 (gateway runtime heartbeat decision)
 **Source directives:**
 - @madtank 2026-04-25 04:11 UTC — "we need to start getting features like heartbeat... we need to have our own pulse on the gateway"
 - @madtank 2026-04-25 15:25 UTC — "keep moving and shipping faster, especially around gateway and connectedness and the registry... it's funny how we might be competing against AWS and Google"
@@ -106,6 +107,48 @@ ax heartbeat watch --interval N [--status S] [--note "..."] [--max-ticks N]
 ## Why this is a small spec
 
 Per @orion's SDD critique 2026-04-25: implementation-first. The contract is the 11 pytests. Spec evolves with code.
+
+## Gateway-Managed Runtime Heartbeats
+
+Gateway-managed agent runtimes send platform heartbeats directly using their
+own agent-bound credential. See
+[ADR-009](../docs/adr/ADR-009-platform-heartbeat-contract.md) for the decision
+rationale.
+
+### Protocol
+
+Heartbeats go to `POST /api/v1/agents/heartbeat` using the runtime's
+agent-bound token. User-level tokens are rejected by the platform.
+
+| Status | When | Sender |
+| --- | --- | --- |
+| `connected` | Every 15 seconds while the SSE listener loop is running | Runtime's `_send_client` in `_listener_loop` |
+| `stale` | On SSE connection failure, before backoff sleep | Runtime's `_send_client` or `_send_heartbeat_best_effort` |
+| `offline` | On `stop()` — agent is shutting down | Runtime's `_send_heartbeat_best_effort` |
+| `setup_error` | On first transition to `effective_state=error` | Runtime's `_send_heartbeat_best_effort` |
+
+### By agent class
+
+Agent classes are defined in
+[GATEWAY-AGENT-REGISTRY-001](../GATEWAY-AGENT-REGISTRY-001/spec.md).
+
+| Agent class | Platform heartbeat mechanism |
+| --- | --- |
+| **Daemon-managed** (`live_listener`, `tool_listener`) | `ManagedAgentRuntime` loop using agent-bound credential. Runtimes that embed the ax platform adapter also send via the adapter's own heartbeat loop — both use agent-bound credentials. |
+| **External plugin** (externally-managed `live_listener`) | Adapter heartbeat loop only — daemon does not own the process. |
+| **On-demand** (`launch_on_send`) | No continuous platform heartbeats between launches. Presence is inferred from launch success and completion signals. |
+| **Attached session** (`attached_channel`) | No platform heartbeats. Registry signals (`sse_connected`, `last_seen_at`) are written to the local Gateway; platform presence is maintained by the SSE connection timeout. When the session stops, registry signal age triggers Gateway liveness escalation. |
+| **Polling mailbox** (`polling_mailbox`, `doorbell_watcher`) | No platform heartbeats. Queue availability determines health, not connection presence. |
+
+### Sweep prohibition
+
+The Gateway sweep loop must not send platform heartbeats. The sweep holds a
+user-level session token which the platform rejects at 400.
+
+### Relationship to the CLI primitive above
+
+This section covers gateway-managed runtime heartbeat loops, not the
+`ax heartbeat` commands above.
 
 ## Out-of-scope cross-references
 

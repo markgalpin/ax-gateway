@@ -3,7 +3,7 @@
 **Status:** Draft  
 **Owner:** @madtank  
 **Date:** 2026-04-22  
-**Related:** LISTENER-001, AGENT-CONTACT-001, MESH-SPAWN-001, [docs/mcp-remote-oauth.md](../../docs/mcp-remote-oauth.md)  
+**Related:** LISTENER-001, AGENT-CONTACT-001, MESH-SPAWN-001, HEARTBEAT-001 (source of 15s heartbeat interval this spec's thresholds derive from), GATEWAY-AGENT-REGISTRY-001, ADR-008 (daemon-to-UI status contract decision), [docs/mcp-remote-oauth.md](../../docs/mcp-remote-oauth.md)  
 **Companion Mockups:** [mockups.md](mockups.md)
 
 ## Purpose
@@ -380,6 +380,71 @@ Gateway may derive health from any of these sources depending on template:
 - `mailbox` agents may have `reachability=queue_available` even when no live
   worker is attached. They are not `OFFLINE` unless the queue path itself is
   unavailable.
+
+## Daemon-to-UI Status Contract
+
+### Operator Intent Takes Priority
+
+Before any health signal is evaluated, the daemon checks operator intent fields
+in the following priority order. These override observed runtime state:
+
+1. `lifecycle_phase == "hidden"` or `lifecycle_phase == "archived"` → agent is
+   intentionally out of active operation regardless of runtime signals. A common
+   reason is that the agent did not record shutdown properly and still appears
+   degraded. The operator's decision overrides the signal.
+2. `desired_state == "stopped"` AND `connected == false` → agent is stopped and
+   has actually stopped (gray).
+3. `desired_state == "stopped"` AND `connected == true` → agent is stopping but
+   not yet down (yellow — transitional).
+4. `desired_state == "running"` → apply health checks below.
+
+### UI Tone Semantics
+
+The product exposes four tones for agent status display. Implementations must
+honour these semantic boundaries:
+
+| Tone | Color | Meaning |
+| --- | --- | --- |
+| `muted` | gray | Operator has intentionally taken this agent out of active operation: stopped, hidden, or archived. |
+| `warning` | yellow | Agent needs attention: transitioning, pending approval, registry signals going stale, or degraded. |
+| `error` | red | Agent is desired=running but cannot function. |
+| `ok` | green | Agent is healthy and ready. |
+
+Gray is reserved exclusively for intentional-off states. Any agent that is
+`desired_state=running` but not working correctly renders red, not gray.
+
+### Reachability Values
+
+The `reachability` helper (section above) is extended with:
+
+- `sse_disconnected` — attached channel agent is connected (process alive, MCP
+  pings active) but the SSE subscription to the platform is down. Messages
+  cannot be delivered. Operator should reconnect the ax-channel MCP server.
+- `attach_required` — attached channel agent process is not running. Operator
+  must start the session.
+
+### Liveness Escalation Thresholds
+
+The daemon derives liveness from how fresh the registry signals are (primarily
+`last_seen_at`). Two thresholds apply uniformly across all agent classes:
+
+| Threshold | Age of last registry signal | Liveness | UI tone | Notes |
+| --- | --- | --- | --- | --- |
+| Stale | > 45 seconds | `stale` | yellow | Transient; agent may self-heal |
+| Offline | > 120 seconds | `offline` | red (LIVE mode only) | Persistent; operator attention needed |
+
+These thresholds are derived from the platform heartbeat interval defined in
+[HEARTBEAT-001](../HEARTBEAT-001/README.md) (15 seconds). 45s ≈ 3× that
+interval; 120s ≈ 8× that interval. Aligning the two keeps the local Gateway
+view coherent with the platform's view of agent presence where possible. The
+gateway does not receive platform heartbeats directly — it observes the
+registry signals that agents write, and chooses thresholds that reflect the
+same liveness intent.
+
+`offline` liveness maps to presence `OFFLINE` only for LIVE mode agents.
+INBOX and ON-DEMAND agents fall through to `IDLE` on offline liveness because
+their availability is defined by queue access or launch capability, not a
+persistent connection.
 
 ## Lifecycle and Protocol Invariants
 

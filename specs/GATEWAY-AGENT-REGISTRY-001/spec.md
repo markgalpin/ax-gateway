@@ -144,6 +144,42 @@ agent_id + install_id + gateway_id + base_url + host_fingerprint + user + cwd + 
 `pid`, `parent_pid`, current command arguments, and timestamps are audit fields,
 not stable matching fields.
 
+## Runtime State and Signaling Fields
+
+Beyond stable identity, the Gateway registry stores ephemeral runtime state.
+These fields are written by the agent process or daemon and read by the daemon
+sweep to derive operator-visible health signals (`liveness`, `presence`,
+`confidence`, `reachability`). Agents must not set derived fields directly.
+
+### Fields by connection path
+
+| Connection path | Key runtime fields | Who sets them |
+| --- | --- | --- |
+| `live_listener` | `effective_state`, `last_seen_at` | Daemon (state); runtime via platform heartbeat (`last_seen_at`) |
+| `tool_listener` | `effective_state`, `last_seen_at`, `current_tool`, `current_tool_call_id` | Daemon (state); runtime via platform heartbeat and tool events |
+| `attached_channel` | `effective_state`, `last_seen_at`, `sse_connected` | Agent process — MCP pings update `last_seen_at`; SSE loop updates `sse_connected` |
+| `launch_on_send` | `effective_state` | Daemon at launch and exit; no continuous heartbeat between launches |
+| `polling_mailbox` | `backlog_depth`, `last_work_received_at` | Gateway updates `backlog_depth` on message arrival; agent updates `last_work_received_at` on each poll |
+| `doorbell_watcher` | `last_watcher_seen_at` | Watcher process on each poll |
+
+### `sse_connected`
+
+A boolean field specific to `attached_channel` agents. Reports whether the
+agent's SSE subscription to the platform is currently active, independently of
+process liveness. An attached session with `sse_connected=false` cannot receive
+messages and must be treated as stale even if `last_seen_at` is fresh — MCP
+pings keep `last_seen_at` current regardless of SSE subscription health.
+
+### What agents must not do
+
+- Set `effective_state=running` while a critical subsystem is broken. Report
+  subsystem health via dedicated fields (e.g. `sse_connected=false`).
+- Set derived fields (`liveness`, `presence`, `confidence`, `reachability`)
+  directly. These are computed by the daemon sweep.
+- Rely on the UI to infer connection path from raw registry fields. The daemon
+  must translate connection-path-specific signals into generic derived fields
+  before the UI reads them.
+
 ## Connection paths
 
 One agent identity may have multiple approved connection paths, but Gateway must
