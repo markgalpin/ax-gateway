@@ -501,6 +501,20 @@ class TestDerivePresence:
 
         assert _derive_presence(mode="INBOX", liveness="connected", work_state="queued") == "QUEUED"
 
+    def test_offline_non_live_mode_returns_idle(self):
+        """Offline liveness on non-LIVE agents (INBOX, ON-DEMAND) returns IDLE.
+
+        OFFLINE presence is meaningful only for always-on listeners — it signals
+        a lost connection for an agent that should be permanently connected. For
+        INBOX and ON-DEMAND agents, availability is defined by queue access or
+        launch capability, not an active connection, so offline liveness falls
+        through to IDLE rather than OFFLINE.
+        """
+        from ax_cli.gateway import _derive_presence
+
+        assert _derive_presence(mode="INBOX", liveness="offline", work_state="idle") == "IDLE"
+        assert _derive_presence(mode="ON-DEMAND", liveness="offline", work_state="idle") == "IDLE"
+
     def test_idle(self):
         from ax_cli.gateway import _derive_presence
 
@@ -554,7 +568,25 @@ class TestDeriveLiveness:
         from ax_cli.gateway import _derive_liveness
 
         liveness, connected = _derive_liveness({}, raw_state="running", last_seen_age=None)
+        assert liveness == "offline"
+        assert connected is False
+
+    def test_running_briefly_stale(self):
+        from ax_cli.gateway import RUNTIME_STALE_AFTER_SECONDS, _derive_liveness
+
+        liveness, connected = _derive_liveness(
+            {}, raw_state="running", last_seen_age=int(RUNTIME_STALE_AFTER_SECONDS) + 5
+        )
         assert liveness == "stale"
+        assert connected is False
+
+    def test_running_persistently_offline(self):
+        from ax_cli.gateway import RUNTIME_OFFLINE_AFTER_SECONDS, _derive_liveness
+
+        liveness, connected = _derive_liveness(
+            {}, raw_state="running", last_seen_age=int(RUNTIME_OFFLINE_AFTER_SECONDS) + 5
+        )
+        assert liveness == "offline"
         assert connected is False
 
     def test_error_state(self):

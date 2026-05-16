@@ -53,7 +53,8 @@ DEFAULT_HANDLER_TIMEOUT_SECONDS = 900
 MIN_HANDLER_TIMEOUT_SECONDS = 1
 SSE_IDLE_TIMEOUT_SECONDS = 45.0
 RUNTIME_HEARTBEAT_INTERVAL_SECONDS = 30.0
-RUNTIME_STALE_AFTER_SECONDS = 75.0
+RUNTIME_STALE_AFTER_SECONDS = 75.0  # brief gap — yellow, likely self-heals
+RUNTIME_OFFLINE_AFTER_SECONDS = 300.0  # persistent gap — red, needs operator attention
 RUNTIME_HIDDEN_AFTER_SECONDS = 15 * 60.0  # default: hide stale agents after 15 min
 SETUP_ERROR_BACKOFF_SECONDS = 30.0  # silence retry storm after a runtime setup error
 # active = visible, normal operation
@@ -1049,7 +1050,14 @@ def _derive_liveness(snapshot: dict[str, Any], *, raw_state: str, last_seen_age:
     if _looks_like_setup_error(snapshot, raw_state):
         return "setup_error", False
     if raw_state == "running":
-        if last_seen_age is None or last_seen_age > RUNTIME_STALE_AFTER_SECONDS:
+        # Two-threshold staleness escalation — generic across all agent types:
+        # brief gap (>75s) → stale (yellow, may self-heal); persistent gap
+        # (>5min) → offline (red, needs operator attention). The daemon sweep
+        # drives this for agents it cannot directly control (e.g. attach_only),
+        # where a stale heartbeat is the only signal that the process has gone.
+        if last_seen_age is None or last_seen_age > RUNTIME_OFFLINE_AFTER_SECONDS:
+            return "offline", False
+        if last_seen_age > RUNTIME_STALE_AFTER_SECONDS:
             return "stale", False
         # Channel agents report SSE subscription health separately from process
         # liveness. A running process with a dead SSE stream can't receive messages.
@@ -1177,6 +1185,10 @@ def _derive_presence(*, mode: str, liveness: str, work_state: str) -> str:
         return "BLOCKED"
     if liveness == "stale":
         return "STALE"
+    # OFFLINE presence is meaningful only for LIVE agents — it signals that an
+    # always-on listener has lost its connection. For INBOX/ON-DEMAND agents,
+    # availability is defined by queue access or launch capability, not by an
+    # active connection, so offline liveness falls through to IDLE below.
     if liveness == "offline" and mode == "LIVE":
         return "OFFLINE"
     if work_state == "working":
@@ -1220,6 +1232,10 @@ def _derive_reachability(*, snapshot: dict[str, Any], mode: str, liveness: str, 
         if snapshot.get("sse_connected") is False:
             return "sse_disconnected"
         return "attach_required"
+    # External plugin runtimes report their own state; a missing fresh heartbeat
+    # means the plugin process has not attached — distinct from a generic unavailable.
+    if snapshot.get("external_runtime_managed") and liveness in {"stale", "offline"}:
+        return "plugin_not_attached"
     if mode == "LIVE" and liveness == "connected":
         return "live_now"
     if mode == "ON-DEMAND" and liveness != "setup_error":
