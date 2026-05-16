@@ -1,6 +1,6 @@
 # ADR-007: Agent Classes and Gateway Signaling Contract
 
-**Status:** Accepted
+**Status:** Accepted — core agent classes reflect current implementation; boundary completion ongoing (see Known Gaps below)
 
 ## Context
 
@@ -27,6 +27,27 @@ Five classes cover all current and anticipated agent models:
 | **Polling mailbox** | No continuous runtime; agent polls on its own schedule | Check-in on each poll; no continuous heartbeat expected between polls | INBOX |
 | **External plugin** | Plugin process managed externally; daemon tracks via periodic heartbeats | Plugin sends heartbeats to `/local/heartbeat`; daemon observes arrival and age | LIVE |
 | **On-demand** | Daemon launches on message arrival; process exits when done | Daemon sets state at launch and exit; no heartbeat between launches | ON-DEMAND |
+
+The polling mailbox and attached session classes are the most commonly confused.
+The key distinction is delivery model, not runtime sophistication:
+
+![Inbox vs channel delivery](../images/inbox-vs-channel.svg)
+
+The `mode` field that the UI reads to determine delivery model is computed by
+the Gateway from two template registration fields:
+
+| `placement` | `activation` | `mode` |
+|---|---|---|
+| `mailbox` | any | `INBOX` |
+| `attached` or `hosted` | `persistent` or `attach_only` | `LIVE` |
+| `hosted` | `on_demand` | `ON-DEMAND` |
+
+**For new agent classes:** register with `placement=mailbox` to enter the
+polling class; register with `placement=attached` and `activation=attach_only`
+for the attached session class; `placement=hosted` with `activation=persistent`
+for daemon-managed. The Gateway derives `mode` automatically — do not attempt
+to set it directly.
+
 
 ### Current Templates and Runtime Types by Class
 
@@ -111,6 +132,25 @@ Between launches, `effective_state` is not `running`, so the liveness
 escalation does not fire. The daemon sets `reachability=launch_available` for
 healthy on-demand agents regardless of whether a process is currently running.
 
+Every managed agent has three layers of state that the signaling contract
+operates on — desired, lifecycle phase, and effective:
+
+![Agent lifecycle states](../images/agent-lifecycle-states.svg)
+
+### Registry Signals vs Platform Heartbeats
+
+The signaling contract described in this ADR covers two distinct communication
+paths that must not be confused:
+
+| | Registry signals | Platform heartbeats |
+|---|---|---|
+| **Destination** | Local Gateway registry (`~/.ax/gateway/`) | aX platform (`paxai.app`) |
+| **Purpose** | Gateway derives local health state (liveness, confidence, UI display) | Platform updates agent presence visible to other users and agents |
+| **Who sends** | Agent process or Gateway daemon | Agent runtime using an **agent-bound** token |
+| **Token required** | N/A — local filesystem write | Agent-bound PAT/JWT; user tokens are rejected with 400 |
+| **Examples** | `effective_state`, `last_seen_at`, `sse_connected` | `send_heartbeat(status="connected")`, `send_heartbeat(status="offline")` |
+| **Defined in** | This ADR (ADR-007) | [ADR-009](ADR-009-platform-heartbeat-contract.md) |
+
 ### What agents must NOT do
 
 - Set `effective_state=running` while a critical subsystem is broken. Use
@@ -121,6 +161,35 @@ healthy on-demand agents regardless of whether a process is currently running.
   `reachability`, `presence`, `confidence`) before the UI reads them.
 - Send heartbeats faster than necessary. The stale threshold is 75 seconds;
   heartbeats every 30 seconds are sufficient for all current agent classes.
+
+## Known Gaps
+
+The following cases represent places where the Gateway does not yet fully
+uphold its side of the contract — it has not computed a generic semantic field
+that would allow the UI to operate without class-specific knowledge. As a
+consequence, the UI currently contains type-specific checks that compensate
+(documented in [ADR-008](ADR-008-agent-status-model.md)):
+
+- **External plugin not attached**: when an external plugin is desired=running
+  and has not sent a fresh heartbeat, the UI currently checks
+  `externalManaged && !connected` directly. The Gateway should derive
+  `reachability=plugin_not_attached` in `_derive_reachability()` so the UI
+  can read a generic field instead. The `plugin_not_attached` reachability
+  value was added in `fix/gateway-agent-status-colors`, but the UI type check
+  was retained because: (1) `external_runtime_managed` is itself a
+  gateway-provided flag rather than agent-class knowledge inferred by the UI;
+  (2) the UI still needs to combine with `presence` to differentiate stale
+  (yellow, may self-reconnect) from offline (red, persistent failure) — the
+  reachability value alone does not eliminate that check. The boundary
+  improvement was marginal enough to defer to a follow-up PR.
+
+- **Attached runtime stale vs generic stale**: the UI checks `isAttachedRuntime`
+  to show "Not running" (red) for a stale attached session instead of generic
+  "Stale" (yellow). The `reachability=attach_required` field already encodes
+  this distinction and could replace the type check. Retained in the current
+  PR to keep scope focused on the status model changes; the ADR documents the
+  desired end state and the cleanup is deferred.
+
 
 ## Consequences
 

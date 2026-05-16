@@ -1965,15 +1965,10 @@
     }
 
     function isMailboxRuntime(agent) {
-      // Pass-through / inbox runtimes hold queued messages until polled — they
-      // don't "process" in the way listener-loop agents do. Distinct UX:
-      // mailbox state ("N unread", "All caught up") instead of "Working".
+      // Determined by gateway-computed mode field. INBOX mode means the agent
+      // holds queued messages until polled — distinct UX from live listeners.
       if (!agent) return false;
-      const intakeModel = String(agent.intake_model || "").toLowerCase();
-      const runtimeType = String(agent.runtime_type || "").toLowerCase();
-      const template = String(agent.template_id || "").toLowerCase();
-      if (template === "claude_code_channel" || runtimeType === "claude_code_channel") return false;
-      return intakeModel === "polling_mailbox" || runtimeType === "inbox" || template === "pass_through";
+      return String(agent.mode || "").toUpperCase() === "INBOX";
     }
 
     function isAttachedRuntime(agent) {

@@ -1,6 +1,6 @@
 # ADR-008: Agent Status Model — Operator Intent, Liveness Escalation, and UI Tone
 
-**Status:** Accepted
+**Status:** Accepted — implemented in `fix/gateway-agent-status-colors`
 
 **Depends on:** [ADR-007: Agent Classes and Gateway Signaling Contract](ADR-007-agent-classes-and-signals.md)
 
@@ -86,20 +86,11 @@ follow the signaling contract in ADR-007.
 
 ## Known Gaps
 
-The following cases currently require class-specific checks in the UI because
-the Gateway does not yet compute a fully generic semantic field. These are
-candidates for future work:
-
-- **External plugin not attached**: the UI checks `externalManaged && !connected`
-  rather than reading a `reachability=plugin_not_attached` value. The gateway
-  could derive this in `_derive_reachability()`.
-- **Attached runtime STALE vs generic STALE**: the UI checks `isAttachedRuntime`
-  to show "Not running" (red) instead of generic "Stale" (yellow). The
-  `reachability=attach_required` field already encodes this distinction and
-  could replace the type check.
-- **Mailbox queue display**: the UI checks `isMailboxRuntime` to switch to
-  queue-count display. This could use `mode === "INBOX"` (a gateway-computed
-  field) instead of inspecting raw `template_id` and `intake_model` values.
+Three cases in the status table currently require class-specific checks in the
+UI — marked *(gap)* in the table below. These are consequences of the Gateway
+not yet computing a fully generic semantic field for those cases. The root
+cause and remediation path for each is documented in
+[ADR-007 § Known Gaps](ADR-007-agent-classes-and-signals.md#known-gaps).
 
 ## Consequences
 
